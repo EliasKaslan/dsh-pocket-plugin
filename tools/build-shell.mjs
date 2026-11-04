@@ -13,7 +13,7 @@
 import { createHash } from 'node:crypto';
 import { copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, parse, posix, relative, resolve, sep } from 'node:path';
+import { dirname, extname, isAbsolute, join, parse, posix, relative, resolve, sep } from 'node:path';
 
 const ROOT = resolve(import.meta.dirname, '..');
 const WEB = join(ROOT, 'web');
@@ -120,13 +120,29 @@ function stampHash(entries) {
   return hash.digest('hex').slice(0, 16);
 }
 
+/** 会被当文本处理的扩展名；其余（png 等）原样复制。 */
+const TEXT_EXT = new Set(['.js', '.mjs', '.css', '.html', '.webmanifest', '.svg', '.json', '.txt']);
+
+/**
+ * 读源文件：文本一律归一到 LF，二进制原样返回。
+ *
+ * 不归一的话，Windows 上带 CRLF 的源文件和 CI（Linux，LF）会产出**不同字节**的
+ * docs/，于是 `build-shell --check` 变成"跟谁的换行符比"的问题：本地绿、CI 红，
+ * 或者反过来。产物必须只取决于内容，不取决于检出的换行风格。
+ */
+async function readAsset(file) {
+  const buffer = await readFile(file);
+  if (!TEXT_EXT.has(extname(file).toLowerCase())) return buffer;
+  return Buffer.from(buffer.toString('utf8').replace(/\r\n/gu, '\n'), 'utf8');
+}
+
 async function collect() {
   const entries = new Map();
 
   const webFiles = (await walk(WEB)).filter((path) => !WEB_SKIP.has(path));
-  for (const path of webFiles) entries.set(path, await readFile(join(WEB, path)));
+  for (const path of webFiles) entries.set(path, await readAsset(join(WEB, path)));
 
-  for (const name of REMOTE_FILES) entries.set(name, await readFile(join(REMOTE, name)));
+  for (const name of REMOTE_FILES) entries.set(name, await readAsset(join(REMOTE, name)));
 
   entries.set('manifest.webmanifest', Buffer.from(shellManifest(await readFile(join(WEB, 'manifest.webmanifest'), 'utf8'))));
 
@@ -154,7 +170,8 @@ async function collect() {
   }
   precache.sort();
 
-  const worker = await readFile(join(REMOTE, 'sw.js'), 'utf8');
+  // worker 源码同样走 readAsset：CRLF 归一后才能和 CI 的 LF 检出产出同样的字节。
+  const worker = (await readAsset(join(REMOTE, 'sw.js'))).toString('utf8');
   entries.set('sw.js', Buffer.from(
     worker
       .replaceAll('__POCKET_PRECACHE__', JSON.stringify(precache, null, 2))
