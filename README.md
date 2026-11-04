@@ -44,26 +44,47 @@
 
 要求：DSH 已装好并能正常启动；Node.js ≥ 22.15。
 
-```bash
-# 从本地目录安装（开发/自用最常见）
-dsh plugin add /path/to/dsh-pocket
+这个插件是 **bundle** 形态：`package.json` 里的 `dsh.bundle.patch` 指向仓库自带的 `cordis.patch.yml`，DSH 会把它当作一层补丁叠进 profile。所以安装要做两件事 —— **登记为 bundle** + **让包名可解析**。
 
-# 或者直接从 GitHub 仓库装
-dsh plugin add github:EliasKaslan/dsh-pocket-plugin
+只加依赖是不够的。实测：只写 `dependencies`、不写 `dsh.profile.bundles` 时，`dsh --profile <name> --dump-config` 只会打印 `patch: entry "pocket" not found`，插件静默不加载。
+
+```jsonc
+// $DSH_HOME/profiles/<你的 profile>/package.json
+{
+  "dependencies": {
+    "dsh-pocket-plugin": "link:D:/path/to/dsh-pocket"   // 你 clone 下来的目录
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-pocket-plugin"                             // 关键：缺这行插件不会被加载
+      ]
+    }
+  }
+}
 ```
 
-`dsh plugin add` 会把插件写进当前 profile 的 `package.json` 依赖，并把 `cordis.patch.yml` 里那行插件配置插进 profile 的补丁文件。**它的安装器走 pnpm**，所以任何 pnpm 认的包源都行（本地目录、npm 包名、git 地址）。装完**重启 DSH** —— 插件是 ESM，改代码必须冷启动，热重载只对配置生效。
+```powershell
+# 让包名可解析（等价于 pnpm 装完后的形态，不需要联网）
+cmd /c mklink /J "%USERPROFILE%\.dsh\profiles\<你的 profile>\node_modules\dsh-pocket-plugin" "D:\path\to\dsh-pocket"
+```
 
-> 上面两种写法里，`github:` 前缀依赖你那份 DSH 安装器的解析；如果你那边报"找不到包"，换成 `dsh plugin add https://github.com/EliasKaslan/dsh-pocket-plugin`，或者用下面的手写方式。
+要改配置就在 profile 的 `cordis.patch.yml` 里按 id 覆盖。**不要**再复制一份 `- insert:` 行 —— 那会插出两行同样的插件：
 
-手写安装（等价，形态与 `dsh-longhaul` 等现成 bundle 一致）：
+```yaml
+- id: pocket
+  config:
+    port: 47901
+    cloud:
+      enabled: true
+      appBase: 'https://你的账号.github.io/dsh-pocket-plugin/'
+```
 
-1. profile 的 `package.json` 依赖里加一条，指向你 clone 下来的目录：
-   ```json
-   { "dependencies": { "dsh-pocket-plugin": "link:D:/path/to/dsh-pocket" } }
-   ```
-2. 把仓库里 `cordis.patch.yml` 的 `- insert:` 整段复制进 `$DSH_HOME/profiles/<你的 profile>/cordis.patch.yml` 的顶层数组。`name:` 保持包名 `dsh-pocket-plugin` 即可，DSH 会从 profile 的 `node_modules` 里解析它。
-3. profile 目录下跑一次 pnpm 安装（或让 DSH 自己重装依赖），再重启。
+改完重启 DSH 生效。插件是 ESM，改代码必须冷启动；热重载只对配置生效。
+
+> `dsh plugin --profile <name> add <包>` 只是把参数转发给 pnpm，**不会**替你登记 `bundles`；而且 Electron 应用自管的 profile 会直接拒绝执行（`profile "..." is managed exclusively by the Electron application`）。所以上面这套手写步骤才是完整的安装路径。
 
 装好后打开 `http://127.0.0.1:47901/pair`，这就是电脑上的配对页 —— 二维码、配对码、已配对设备、远程开关都在这一页。这个页面**只接受本机回环访问**，局域网里的其它机器打开会被拒绝。
 
@@ -224,7 +245,7 @@ Service Worker 的预缓存清单由 `tools/build-shell.mjs` 按真实产物列�
 - **已验证**：`npm run verify` 四关全绿（60 文件语法 / 58 条单元+协议 / 11 条端到端 / `docs/` 与源码逐字节一致）；CI 在 Node 22 与 24 上都绿；把仓库重新 clone 一份（Linux CI 与 Windows 本地各一次）跑同样的四关，结果一致 —— 说明提交进仓库的东西是自洽的，不依赖我本机的残留文件。
 - **已验证**：用真实入口 `lib/index.mjs` + 假 ctx 起服务（临时端口、临时数据目录），健康检查 / CSP / 配对页 / 配对码 / 未授权 401 / 路径穿越 / 端口释放全部符合预期。
 - **已验证**：`npm pack --dry-run` 出来的 83 个文件里包含 `cordis.patch.yml`、`lib/index.mjs`、`bin/`，即安装器拿到的包是完整的。
-- **未验证**：没有把本插件真正装进一份 DSH profile 跑过（本机跑的是上一代 v1，不敢动）。所以 `dsh plugin add` 这一步的端到端效果请你自己确认一次；手写安装那条路径的形态与现成 bundle `dsh-longhaul` 完全一致。
+- **已验证（装进真 profile 冷启动）**：在隔离的 `DSH_HOME` 里用真 host 起过（`dsh --profile <name> --no-open`），日志出现 `plugin loading; data=<DSH_HOME>/pocket` 与 `bridge listening on 0.0.0.0:<port>`，`/api/v1/health` 200、`/pair` 200、`/api/v1/pairing` 正常发码、未授权 `/api/v1/tasks` 401；同一次实验里首选端口被占用，插件自动退到下一个端口。`--dump-config` 里能看到 `# == dsh-pocket-plugin` 这一层，说明 bundle 补丁确实被叠进去了。同一个形态也装进了日常在用的 profile。
 - **未验证**：iOS Safari 实机、真正的蜂窝网络切换、长时间（>24h）中继稳定性。
 
 ## 已知限制
