@@ -67,9 +67,15 @@ test('SSE：/events 开流 → retry 头 + hello 帧 + 实时帧，断开后服�
     assert.notEqual(stream.res.headers['content-security-policy'], undefined, 'SSE 出口也要带安全头');
 
     const head = await stream.readUntil((text) => text.includes('event: hello'));
-    assert.match(head, /^retry: 3000\n\n/u, '开流第一段必须是 retry: 3000');
-    assert.match(head, /^id: \d+\nevent: hello\ndata: \{.*\}\n\n$/mu);
-    const hello = JSON.parse(head.split('event: hello\ndata: ')[1].split('\n')[0]);
+    // 不要对整段 body 做锚定正则：一次 read 可能已经把开流后的好几帧一起攒下来了
+    // （Linux CI 上就是这样，实际拿到 retry + hello + tasks.changed + … 五帧），
+    // 那样 `^…\n\n$` 永远匹配不上。按空行切事件，再挑 hello 这一帧。
+    const frames = head.split('\n\n').filter((block) => block.length > 0);
+    assert.equal(frames[0], 'retry: 3000', '开流第一段必须是 retry: 3000');
+    const helloFrame = frames.find((block) => block.includes('event: hello'));
+    assert.notEqual(helloFrame, undefined, `没等到 hello 帧：${head.slice(0, 200)}`);
+    assert.match(helloFrame, /^id: \d+\nevent: hello\ndata: \{.*\}$/u);
+    const hello = JSON.parse(helloFrame.slice(helloFrame.indexOf('data: ') + 'data: '.length));
     assert.equal(hello.type, 'hello');
     assert.equal(hello.payload.device.id, deviceId);
     assert.equal(typeof hello.payload.server.version, 'string');
