@@ -254,20 +254,25 @@ test('check：令牌过期即失效，并从内存与磁盘同时删除', () => 
   assert.deepEqual(JSON.parse(readFileSync(sessions, 'utf8')).sessions, [], '过期令牌必须从磁盘删除');
 });
 
-test('写盘后 sessionsMtime 不同步：下一次 check 会整份重载，内存改动被覆盖（现状记录）', () => {
+test('写盘后 sessionsSignature 不同步：下一次 check 会整份重载，内存改动被覆盖（现状记录）', () => {
   const dir = scratch();
   const { auth, sessions } = makeAuth(dir);
   const { token } = auth.login({ user: 'alice', password: PASSWORD });
   const key = digest(token);
 
-  // saveSessions()（auth.mjs:148-151）只写文件、不回写 sessionsMtime，
+  // saveSessions() 只写文件、不回写 sessionsSignature，
   // 于是 save 之后的第一次 maybeReload 一定认为“文件被外部改过”。
-  assert.notEqual(auth.sessionsMtime, statSync(sessions).mtimeMs, 'login 写盘后 sessionsMtime 还停在写之前');
+  // 签名是「mtime:size」，必须两个都比 —— 只比 mtime 的话，同一毫秒内的
+  // 连续两次写会被漏掉（那是另一个真 bug，见 lib/auth.mjs 的 fileSignature）。
+  const onDisk = statSync(sessions);
+  assert.equal(typeof auth.sessionsSignature, 'string', 'sessionsSignature 必须存在，否则这条断言是空转');
+  assert.notEqual(auth.sessionsSignature, `${onDisk.mtimeMs}:${onDisk.size}`,
+    'login 写盘后 sessionsSignature 还停在写之前');
 
   auth.sessions.get(key).expiresAt = Date.now() - 1;
   assert.equal(auth.check(token) !== null, true,
     'check 先 reload，内存里刚被改成“已过期”的会话会被磁盘内容复活');
-  assert.equal(auth.maybeReload(), false, '这次 check 顺带把 sessionsMtime 同步了');
+  assert.equal(auth.maybeReload(), false, '这次 check 顺带把 sessionsSignature 同步了');
 });
 
 test('prune：只清过期会话，返回清除条数；没有过期时不写盘', () => {

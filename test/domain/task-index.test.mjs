@@ -1525,7 +1525,15 @@ test('workspaces：无 registry → 空数组；有 registry 时去重、标 ava
   assert.equal(list[0].id, 'w1');
   assert.equal(list[0].title, '显式标题');
   assert.equal(list[0].available, true);
-  assert.equal(paths.filter((value) => value.toUpperCase() === existing.toUpperCase()).length, 1, '大小写不同算同一个工作区');
+  // 大小写折叠是**平台相关**的：lib/task-index.mjs:59 只在 win32 上 toLowerCase，
+  // 因为 POSIX 里 /Foo 与 /foo 真是两个目录。测试不能替实现编造统一行为，
+  // 否则在 Linux CI 上必红（这条就是这么红的）。
+  const caseVariants = paths.filter((value) => value.toUpperCase() === existing.toUpperCase()).length;
+  const foldedByPlatform = process.platform === 'win32' ? 1 : 2;
+  assert.equal(caseVariants, foldedByPlatform,
+    process.platform === 'win32'
+      ? 'Windows 上大小写不同应算同一个工作区'
+      : 'POSIX 上大小写不同应是两个不同的工作区');
   assert.equal(list.find((entry) => entry.path === missing).available, false);
   assert.equal(list.find((entry) => entry.path === missing).title, 'ws-missing', '没有 title 时用目录名');
 
