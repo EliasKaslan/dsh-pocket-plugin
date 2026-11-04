@@ -10,6 +10,7 @@
  *    不编造 405，否则就是假红。
  */
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
@@ -17,6 +18,9 @@ import { after, before, test } from 'node:test';
 import {
   expectSecurityHeaders, jsonResponse, request, requestJson, samePath, startBridge,
 } from './support/harness.mjs';
+
+/** health 的版本断言以包版本为准，不在测试里写死。 */
+const PKG_VERSION = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version;
 
 const SECRET_TITLE = '机密任务标题-9f2c7a';
 
@@ -137,7 +141,9 @@ test('/api/v1/health：200、只暴露公开字段、端口是实际监听端口
   assert.equal(body.data.port, ctx.port);
   assert.equal(body.data.protocol, 1);
   assert.equal(body.data.requiresPairing, true);
-  assert.equal(body.data.version, '1.0.0');
+  // 不要写死版本号：每次发版都得改测试，改漏了就是一条假红。以 package.json 为准，
+  // 这样真正要钉的是「health 报的版本 = 包版本」，而不是某个具体数字。
+  assert.equal(body.data.version, PKG_VERSION);
   // publicStatus 的注释承诺：没有路径、没有配对数据、没有错误细节。
   for (const forbidden of ['allowedRoots', 'devices', 'pairing', 'error', ctx.core.state.pairing.code]) {
     assert.equal(response.body.includes(forbidden), false, `health 泄漏了 ${forbidden}`);
