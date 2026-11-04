@@ -46,7 +46,10 @@ function makeLogger() {
   return { lines, info: push('info'), warn: push('warn'), error: push('error') };
 }
 
-const delay = (ms) => new Promise((resolve) => { const timer = setTimeout(resolve, ms); timer.unref?.(); });
+// 注意：这个定时器**不能** unref。await 一个 unref 的定时器时，事件循环会因
+// 为没有别的活而提前兜底，Node 22 的 runner 直接判 cancelledByParent，
+// 后面整个文件的测试都会被取消（Node 24 不复现，所以只有 CI 会红）。
+const delay = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 
 /**
  * 造一个真实 TaskIndex。`services` 未给出的键就是「宿主没装这个服务」。

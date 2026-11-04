@@ -323,7 +323,8 @@ test('relay 连接失败：错误与 offline 状态会经 status() 透出，且 
     while (Date.now() < deadline) {
       status = service.status();
       if (status.state === 'offline' && String(status.lastError).length > 0) break;
-      await new Promise((resolve) => { const timer = setTimeout(resolve, 25); timer.unref?.(); });
+      // 被 await 的定时器不能 unref（Node 22 会因此取消整个文件）。
+      await new Promise((resolve) => { setTimeout(resolve, 25); });
     }
     assert.equal(status.state, 'offline', `没连上必须落到 offline，实际 ${status.state}`);
     assert.match(String(status.lastError), /ECONNREFUSED|ECONNRESET|connect/u, `必须把真实原因带出来，实际 ${status.lastError}`);

@@ -23,7 +23,8 @@ let ctx;
 let token;
 let deviceId;
 
-const delay = (ms) => new Promise((resolve) => { const timer = setTimeout(resolve, ms); timer.unref?.(); });
+// 同上：被 await 的定时器不能 unref，否则 Node 22 的 runner 会取消整个文件。
+const delay = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 
 async function until(predicate, { timeoutMs = 4000, label = '条件' } = {}) {
   const deadline = Date.now() + timeoutMs;
