@@ -32,7 +32,16 @@ test('safeJoin 拒绝 ../ 穿越与绝对路径', () => {
   assert.equal(safeJoin(root, '../../secret.txt'), undefined);
   assert.equal(safeJoin(root, '..'), undefined);
   assert.equal(safeJoin(root, '..\\..\\windows\\win.ini'), undefined, '反斜杠也是分隔符');
-  assert.equal(safeJoin(root, 'C:\\Windows\\System32\\drivers\\etc\\hosts'), path.isAbsolute('C:\\Windows\\System32\\drivers\\etc\\hosts') ? undefined : path.join(root, 'C:\\Windows\\System32\\drivers\\etc\\hosts'), '盘符路径：在 win32 上是绝对路径必须拒；在 POSIX 上它只是根内的一个文件名，不能因此判失败');
+  // 盘符路径是个平台相关的坑：safeJoin 会先把 \ 归一成 /（util.mjs:287），
+  // 于是 win32 上 'C:/...' 仍是绝对路径 → 必须拒；POSIX 上它只是"根内一个带
+  // 冒号的文件名"，落进根里是安全的。这里只钉平台真正保证的结论。
+  const driveAbs = 'C:\\Windows\\System32\\drivers\\etc\\hosts';
+  const driveOut = safeJoin(root, driveAbs);
+  if (process.platform === 'win32') {
+    assert.equal(driveOut, undefined, '盘符路径在 win32 上是绝对路径，必须拒');
+  } else {
+    assert.ok(driveOut !== undefined && driveOut.startsWith(`${root}${path.sep}`), `POSIX 上必须被关在根内：${driveOut}`);
+  }
   assert.equal(safeJoin(root, '/etc/passwd'), path.join(root, 'etc', 'passwd'), '前导 / 被当作根内相对路径');
   // 平台无关的硬不变量：不管输入长什么样，结果要么被拒（undefined），要么必须落在根内。
   for (const probe of ['/etc/passwd', 'C:\\Windows\\win.ini', '../x', '..\\x', 'a/../../x', '/..\\/x']) {
