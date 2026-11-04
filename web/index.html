@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#070b16">
+<meta name="color-scheme" content="dark light">
+<meta name="format-detection" content="telephone=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="DSH 随行">
+<meta name="description" content="DSH 随行：用手机在任何网络查看与操作电脑上的 DeepSeek Harness，端到端加密，电脑零公网暴露。">
+<title>DSH 随行</title>
+<link rel="icon" href="/app/favicon.svg" type="image/svg+xml">
+<link rel="manifest" href="/app/manifest.webmanifest">
+<link rel="stylesheet" href="/app/app.css">
+</head>
+<body>
+<div id="app" class="app-root">
+  <div class="boot">
+    <div class="boot-mark">
+      <span class="logo-orbit"></span>
+      <svg viewBox="0 0 48 48" width="56" height="56" aria-hidden="true">
+        <defs><linearGradient id="bootGrad" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5B8CFF"/><stop offset="1" stop-color="#8B5CF6"/></linearGradient></defs>
+        <rect x="3" y="3" width="42" height="42" rx="13" fill="url(#bootGrad)"/>
+        <path d="M15 24.5c3.2-6.8 14.8-6.8 18 0" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/>
+        <circle cx="24" cy="30.5" r="3" fill="#fff"/>
+      </svg>
+    </div>
+    <div class="boot-title">DSH 随行</div>
+    <div class="boot-sub">正在连接你的电脑…</div>
+    <div class="boot-bar"><span></span></div>
+  </div>
+</div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<div id="modal-root" class="layer-root"></div>
+<script type="module" src="/app/app.js"></script>
+</body>
+</html>
