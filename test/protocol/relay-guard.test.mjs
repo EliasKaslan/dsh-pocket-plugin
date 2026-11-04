@@ -84,10 +84,14 @@ test('重放闸：STALE_WINDOW_MS 之外的 ts 一律 stale', () => {
   const sid = 'a1b2c3d4';
 
   assert.deepEqual(link.checkFreshness('req', { seq: 1, ts: now, sid }), { ok: true });
-  assert.equal(link.checkFreshness('req', { seq: 2, ts: now - STALE_WINDOW_MS - 1, sid }).code, 'stale');
-  assert.equal(link.checkFreshness('req', { seq: 3, ts: now + STALE_WINDOW_MS + 1, sid }).code, 'stale');
-  // 边界：正好等于窗口仍然接受（Math.abs > 窗口才拒）。
-  assert.equal(link.checkFreshness('req', { seq: 4, ts: now - STALE_WINDOW_MS, sid }).ok, true);
+  // 注意：闸门比的是**检查那一刻**的 Date.now()（cloud.mjs:779），测试里没法把
+  // now 钉死。所以不能断言「正好 WINDOW+1 就 stale」—— 只要检查晚 1ms 执行，
+  // 未来方向的那个差值就从 WINDOW+1 掉回 WINDOW，断言会随机翻成 pass/fail
+  // （CI 上真翻过一次）。这里只钉「明显超出窗口」与「明显在窗口内」。
+  assert.equal(link.checkFreshness('req', { seq: 2, ts: now - STALE_WINDOW_MS - 60_000, sid }).code, 'stale', '过去方向超窗');
+  assert.equal(link.checkFreshness('req', { seq: 3, ts: now + STALE_WINDOW_MS + 60_000, sid }).code, 'stale', '未来方向超窗');
+  // 窗口内留足余量，避免「跑得慢」把一条本该通过的断言拖成 stale。
+  assert.equal(link.checkFreshness('req', { seq: 4, ts: now - STALE_WINDOW_MS / 2, sid }).ok, true, '窗口内应放行');
   // 非法 seq / 缺失 sid 都归到 stale，而不是「放行后崩溃」。
   assert.equal(link.checkFreshness('req', { seq: 0, ts: now, sid }).code, 'stale');
   assert.equal(link.checkFreshness('req', { seq: 1.5, ts: now, sid }).code, 'stale');

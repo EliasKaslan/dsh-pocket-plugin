@@ -10,6 +10,9 @@ name: CI
 
 on:
   push:
+    # 只跟分支。不写 branches 的话打 tag 也会触发一次，同一个 commit 会跑两遍
+    # （已经踩过：tag 那次与分支那次结论不一致时，很难判断到底哪个是真的）。
+    branches: [main]
   pull_request:
   workflow_dispatch:
 

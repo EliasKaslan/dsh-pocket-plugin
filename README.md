@@ -48,13 +48,22 @@
 # 从本地目录安装（开发/自用最常见）
 dsh plugin add /path/to/dsh-pocket
 
-# 或者从 Git 地址安装
+# 或者直接从 GitHub 仓库装
 dsh plugin add github:EliasKaslan/dsh-pocket-plugin
 ```
 
-`dsh plugin add` 会把插件写进当前 profile 的 `package.json` 依赖，并把 `cordis.patch.yml` 里那行插件配置插进 profile 的补丁文件。装完**重启 DSH**（插件是 ESM，改代码必须冷启动，热重载只对配置生效）。
+`dsh plugin add` 会把插件写进当前 profile 的 `package.json` 依赖，并把 `cordis.patch.yml` 里那行插件配置插进 profile 的补丁文件。**它的安装器走 pnpm**，所以任何 pnpm 认的包源都行（本地目录、npm 包名、git 地址）。装完**重启 DSH** —— 插件是 ESM，改代码必须冷启动，热重载只对配置生效。
 
-手写安装（不想用 `dsh plugin add`）：把仓库里 `cordis.patch.yml` 的 `- insert:` 整段复制进 `$DSH_HOME/profiles/<你的 profile>/cordis.patch.yml` 顶层数组，把 `name:` 改成插件 `lib/index.mjs` 的绝对路径。
+> 上面两种写法里，`github:` 前缀依赖你那份 DSH 安装器的解析；如果你那边报"找不到包"，换成 `dsh plugin add https://github.com/EliasKaslan/dsh-pocket-plugin`，或者用下面的手写方式。
+
+手写安装（等价，形态与 `dsh-longhaul` 等现成 bundle 一致）：
+
+1. profile 的 `package.json` 依赖里加一条，指向你 clone 下来的目录：
+   ```json
+   { "dependencies": { "dsh-pocket-plugin": "link:D:/path/to/dsh-pocket" } }
+   ```
+2. 把仓库里 `cordis.patch.yml` 的 `- insert:` 整段复制进 `$DSH_HOME/profiles/<你的 profile>/cordis.patch.yml` 的顶层数组。`name:` 保持包名 `dsh-pocket-plugin` 即可，DSH 会从 profile 的 `node_modules` 里解析它。
+3. profile 目录下跑一次 pnpm 安装（或让 DSH 自己重装依赖），再重启。
 
 装好后打开 `http://127.0.0.1:47901/pair`，这就是电脑上的配对页 —— 二维码、配对码、已配对设备、远程开关都在这一页。这个页面**只接受本机回环访问**，局域网里的其它机器打开会被拒绝。
 
@@ -177,7 +186,7 @@ ESM 模块缓存：必须重启 DSH。只有 `cordis.patch.yml` 的配置改动�
 ```bash
 npm install            # 或 pnpm install
 node tools/dev-server.mjs     # web/ 热更新开发服务器（代理到 47901）
-node --test test/unit test/protocol   # 单元 + 协议测试（node:test，无浏览器）
+node --test "test/**/*.test.mjs"   # 单元 + 协议测试（node:test，无浏览器）
 node test/e2e/run.mjs         # 端到端：真起一个服务，打真 HTTP
 node tools/build-shell.mjs    # 生成 docs/：可直接静态托管的外壳
 node tools/build-shell.mjs --check    # 校验 docs/ 与源码同步（CI 用）
@@ -187,6 +196,10 @@ npm run verify        # 上面几条全跑一遍：语法 → 单测/协议 → 
 
 > Windows PowerShell 下如果 `npm` 被执行策略拦住（`npm.ps1 因为在此系统上禁止运行脚本`），
 > 用 `npm.cmd run verify`，或者直接按顺序敲上面那几条 `node` 命令 —— 本仓所有脚本都不依赖 npm。
+
+> 测试命令必须写成 glob。Node 24 会把 `node --test test/unit test/protocol` 里的**目录**当成模块去
+> `require`，直接 `MODULE_NOT_FOUND` 退 1；而空 glob（目录里没有匹配文件时）会以 `tests 0` 静默退 0。
+> 两种都不是你要的结果，所以 CI 与 `package.json` 统一用 `test/**/*.test.mjs`。
 
 目录：
 
@@ -203,6 +216,16 @@ test/        单元 / 协议 / 端到端测试
 `web/` 和 `remote/` 共用同一套 UI：`remote/index.html` 只是先把中继和登录搞定，再 `import` 同一份 `app.js`。所以两个入口的界面不会走样，改一处两边都变。
 
 Service Worker 的预缓存清单由 `tools/build-shell.mjs` 按真实产物列表生成，不要手写 —— 手写过一次，漏了 `store.js` / `lib/*` / `views/*`，结果断网打开是白屏。
+
+### 这个仓现在验到什么程度
+
+写清楚边界，免得你把「测过」当成「不会坏」：
+
+- **已验证**：`npm run verify` 四关全绿（60 文件语法 / 58 条单元+协议 / 11 条端到端 / `docs/` 与源码逐字节一致）；CI 在 Node 22 与 24 上都绿；把仓库重新 clone 一份（Linux CI 与 Windows 本地各一次）跑同样的四关，结果一致 —— 说明提交进仓库的东西是自洽的，不依赖我本机的残留文件。
+- **已验证**：用真实入口 `lib/index.mjs` + 假 ctx 起服务（临时端口、临时数据目录），健康检查 / CSP / 配对页 / 配对码 / 未授权 401 / 路径穿越 / 端口释放全部符合预期。
+- **已验证**：`npm pack --dry-run` 出来的 83 个文件里包含 `cordis.patch.yml`、`lib/index.mjs`、`bin/`，即安装器拿到的包是完整的。
+- **未验证**：没有把本插件真正装进一份 DSH profile 跑过（本机跑的是上一代 v1，不敢动）。所以 `dsh plugin add` 这一步的端到端效果请你自己确认一次；手写安装那条路径的形态与现成 bundle `dsh-longhaul` 完全一致。
+- **未验证**：iOS Safari 实机、真正的蜂窝网络切换、长时间（>24h）中继稳定性。
 
 ## 已知限制
 
