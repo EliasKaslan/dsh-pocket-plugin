@@ -242,7 +242,9 @@ Service Worker 的预缓存清单由 `tools/build-shell.mjs` 按真实产物列�
 
 写清楚边界，免得你把「测过」当成「不会坏」：
 
-- **已验证**：`npm run verify` 四关全绿（60 文件语法 / 58 条单元+协议 / 11 条端到端 / `docs/` 与源码逐字节一致）；CI 在 Node 22 与 24 上都绿；把仓库重新 clone 一份（Linux CI 与 Windows 本地各一次）跑同样的四关，结果一致 —— 说明提交进仓库的东西是自洽的，不依赖我本机的残留文件。
+- **已验证**：`npm run verify` 全绿（80 文件语法 / **414 条**单元+协议+域+集成+中继 / 11 条端到端 / `docs/` 与源码逐字节一致），测试本身跑完约 2.5 秒，不需要网络、不碰 `~/.dsh`、不占固定端口。CI 在 Node 22 与 24 上都绿；把仓库重新 clone 一份（Linux CI 与 Windows 本地各一次）跑同样的门禁，结果一致 —— 说明提交进仓库的东西是自洽的，不依赖我本机的残留文件。
+- **已验证（覆盖率）**：`node --test --experimental-test-coverage` 量出来 86% 行 / 88% 分支 / 90% 函数；`auth` / `messages` / `state` / `cloud-service` 行覆盖 100%，`task-index` 99.8%、`server` 96.4%、`util` 98.7%。没有覆盖到的是竞态与需要真实等待的分支（SSE/WS 心跳、socket 停滞、`listen` 失败），以及 `vendor/qrcode.mjs` 的内部算法。
+- **已验证（会红）**：对 `lib/` 做过多次变异（改 `MAX_TASKS` 上限、改 broker 条数上限、删重放闸、去掉 AAD），每次都有对应测试变红，改回即复绿 —— 不是「写了测试但断言是空的」。
 - **已验证**：用真实入口 `lib/index.mjs` + 假 ctx 起服务（临时端口、临时数据目录），健康检查 / CSP / 配对页 / 配对码 / 未授权 401 / 路径穿越 / 端口释放全部符合预期。
 - **已验证**：`npm pack --dry-run` 出来的 83 个文件里包含 `cordis.patch.yml`、`lib/index.mjs`、`bin/`，即安装器拿到的包是完整的。
 - **已验证（装进真 profile 冷启动）**：在隔离的 `DSH_HOME` 里用真 host 起过（`dsh --profile <name> --no-open`），日志出现 `plugin loading; data=<DSH_HOME>/pocket` 与 `bridge listening on 0.0.0.0:<port>`，`/api/v1/health` 200、`/pair` 200、`/api/v1/pairing` 正常发码、未授权 `/api/v1/tasks` 401；同一次实验里首选端口被占用，插件自动退到下一个端口。`--dump-config` 里能看到 `# == dsh-pocket-plugin` 这一层，说明 bundle 补丁确实被叠进去了。同一个形态也装进了日常在用的 profile。
@@ -254,6 +256,7 @@ Service Worker 的预缓存清单由 `tools/build-shell.mjs` 按真实产物列�
 - 远程模式下每条资源请求都要过一次中继往返，首次加载用 Service Worker 预缓存兜住；之后接近瞬时。
 - 上传附件、语音输入、系统推送通知都没有做（设置页里的「通知」开关目前只会申请浏览器权限，**不会真的弹通知**）。
 - 只在 Chromium / Safari 移动端浏览器上验过；桌面浏览器能用但不为它优化。
+- 三个已知的低危缺陷（测试里已如实钉住当前行为，尚未修）：跟随任务的幂等键记的是请求侧 `sessionId`，与任务实际落在的 agent id 不同时，重放同一个 `clientTaskId` 会**多建一个 agent** 而不是复用；空字符串 id 能进索引，但永远路由不到 `/tasks/:id`；预设损坏时 `String(对象)` 会退化成 `[object Object]`，丢掉原因。
 
 ## 许可
 

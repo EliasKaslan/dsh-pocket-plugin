@@ -58,8 +58,11 @@ jobs:
       - name: 语法检查
         run: node tools/check-syntax.mjs
 
-      - name: 单元 + 协议测试
-        run: node --test "test/unit/*.test.mjs" "test/protocol/*.test.mjs"
+      # 用一条 glob 覆盖全部测试目录。之前这里写死了 unit/ 与 protocol/ 两个目录，
+      # 后来新增的 domain/ integration/ relay/ util/ 四条线在 CI 里会被静默跳过 ——
+      # 本地绿、CI 也绿，但 CI 根本没跑那些测试。glob 必须留在这里而不是拆成多行。
+      - name: 单元 + 协议 + 域 + 集成 + 中继测试
+        run: node --test "test/**/*.test.mjs"
 
       - name: 浏览器端到端
         run: node test/e2e/run.mjs
