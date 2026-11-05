@@ -124,6 +124,50 @@ export function baseUrl() {
   return typeof shell.baseUrl === 'string' ? shell.baseUrl : '';
 }
 
+/* ---------------- shell hand-off ---------------- */
+
+/**
+ * 外壳（`remote/remote.js`）用口令换来的设备令牌。
+ *
+ * 口令登录是唯一入口：桌面在 `login` / `auth` 应答里把设备令牌一起发下来，
+ * 外壳再通过 `__POCKET_SHELL__` 交给这里。拿不到就只有两种可能——这台手机
+ * 还没登录，或者它的设备已经被电脑端移除。
+ */
+export function shellDeviceToken() {
+  const shell = globalThis.__POCKET_SHELL__;
+  if (shell?.mode !== 'remote') return '';
+  return typeof shell.deviceToken === 'string' ? shell.deviceToken : '';
+}
+
+/** 外壳没给令牌的原因：'' 正常，'revoked' 已被移除，'limit' 设备数已满。 */
+export function shellDeviceError() {
+  const shell = globalThis.__POCKET_SHELL__;
+  if (shell?.mode !== 'remote') return '';
+  return typeof shell.deviceError === 'string' ? shell.deviceError : '';
+}
+
+/**
+ * 外壳给的设备令牌 → 一份可以直接用的会话记录；没有令牌就返回 null。
+ *
+ * 令牌与设备 id 一律以外壳为准（手机重装后本地什么都没了，一次口令登录就
+ * 应该马上能用），地址、设备名这类附带信息沿用旧记录。
+ */
+export function sessionFromShell(prior = store.session) {
+  const token = shellDeviceToken();
+  if (token.length === 0) return null;
+  const shell = globalThis.__POCKET_SHELL__;
+  const shellBase = typeof shell?.baseUrl === 'string' ? shell.baseUrl : '';
+  const base = shellBase.length > 0 ? shellBase : (prior?.baseUrl ?? '');
+  return normalizeSession({
+    token,
+    baseUrl: base,
+    deviceId: shell?.deviceId || prior?.deviceId || '',
+    deviceName: prior?.deviceName ?? '',
+    serverName: prior?.serverName ?? '',
+    pairedAt: prior?.pairedAt ?? Date.now(),
+  });
+}
+
 export function serverName() {
   return store.bridge?.serverName
     || store.session?.serverName

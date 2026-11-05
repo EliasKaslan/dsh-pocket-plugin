@@ -58,9 +58,12 @@ export function makeLink({
   relayNonce,
   localPort = 47801,
   logger = makeLogger(),
+  core = null,
 } = {}) {
+  // core 走**构造参数**注入：生产里就是这样接的（cloud-service → CloudLink），
+  // 事后赋值会绕开这条路径，曾经因此漏掉"忘了传 core"的阻断 bug。
   const link = new CloudLink({
-    localPort, identity, auth, allowAnonymous, relayNonce, logger,
+    localPort, identity, auth, allowAnonymous, relayNonce, logger, core,
   });
   const sent = [];
   link.state = 'online';

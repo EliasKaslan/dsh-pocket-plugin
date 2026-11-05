@@ -4,8 +4,11 @@
 
 **不用内网穿透，不用公网 IP，不用开端口。** 电脑端只在 `127.0.0.1` 上监听，手机上唯一的通路是加密中继：手机和电脑各自向外连一个公共消息中转，中间流动的只有密文；密钥只存在于你手机扫到的那串链接里，中转服务器和服务商都拿不到。
 
-> **v2.0.0：只支持加密中继。局域网直连已移除。**
-> 旧版的「同一 Wi-Fi 下扫内网地址直连」（`http://<内网IP>:<端口>/app`）整条删掉了 —— 没有开关、没有降级、没有兼容层。桌面端**不再监听任何非回环地址**，配置里也不存在能改变监听地址的键。手机现在必须走：`cloud.appBase`（你自己托管的中继外壳）+ 8 位配对码 + 口令登录。从 1.x 升上来请先看 [MIGRATION.md](MIGRATION.md)。
+> **v2.1.0：手机只需要一个凭据 —— 账号 + 口令。**
+> 在手机的中继外壳登录页输入账号和口令，登录成功时电脑端**自动登记这台手机并下发设备令牌**（`deviceToken`），然后直接进入任务列表。不再需要 8 位配对码，也没有有效期倒计时。配对码并没有从代码里删掉，只是从界面与 CLI 上撤掉了，仅作为**兼容旧手机的后端口令**保留。
+
+> **v2.0.0 起：只支持加密中继，局域网直连已移除。**
+> 旧版的「同一 Wi-Fi 下扫内网地址直连」（`http://<内网IP>:<端口>/app`）整条删掉了 —— 没有开关、没有降级、没有兼容层。桌面端**不再监听任何非回环地址**，配置里也不存在能改变监听地址的键。手机必须走：`cloud.appBase`（你自己托管的中继外壳）+ 账号 + 口令。从 1.x 升上来请先看 [MIGRATION.md](MIGRATION.md)。
 
 > **包名说明**：本项目的 npm 包名是 `dsh-pocket-plugin`。npm 上另有一个同名项目叫 `dsh-pocket`，两者**没有关系**，代码、协议、许可都不同。认准 `dsh-pocket-plugin`。
 
@@ -19,16 +22,17 @@
 - **中断**：一键取消正在跑的任务。
 - **断网可用**：外壳是 PWA，安装后静态资源全部预缓存，飞行模式下也能打开看到上次的任务列表。
 
-## 手机怎么连（唯一路径）
+## 手机怎么连（唯一路径：一个凭据）
 
-v2 只有一条路，四个动作缺一不可：
+v2 只有一条路，三个动作缺一不可：
 
 | 步骤 | 做什么 | 在哪做 |
 | --- | --- | --- |
 | 1. 配 `cloud.appBase` | 把你自己托管的手机端外壳地址填进插件配置（结尾带 `/`） | 电脑：profile 的 `cordis.patch.yml` |
-| 2. 设口令 | `node tools/set-auth.mjs --user 你的名字`（交互输入，不回显） | 电脑：终端 |
-| 3. 扫码 / 输码 | 扫配对页「远程访问」的二维码，或在手机上手输 8 位配对码（形如 `VX42-NW9A`） | 手机：外壳页面 |
-| 4. 登录 | 输入第 2 步设的口令，成功后记住 15 天 | 手机：外壳页面 |
+| 2. 设账号 + 口令 | `node tools/set-auth.mjs --user 你的名字`（交互输入，不回显）；这里填的用户名就是手机要输的账号 | 电脑：终端 |
+| 3. 扫码 → 登录 | 扫配对页「远程访问」的二维码打开中继外壳，输入第 2 步的账号与口令，进入任务列表 | 手机：外壳页面 |
+
+**手机端只需要一个凭据：账号 + 口令。** 登录成功时电脑端自动把这台手机登记成「已配对设备」，并把设备令牌（`deviceToken`）随同一个应答发下来；之后这台手机靠令牌直接进入，不用再输口令，也没有第二步要填的码。配对页现在只显示三样东西：**中继二维码、账号提示、已配对设备列表**（另加中继状态与启停按钮）。
 
 二维码里只有中继信息（`<appBase>#s=<broker>&r=<房间号>&k=<密钥>`），**不含任何内网地址**。房间里流动的是密文：
 
@@ -90,9 +94,9 @@ cmd /c mklink /J "%USERPROFILE%\.dsh\profiles\<你的 profile>\node_modules\dsh-
 
 > `dsh plugin --profile <name> add <包>` 只是把参数转发给 pnpm，**不会**替你登记 `bundles`；而且 Electron 应用自管的 profile 会直接拒绝执行（`profile "..." is managed exclusively by the Electron application`）。所以上面这套手写步骤才是完整的安装路径。
 
-装好后打开 `http://127.0.0.1:47901/pair`，这就是电脑上的配对页 —— 二维码、配对码、已配对设备、中继状态都在这一页。这个页面**只在回环上可访问**：插件不监听任何非回环地址，也没有配置项能把它暴露出去。
+装好后打开 `http://127.0.0.1:47901/pair`，这就是电脑上的配对页 —— 中继二维码、登录账号提示、已配对设备列表、中继状态都在这一页，**页面上没有配对码，也没有任何倒计时**。这个页面**只在回环上可访问**：插件不监听任何非回环地址，也没有配置项能把它暴露出去。
 
-## 配对
+## 连接：登录即配对
 
 1. **配 `cloud.appBase`。** 先在电脑上生成外壳并把 `docs/` 发布出去：
 
@@ -104,18 +108,23 @@ cmd /c mklink /J "%USERPROFILE%\.dsh\profiles\<你的 profile>\node_modules\dsh-
 
    `cloud.appBase` **故意没有默认值**：外壳是一段会在你手机上执行的代码，如果把某个第三方地址写成默认，等于让每一次安装都去信任同一个人的账号。所以中继入口必须你自己提供这一段。
 
-2. **设访问口令。**
+2. **设账号 + 口令。**
 
    ```bash
    # 交互输入，不回显，不进命令历史
    node tools/set-auth.mjs --user 你的名字
    ```
 
-   没有口令时中继**不会启动**，`cloud.appBase` 为空时也不会启动 —— 两道闸都是有意的 fail-closed。
+   这里 `--user` 填的就是手机登录时要输的**账号**（配对页「手机登录」卡片会显示真实值，登录页通常也会预填；忘了就用 `node tools/set-auth.mjs --status` 看）。没有口令时中继**不会启动**，`cloud.appBase` 为空时也不会启动 —— 两道闸都是有意的 fail-closed。
 
-3. **扫码或输码。** 前两步做完并重启后，配对页「远程访问」那一栏会出现二维码；用手机扫它，或者在外壳打开的页面里手输 8 位配对码（`VX42-NW9A` 这种形态）。配对码 10 分钟内有效、最多用 10 次；一台电脑最多 8 台设备，满了要先在配对页撤销旧设备。
+3. **扫码打开中继外壳。** 前两步做完并重启后，配对页「远程访问」那一栏会出现二维码；用手机扫它（或把链接发到手机上打开）。二维码里只有中继、房间与密钥参数，不含任何地址，也没有需要手输的码 —— 页面上已经没有配对码，也没有有效期倒计时。
 
-4. **登录。** 输入第 2 步的口令。登录后手机记住 15 天，过期或被撤销都要重新登录；改口令会让所有手机立刻失效。
+4. **用账号 + 口令登录，登录成功即完成配对。** 电脑端自动登记这台手机、下发设备令牌，手机直接进入任务列表，并记住登录 15 天。三点要记住：
+   - **设备按 `name` + `platform` 识别**：同一台手机再次登录会**原地轮换**同一条设备记录，不会越登越多。
+   - **上限 8 台**（`maxDevices`）：达到上限时登录会明确报 `deviceLimit`，需要先在配对页「已配对设备」里移除旧设备。插件不会自己顶掉谁。
+   - **被移除 ≠ 重登就复活**：在配对页移除一台设备后，那台手机再出示旧令牌时，服务端回 `revoked: true` 且**不会自动补发**新令牌；旧令牌永远作废，它必须回到登录页用账号 + 口令重新登录一次（口令在电脑端校验通过才算你在电脑上重新确认，而且新登记仍占 8 台里的一个名额）。
+
+   改口令会让所有手机立刻失效，需要重新登录。
 
 手机浏览器登录后就是 App；把它「添加到主屏幕」，下次像原生应用一样打开。
 
@@ -127,8 +136,8 @@ cmd /c mklink /J "%USERPROFILE%\.dsh\profiles\<你的 profile>\node_modules\dsh-
 | --- | --- | --- |
 | `port` | `47901` | 回环监听端口；**监听地址固定 `127.0.0.1`**。被占用时自动顺延（47901 → 47902 → …），实际端口看 `/api/v1/health` 的 `port` |
 | `serverName` | `我的电脑` | 手机上显示的名字。**不会**默认用主机名，避免泄露机器名 |
-| `pairTtlMs` | `600000` | 配对码有效期 |
-| `maxDevices` | `8` | 最多同时配对的设备数 |
+| `pairTtlMs` | `600000` | 旧配对码的有效期。**仅对兼容旧手机的后端口令生效**：界面与 CLI 已不显示配对码，新流程用不到这一项 |
+| `maxDevices` | `8` | 最多同时配对的设备数；满了登录会报 `deviceLimit`，要先移除旧设备 |
 | `allowedRoots` | `[]` | 允许作为任务工作目录的根。**留空不是"不限制"**，而是"只允许你在 DSH 里打开过的工作区"；一个都没有时任务无法创建 |
 | `allowedHosts` | `[]` | 额外的合法 `Host` 值（本机反代预览时才需要），用于防 DNS rebinding |
 | `authRequired` | `true` | 是否要求口令登录。只有显式写 `false` 才会关；关掉它中继就起不来（除非同时开 `cloud.allowAnonymous`） |
@@ -140,12 +149,12 @@ cmd /c mklink /J "%USERPROFILE%\.dsh\profiles\<你的 profile>\node_modules\dsh-
 
 **已删除的两个配置键：`host`、`publicBaseUrl`。** v1 里用它们改监听地址 / 改二维码里的链接；v2 已经没有局域网路径，这两个键**被忽略**（旧配置里残留时只 warn 一次，不崩），填什么都改变不了「只监听 `127.0.0.1`」。
 
-数据目录里有：`state.json`（设备与配对码，只存 token 哈希）、`auth.json`（口令 scrypt 哈希）、`sessions.json`（登录会话）、`cloud.json`（中继房间与密钥）、`bridge.log`。这些都**不应该进版本库**，`.gitignore` 已经排除。
+数据目录里有：`state.json`（设备记录 + 兼容旧手机用的配对码，令牌只存哈希）、`auth.json`（账号与口令 scrypt 哈希）、`sessions.json`（登录会话）、`cloud.json`（中继房间与密钥）、`bridge.log`。这些都**不应该进版本库**，`.gitignore` 已经排除。
 
 ## 命令行
 
 ```bash
-node bin/cli.mjs pair            # 中继链接 + 二维码 + 配对码（别名 link）
+node bin/cli.mjs pair            # 中继链接 + 二维码 + 登录账号（不再打印配对码；别名 link）
 node bin/cli.mjs status          # 运行状态、中继状态、设备数
 node bin/cli.mjs devices         # 已配对设备
 node bin/cli.mjs revoke <id|all> # 撤销设备
@@ -163,7 +172,9 @@ node bin/cli.mjs broker [url]    # 查看/临时切换中继地址
 - **中继请求不提权**：转发进本机的请求带一个每进程随机标记，插件**看到标记就一律当作远程**（先标记、再校验值，值不对也只是记日志），哪怕源 IP 是 127.0.0.1；转发前该头一律剥离。
 - **中继路由白名单**：只有手机 UI 真正需要的路由能被代理进来；`/pair`、`/api/v1/pairing`、`/api/v1/pair`、`/api/v1/devices*`、`/api/v1/cloud*`、`/download*`、`/healthz` 在中继侧直接拒绝。
 - **口令闸门**：远程必须过口令（scrypt，N=16384）；中继侧还有 10 次/分钟的登录预算，超了直接 `locked`。
-- **设备令牌**：配对时下发随机令牌，只存哈希；可单独撤销，撤销时正在连的 WebSocket / SSE 立刻断开。
+- **一个凭据**：手机端唯一的凭据是**账号 + 口令**；配对码已从界面与 CLI 撤掉，仅作为兼容旧手机的后端口令保留，新流程不需要、也不该再让任何人去输它。
+- **设备令牌**：口令登录成功时下发随机令牌（`deviceToken`），只存哈希；设备按 `name` + `platform` 识别，同一台手机重新登录是**原地轮换**同一条记录，不会越登越多；可单独撤销，撤销时正在连的 WebSocket / SSE 立刻断开，且旧令牌**不会**被自动补发（要恢复只能重新用账号 + 口令登录）。
+- **设备上限 8 台**：`maxDevices` 默认 8，达到上限时登录明确失败（`deviceLimit`），不会静默顶掉旧设备。
 - **防 DNS rebinding**：所有路由先校验 `Host`，只接受 `localhost` / `127.0.0.1` / `[::1]` / 本机主机名 / `allowedHosts` 显式列表，外来 Host 直接 403。
 - **防 CSRF**：写操作校验 `Sec-Fetch-Site` / `Origin`；两者都没有时只放行回环，非回环一律拒绝。表单再带一个隐藏 CSRF 字段。
 - **工作目录白名单**：任务目录必须落在允许的根里，解析后按路径段比较；空列表 = 全关，不是全开。
@@ -187,7 +198,7 @@ node bin/cli.mjs broker [url]    # 查看/临时切换中继地址
 v2 只有中继一条路，按这个顺序查：配对页「远程访问」那一栏是 `未配置` = `cloud.appBase` 为空；`已阻止` = 还没设口令或 `authRequired=false`；`连接失败` = broker 不通，换一个（`cloud.broker`）试试。三项都正常还连不上，就是手机没有从外壳地址打开 —— 直接输内网地址已经不可能成功。
 
 **以前扫的二维码还能用吗？**
-不能。v1 的局域网二维码、`http://<内网IP>:端口/app` 链接在 v2 里全部失效（那条通路已经不存在）；即使你手里的中继链接还能打开外壳，也请重新配对一次 —— 旧外壳缓存和新产物对不上。见 [MIGRATION.md](MIGRATION.md)。
+不能。v1 的局域网二维码、`http://<内网IP>:端口/app` 链接在 v2 里全部失效（那条通路已经不存在）；即使你手里的中继链接还能打开外壳，也请重新登录一次 —— 旧外壳缓存和新产物对不上。见 [MIGRATION.md](MIGRATION.md)。
 
 **`host` / `publicBaseUrl` 还能配吗？**
 不能，也不生效。这两个键在 v2 被忽略（只 warn 一次），监听地址恒为 `127.0.0.1`。
@@ -202,13 +213,19 @@ ESM 模块缓存：必须重启 DSH。只有 `cordis.patch.yml` 的配置改动�
 没有允许的工作目录。在桌面端打开一个工作区，或者配置 `allowedRoots`。
 
 **手机上显示"登录已过期"？**
-会话默认 15 天；改过口令、或设备被撤销，也会立刻失效。重新扫码配一次即可。
+会话默认 15 天；改过口令、或设备被撤销，也会立刻失效。用账号 + 口令重新登录一次即可（口令是唯一凭据）。
+
+**手机上提示「这台设备已被电脑端移除」？**
+说明你在配对页移除过这台设备，它的令牌已被吊销。服务端**不会**因为手机再出示旧令牌就自动补发 —— 旧令牌永远作废。要恢复访问，回到登录页用账号 + 口令重新登录一次：口令在电脑端校验通过才算你在电脑上重新确认，新登记的设备同样受 8 台上限约束。
+
+**登录提示「设备数已达上限」（`deviceLimit`）？**
+已经登记满 8 台（`maxDevices`）。先在配对页「已配对设备」里移除一台不用了的，再让那台手机登录。插件不会自动顶掉旧设备，也不会把这条错误吞掉。
 
 **能不能不用公共 broker？**
 可以，`cloud.broker` 填你自己的 MQTT over WSS 地址；两台设备都连得上就行。
 
 **从旧版（`dsh-mobile-bridge`，协议 1）或 v1（`dsh-pocket-plugin` 1.0.x）升上来？**
-见 [MIGRATION.md](MIGRATION.md)：数据不自动迁移，要重新配对、重设口令。
+见 [MIGRATION.md](MIGRATION.md)：数据不自动迁移，要重新登录、重设账号与口令。
 
 ## 开发
 
@@ -253,9 +270,9 @@ Service Worker 的预缓存清单由 `tools/build-shell.mjs` 按真实产物列�
 - **门禁**：`npm run verify` 依次跑四条 —— `tools/check-syntax.mjs`（逐文件语法）→ `node --test "test/**/*.test.mjs"`（单元 + 协议 + 域 + 集成 + 中继）→ `test/e2e/run.mjs`（真起服务、打真 HTTP）→ `build-shell --check`（`docs/` 与源码逐字节一致）。测试本身跑完约几秒，不需要网络、不碰 `~/.dsh`、不占固定端口。CI 在 Node 22 与 24 上都跑同一套；把仓库重新 clone 一份（Linux CI 与 Windows 本地各一次）跑同样的门禁，结果一致 —— 说明提交进仓库的东西是自洽的，不依赖我本机的残留文件。
 - **覆盖率**：`node --test --experimental-test-coverage` 可量；`auth` / `messages` / `state` / `cloud-service` 的行覆盖接近满，`task-index` / `server` / `util` 也很高。没有覆盖到的主要是竞态与需要真实等待的分支（SSE/WS 心跳、socket 停滞、`listen` 失败），以及 `vendor/qrcode.mjs` 的内部算法。具体百分比以命令输出为准。
 - **已验证（会红）**：对 `lib/` 做过多次变异（改 `MAX_TASKS` 上限、改 broker 条数上限、删重放闸、去掉 AAD），每次都有对应测试变红，改回即复绿 —— 不是「写了测试但断言是空的」。
-- **已验证**：用真实入口 `lib/index.mjs` + 假 ctx 起服务（临时端口、临时数据目录），健康检查 / CSP / 配对页 / 配对码 / 未授权 401 / 路径穿越 / 端口释放全部符合预期；v2 还钉住了「监听地址是 `127.0.0.1`」「非回环 `Host` 仍然 403」「旧配置里的 `host` 被忽略」。
+- **已验证**：用真实入口 `lib/index.mjs` + 假 ctx 起服务（临时端口、临时数据目录），健康检查 / CSP / 配对页（只渲染账号提示与设备列表，且不含配对码）/ 未授权 401 / 路径穿越 / 端口释放全部符合预期；v2 还钉住了「监听地址是 `127.0.0.1`」「非回环 `Host` 仍然 403」「旧配置里的 `host` 被忽略」。
 - **已验证**：`npm pack --dry-run` 出来的清单里包含 `cordis.patch.yml`、`lib/index.mjs`、`bin/`，即安装器拿到的包是完整的。
-- **已验证（装进真 profile 冷启动）**：在隔离的 `DSH_HOME` 里用真 host 起过（`dsh --profile <name> --no-open`），日志出现 `plugin loading; data=<DSH_HOME>/pocket` 与 `bridge listening on 127.0.0.1:<port>`，`/api/v1/health` 200、`/pair` 200、`/api/v1/pairing` 正常发码、未授权 `/api/v1/tasks` 401；同一次实验里首选端口被占用，插件自动退到下一个端口。`--dump-config` 里能看到 `# == dsh-pocket-plugin` 这一层，说明 bundle 补丁确实被叠进去了。同一个形态也装进了日常在用的 profile。
+- **已验证（装进真 profile 冷启动）**：在隔离的 `DSH_HOME` 里用真 host 起过（`dsh --profile <name> --no-open`），日志出现 `plugin loading; data=<DSH_HOME>/pocket` 与 `bridge listening on 127.0.0.1:<port>`，`/api/v1/health` 200、`/pair` 200、`/api/v1/pairing` 200（配对页只取设备上限与账号，不再显示配对码）、未授权 `/api/v1/tasks` 401；同一次实验里首选端口被占用，插件自动退到下一个端口。`--dump-config` 里能看到 `# == dsh-pocket-plugin` 这一层，说明 bundle 补丁确实被叠进去了。同一个形态也装进了日常在用的 profile。
 - **未验证**：iOS Safari 实机、真正的蜂窝网络切换、长时间（>24h）中继稳定性。
 
 ## 已知限制
@@ -272,4 +289,4 @@ MIT。第三方组件见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)；安�
 
 ## English
 
-DSH Pocket puts your desktop DeepSeek Harness on your phone. Since v2.0.0 the relay is the **only** path: the desktop listens on `127.0.0.1` only and never exposes a LAN address, the phone goes through a static shell you host yourself (`cloud.appBase`), and everything between them is AES-256-GCM sealed with a key that only lives in the QR-code fragment. Set a password, open `http://127.0.0.1:47901/pair`, scan the code or type the 8-character pairing code, then log in. Direct LAN access (`http://<lan-ip>:<port>/app`) has been removed with no fallback; v1 QR codes and links are void — see [MIGRATION.md](MIGRATION.md). MIT licensed.
+DSH Pocket puts your desktop DeepSeek Harness on your phone. Since v2.0.0 the relay is the **only** path: the desktop listens on `127.0.0.1` only and never exposes a LAN address, the phone goes through a static shell you host yourself (`cloud.appBase`), and everything between them is AES-256-GCM sealed with a key that only lives in the QR-code fragment. Since v2.1.0 the phone needs exactly one credential — the account and password you set on the desktop: scan the code, sign in with them, and the first successful login registers the phone and returns a device token, so no pairing code is needed (the legacy code is kept only as a backend fallback for old phones). Direct LAN access (`http://<lan-ip>:<port>/app`) has been removed with no fallback; v1 QR codes and links are void — see [MIGRATION.md](MIGRATION.md). MIT licensed.

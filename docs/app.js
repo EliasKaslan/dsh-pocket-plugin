@@ -1,9 +1,13 @@
 /**
  * DSH 随行 · phone client entry point.
  *
- * Boots the pair/connect flow, owns the router, and is the single place that
- * talks to the host: every view gets its actions through `ctx` instead of
- * importing the network layer itself.
+ * Boots the connect flow, owns the router, and is the single place that talks to
+ * the host: every view gets its actions through `ctx` instead of importing the
+ * network layer itself.
+ *
+ * 登录只有一种方式：中继外壳（`remote/remote.js`）用口令向电脑换一张设备
+ * 令牌，再通过 `__POCKET_SHELL__` 交过来。拿到令牌就直接渲染任务列表，
+ * 中间没有任何需要手输的码。
  */
 import './lib/sprite.js';
 import { $, empty, h, icon, raf } from './lib/dom.js';
@@ -12,10 +16,10 @@ import { relTime } from './lib/format.js';
 import { toast } from './lib/ui.js';
 import {
   LIMITS, applyTheme, baseUrl, isRelayShell, loadCache, loadPrefs, loadSession,
-  saveCache, savePrefs, saveSession, serverName, store, token,
+  saveCache, savePrefs, saveSession, serverName, sessionFromShell, shellDeviceError, store, token,
 } from './store.js';
 import { mountCompose } from './views/compose.js';
-import { mountConnect, readPairFragment } from './views/connect.js';
+import { mountConnect } from './views/connect.js';
 import { mountDetail } from './views/detail.js';
 import { mountSettings } from './views/settings.js';
 import { mountTasks } from './views/tasks.js';
@@ -27,7 +31,6 @@ const SESSION_CACHE = 'dsh.pocket.session.v1';
 const app = document.getElementById('app');
 const banner = createBanner();
 
-let pendingPair = null;
 let view = null;
 let viewName = '';
 let viewSeq = 0;
@@ -44,7 +47,7 @@ const api = createApi({
   getBase: () => baseUrl(),
   getToken: token,
   onUnauthorized: (message) => {
-    toast(message || '登录已失效，请重新配对', { tone: 'danger' });
+    toast(message || '登录已失效，请重新用口令登录', { tone: 'danger' });
     signOut();
   },
 });
@@ -428,10 +431,13 @@ function makeContext() {
       } catch { /* ignore */ }
     },
     unpair() { signOut({ forget: true }); },
-    paired(session) {
-      saveSession(session);
-      void enterApp();
+    /** 回到口令闸门：清掉登录会话与设备令牌，由中继外壳重新弹登录页。 */
+    relogin() {
+      const shell = globalThis.__POCKET_SHELL__;
+      if (typeof shell?.relogin === 'function') { shell.relogin(); return; }
+      location.reload();
     },
+    reloadPage() { location.reload(); },
     savedCwd(cwd) { savePrefs({ lastCwd: cwd }); },
     reloadDetail() { if (store.detailId !== null) void loadDetail(store.detailId); },
     refreshDetailSoon() { scheduleDetailRefresh(400); },
@@ -533,25 +539,14 @@ async function boot() {
   store.session = isRelayShell() ? loadSession() : null;
   if (!isRelayShell()) saveSession(null);
 
-  const pairPayload = readPairFragment(location.hash);
-  if (pairPayload !== null && pairPayload.code.length > 0) {
-    // 老二维码里的 `u`（局域网地址）已被 readPairFragment 丢弃，这里也不再看地址。
-    pendingPair = pairPayload;
-    history.replaceState(null, '', location.pathname + location.search);
-  }
+  // 外壳刚用口令换到设备令牌：以它为准重建会话 —— 有令牌就直接进任务列表，
+  // 中间不再有任何连接页。外壳明确说这台设备没有令牌可用
+  // （被电脑端移除 / 设备数已满）时，本地那份旧会话一律作废。
+  if (shellDeviceError().length > 0) saveSession(null);
+  else adoptShellSession();
 
   window.addEventListener('hashchange', () => { void applyRoute(); });
   window.addEventListener('online', () => { realtime?.kick(); void loadTasks({ silent: true }); });
-
-  if (pendingPair !== null) {
-    const ok = await tryAutoPair(pendingPair);
-    pendingPair = null;
-    if (ok) return;
-    navigate('/connect', { replace: true });
-    await applyRoute();
-    toast('自动配对失败，请手动输入配对码', { tone: 'danger' });
-    return;
-  }
 
   if (store.session !== null) {
     await enterApp();
@@ -563,41 +558,12 @@ async function boot() {
   void registerWorker();
 }
 
-async function tryAutoPair(payload) {
-  // 直连已删除：不在中继外壳里就不存在可用的 base，自动配对直接放弃。
-  if (!isRelayShell()) return false;
-  const base = baseUrl();
-  if (base.length === 0) return false;
-  try {
-    const deviceName = store.prefs.deviceName ?? '';
-    const name = deviceName.length > 0 ? deviceName : defaultDeviceNameSafe();
-    const data = await api('/api/v1/pair', {
-      method: 'POST',
-      auth: false,
-      base,
-      timeout: 25_000,
-      body: { code: payload.code, name, platform: 'web', appVersion: APP_VERSION },
-    });
-    if (typeof data?.token !== 'string') return false;
-    saveSession({
-      token: data.token,
-      baseUrl: base,
-      deviceName: name,
-      serverName: data.server?.name ?? payload.name ?? '',
-      pairedAt: Date.now(),
-    });
-    await enterApp();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function defaultDeviceNameSafe() {
-  const ua = navigator.userAgent;
-  if (/iPhone/u.test(ua)) return 'iPhone';
-  if (/Android/u.test(ua)) return 'Android 手机';
-  return '我的手机';
+/** 用外壳给的设备令牌重建会话；没有令牌就什么也不做（返回 false）。 */
+function adoptShellSession() {
+  const adopted = sessionFromShell(store.session);
+  if (adopted === null) return false;
+  saveSession(adopted);
+  return true;
 }
 
 boot().catch((error) => {

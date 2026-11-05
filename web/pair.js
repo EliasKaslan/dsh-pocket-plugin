@@ -4,22 +4,12 @@
   'use strict';
 
   const $ = (id) => document.getElementById(id);
-  const codeEl = $('pair-code');
-  const bar = $('countdown-bar');
-  const countdownText = $('countdown-text');
-  const usesEl = $('pair-uses');
   const deviceList = $('device-list');
   const deviceCount = $('device-count');
   const toastEl = $('toast');
 
-  let state = { expiresAt: 0, ttlMs: 600000, uses: 0, maxUses: 10 };
   let stopped = false;
   let toastTimer;
-
-  try {
-    const raw = document.getElementById('pair-data')?.textContent;
-    if (raw) state = { ...state, ...JSON.parse(raw) };
-  } catch { /* keep defaults */ }
 
   function toast(message) {
     if (!toastEl) return;
@@ -27,24 +17,6 @@
     toastEl.classList.add('show');
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2200);
-  }
-
-  function fmtRemaining(ms) {
-    if (ms <= 0) return '已过期，正在刷新…';
-    const total = Math.ceil(ms / 1000);
-    const minutes = Math.floor(total / 60);
-    const seconds = total % 60;
-    return `剩余 ${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-  }
-
-  function tick() {
-    const remaining = state.expiresAt - Date.now();
-    const ratio = state.ttlMs > 0 ? Math.max(0, Math.min(1, remaining / state.ttlMs)) : 0;
-    if (bar) bar.style.width = `${(ratio * 100).toFixed(2)}%`;
-    if (countdownText) countdownText.textContent = fmtRemaining(remaining);
-    if (bar) bar.style.background = ratio < 0.2
-      ? 'linear-gradient(90deg,#fbbf24,#f87171)'
-      : 'linear-gradient(90deg,#5b8cff,#8b5cf6)';
   }
 
   function renderDevices(devices) {
@@ -89,18 +61,10 @@
     }
   }
 
+  // 页面只关心设备列表：配对码已经不再是用户要读的东西。
   function apply(data) {
     if (!data || typeof data !== 'object') return;
-    state = {
-      expiresAt: Number(data.expiresAt) || 0,
-      ttlMs: Number(data.ttlMs) || 600000,
-      uses: Number(data.uses) || 0,
-      maxUses: Number(data.maxUses) || 10,
-    };
-    if (codeEl && typeof data.code === 'string') codeEl.textContent = data.code;
-    if (usesEl) usesEl.textContent = `已配对 ${state.uses} 次`;
     renderDevices(data.devices);
-    tick();
   }
 
   async function refresh() {
@@ -117,22 +81,6 @@
       if (body?.ok) apply(body.data);
     } catch (error) {
       if (!stopped) toast('与桥接服务的连接已断开，正在重试…');
-    }
-  }
-
-  async function rotate() {
-    const button = $('rotate');
-    if (button) button.disabled = true;
-    try {
-      const response = await fetch('/api/v1/pairing/rotate', { method: 'POST', headers: { accept: 'application/json' } });
-      const body = await response.json();
-      if (!response.ok || !body?.ok) throw new Error(body?.error?.message || '刷新失败');
-      apply(body.data);
-      toast('已生成新的配对码');
-    } catch (error) {
-      toast(error.message || '刷新失败');
-    } finally {
-      if (button) button.disabled = false;
     }
   }
 
@@ -206,14 +154,12 @@
     } catch { /* the next tick retries */ }
   }
 
-  $('rotate')?.addEventListener('click', rotate);
   document.addEventListener('click', (event) => {
     if (event.target.closest('[data-copy-remote]')) {
       copy($('remote-url')?.textContent?.trim() || '');
     }
   });
 
-  setInterval(tick, 1000);
   setInterval(refresh, 4000);
   setInterval(refreshRemote, 5000);
   refresh();

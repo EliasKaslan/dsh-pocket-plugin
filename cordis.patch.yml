@@ -1,4 +1,4 @@
-# DSH 随行（dsh-pocket-plugin）· 插件行  ·  v2.0.0
+# DSH 随行（dsh-pocket-plugin）· 插件行  ·  v2.1.0
 #
 # 作为一个 DSH bundle 安装时，这一行由 bundle 自带，无需手写。
 # 用 `dsh plugin add <源>` 安装后，profile 的 package.json 会多一条依赖，
@@ -8,7 +8,8 @@
 # `$DSH_HOME/profiles/<profile>/cordis.patch.yml` 的顶层数组即可。
 #
 # v2 只走加密中继：桌面端固定监听 127.0.0.1，局域网直连已移除，
-# 手机的唯一入口是「中继外壳 + 8 位配对码 + 口令登录」。
+# 手机的唯一入口是「中继外壳 + 账号 + 口令」。登录成功即自动登记设备并
+# 下发设备令牌，不再需要 8 位配对码（旧配对码仅作兼容旧手机的后端口令保留）。
 # 旧配置里残留的 `host` / `publicBaseUrl` 会被忽略（只 warn 一次），
 # 改它们不会改变监听地址 —— 不存在任何能把面板暴露到内网/公网的开关。
 - insert:
@@ -24,7 +25,7 @@
         cloud:
           # 中继是 v2 的唯一通路，但它默认关闭。开启要同时满足两个前提，
           # 缺一个都起不来 —— 这是有意的 fail-closed，不是没做完：
-          #   1) 设过访问口令（`node tools/set-auth.mjs`，或在配对页里设置）；
+          #   1) 设过访问口令（`node tools/set-auth.mjs --user 你的名字`；账号就是手机登录时输的用户名）；
           #   2) `appBase` 填了你自己托管的手机端外壳地址。
           enabled: false
           # 手机端静态外壳的地址。**故意留空**：外壳是一段会在你手机上执行的

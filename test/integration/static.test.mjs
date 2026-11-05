@@ -254,12 +254,15 @@ test('根路径：回环 302 到 /pair；中继请求拿到落地页，且既不
   assert.equal(remote.body.includes(ctx.core.csrfToken), false, '落地页泄漏了 CSRF token');
 });
 
-test('配对页：回环 200 且带配对码 / CSRF meta；中继 403 落地页且绝不带码', async () => {
+test('配对页：回环 200 且给账号+口令指引（不再显示配对码）/ CSRF meta；中继 403 落地页', async () => {
   const page = await request(ctx.port, '/pair');
   assert.equal(page.status, 200);
   assert.equal(page.headers['content-type'], 'text/html; charset=utf-8');
   assert.equal(page.headers['cache-control'], 'no-store', '配对页不能被缓存');
-  assert.equal(page.body.includes(ctx.core.state.pairing.code), true, '配对页必须显示配对码');
+  // v2.1 起凭据统一成「账号 + 口令」：配对码不再出现在页面上，
+  // 手机登录成功时桌面端自动发设备令牌。
+  assert.equal(page.body.includes(ctx.core.state.pairing.code), false, '配对码不该再显示在页面上');
+  assert.match(page.body, /口令/u, '配对页必须告诉用户手机端用什么登录');
   assert.equal(page.body.includes(`<meta name="pocket-csrf" content="${ctx.core.csrfToken}">`), true);
   assert.match(page.body, /还没有配对设备/u);
   assert.match(page.body, /远程访问已停止/u, 'auth.required=true 且无凭据时必须给出「缺少口令」横幅');

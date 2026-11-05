@@ -9,8 +9,8 @@
 
    Boot order (must not be reordered):
      splash -> hash validation -> sealer -> relay connect -> hello ->
-     login gate -> per-tab session -> shims -> __POCKET_SHELL__ ->
-     await import('./app.js')
+     login gate -> device token (from the login/auth reply) -> shims ->
+     __POCKET_SHELL__ -> await import('./app.js')
 
    Rules for this file:
    - No innerHTML / insertAdjacentHTML anywhere. Every dynamic string is
@@ -19,9 +19,11 @@
      reasons) and from the URL.
    - No absolute paths and no absolute asset URLs: the shell may live at a
      sub-path of any static host.
-   - The device token never goes to localStorage. *.github.io shares one
-     origin across every project page, so a token parked there is readable
-     by any sibling page (and by any XSS on one).
+   - 口令是唯一凭据：登录成功时桌面随应答下发这台手机**自己的**设备令牌，
+     外壳把它交给 app.js（`__POCKET_SHELL__.deviceToken`）。令牌只写在 app
+     自己的 `dsh.pocket.*` / `pocket.*` 键里，为的是刷新页面不用重新登记一台
+     设备；它在电脑端「移除设备」后立即作废 —— 外壳会把本地那份一起丢掉，
+     并要求重新用口令登录。链接里的 `r`/`k` 永不入库。
    ============================================================ */
 
 /* ------------------------------- constants ------------------------------ */
@@ -356,6 +358,46 @@ function clearDeviceSession() {
   }
 }
 
+/**
+ * 这台手机上次拿到的设备令牌（可能没有）。
+ *
+ * 必须在 `auth` 之前读出来：带上它桌面才会「原样回显」而不是又登记一台新
+ * 设备 —— 少了这一步，每刷新一次页面就会多出一台设备，直到撞上设备上限。
+ */
+function readDeviceSession() {
+  for (const key of [SS_SESSION, APP_SESSION_KEY]) {
+    const raw = readStorage('local', key);
+    if (typeof raw !== 'string' || raw.length === 0) continue;
+    try {
+      const parsed = JSON.parse(raw);
+      const token = typeof parsed?.token === 'string' ? parsed.token : '';
+      if (token.length === 0) continue;
+      return { token, deviceId: typeof parsed?.deviceId === 'string' ? parsed.deviceId : '' };
+    } catch { /* 坏了的那份跳过，别让一条脏记录挡住登录 */ }
+  }
+  return null;
+}
+
+/**
+ * 把「这台手机的设备令牌」落盘 —— app.js 就是从这个键建会话的。
+ *
+ * 令牌为空时必须把旧副本清掉：一张已经作废的令牌比没有更糟，它会一直 401。
+ */
+function persistDeviceSession(token, deviceId, { name, room }) {
+  if (typeof token !== 'string' || token.length === 0) {
+    clearDeviceSession();
+    return;
+  }
+  saveDeviceSession({
+    baseUrl: REMOTE_ORIGIN,
+    token,
+    deviceId: typeof deviceId === 'string' ? deviceId : '',
+    server: { name },
+    remote: { room: String(room ?? '').slice(0, 6) },
+    at: Date.now(),
+  });
+}
+
 /* ------------------------------- 登录闸门 ------------------------------- */
 
 const LOGIN_ERROR_TEXT = {
@@ -514,6 +556,14 @@ class Relay {
     this.onunauthorized = () => {};
     /** 15-day login token, loaded before the first `auth` exchange. */
     this.session = null;
+    /**
+     * 这台手机**自己的**设备令牌：口令登录成功时由桌面随机下发，调用 HTTP API
+     * 的 `Authorization: Bearer` 用的就是它（等价于以前 `/api/v1/pair` 发的 token）。
+     */
+    this.deviceToken = '';
+    this.deviceId = '';
+    /** 桌面为什么没给令牌：'' 正常，'revoked' 已被移除，'limit' 设备数已满。 */
+    this.deviceIssue = '';
     this.authRequired = false;
     this.authUser = null;
     this.authWaiter = undefined;
@@ -682,6 +732,8 @@ class Relay {
       case 'auth': {
         this.authRequired = message.required === true;
         this.authUser = typeof message.user === 'string' ? message.user : null;
+        // 桌面顺手把设备令牌（或「被移除 / 设备数满」）一起写在应答里。
+        this.absorbDevice(message);
         if (message.ok === true && Number(message.expiresAt) > 0 && this.session !== null) {
           this.session.expiresAt = Number(message.expiresAt);
           void saveAuthSession(this.session);
@@ -690,6 +742,7 @@ class Relay {
         break;
       }
       case 'login': {
+        this.absorbDevice(message);
         this.loginWaiter?.(message);
         break;
       }
@@ -804,6 +857,41 @@ class Relay {
     }
   }
 
+  /**
+   * 这台手机自报的设备令牌。桌面据此区分「第一次登录」（登记一台新设备）和
+   * 「上次那台还好不好用」。没有就不带这个字段 —— 带空串等于「自报了但无效」。
+   */
+  deviceClaim() {
+    return this.deviceToken.length > 0 ? { deviceToken: this.deviceToken } : {};
+  }
+
+  /**
+   * 口令应答（`login` / `auth`）里带回来的设备令牌：首次登录、续期、手机重装
+   * 之后用同一个口令登录一次，都走这里刷新本地那一份。
+   *
+   * 桌面只在「手机自报了令牌却用不了」时回 revoked / deviceLimit，并且明确
+   * 不自动补发 —— 所以客户端这份必须一起丢掉，别让下一次继续拿它去撞。
+   */
+  absorbDevice(reply) {
+    const token = typeof reply?.deviceToken === 'string' ? reply.deviceToken : '';
+    if (token.length > 0) {
+      this.deviceToken = token;
+      this.deviceId = typeof reply.deviceId === 'string' ? reply.deviceId : '';
+      this.deviceIssue = '';
+      return;
+    }
+    if (reply?.revoked === true) this.dropDevice('revoked');
+    else if (reply?.deviceLimit === true) this.dropDevice('limit');
+  }
+
+  /** 忘掉这台手机的设备令牌（被移除 / 设备数满 / 主动重新登录）。 */
+  dropDevice(issue = '') {
+    this.deviceToken = '';
+    this.deviceId = '';
+    this.deviceIssue = issue;
+    clearDeviceSession();
+  }
+
   /** Ask the desktop whether this link needs a login and whether ours works. */
   checkAuth(timeoutMs = 8_000) {
     return new Promise((resolve) => {
@@ -815,7 +903,9 @@ class Relay {
         resolve(value);
       };
       this.authWaiter = done;
-      this.send({ t: 'auth' }).catch(() => done({ required: false, ok: true }));
+      // `phone` 只在桌面需要新登记一台设备时用到（还没登录过 / 本地没有令牌）。
+      this.send({ t: 'auth', phone: this.phoneName, platform: 'web', ...this.deviceClaim() })
+        .catch(() => done({ required: false, ok: true }));
       setTimeout(() => done({ required: this.authRequired, ok: !this.authRequired }), timeoutMs);
     });
   }
@@ -831,7 +921,7 @@ class Relay {
         resolve(value);
       };
       this.loginWaiter = done;
-      this.send({ t: 'login', user, password, remember, phone: this.phoneName })
+      this.send({ t: 'login', user, password, remember, phone: this.phoneName, platform: 'web', ...this.deviceClaim() })
         .catch((error) => done({ ok: false, reason: 'send-failed', message: String(error?.message ?? error) }));
       setTimeout(() => done({ ok: false, reason: 'timeout' }), timeoutMs);
     });
@@ -1172,6 +1262,8 @@ async function main() {
 
   const room = params.get('r');
   const key = params.get('k');
+  // `t` 只用来判断「这是不是一个完整的远程链接」。它以前被当成手机的 API
+  // 凭据；现在凭据只有一条路——口令登录换来的 deviceToken（见 persistDeviceSession）。
   const token = params.get('t');
   const name = params.get('n') ?? 'DSH';
 
@@ -1201,6 +1293,12 @@ async function main() {
   }
 
   const relay = new Relay({ room, sealer, brokers });
+  // 上次拿到的设备令牌先装上：`auth` 靠它判断「还是那台设备」还是「新登记一台」。
+  const known = readDeviceSession();
+  if (known !== null) {
+    relay.deviceToken = known.token;
+    relay.deviceId = known.deviceId;
+  }
   relay.session = await loadAuthSession();
   window.__POCKET_RELAY__ = relay;
 
@@ -1283,16 +1381,22 @@ async function main() {
     };
   }
 
-  // Device session: per tab only. The device token comes from the link, so
-  // nothing has to survive the tab; app.js needs a session record to build its
-  // Authorization header.
-  saveDeviceSession({
-    baseUrl: REMOTE_ORIGIN,
-    token,
-    server: { name },
-    remote: { room: room.slice(0, 6) },
-    at: Date.now(),
-  });
+  // 设备令牌：口令登录成功时桌面已经随应答一起下发（首次登录会自动登记一台）。
+  // 被移除 / 设备数满时桌面明确回 deviceToken:null，并且**不会**自动补发 ——
+  // 这两种情况绝不能再拿链接里的令牌顶上，否则「移除设备」就形同虚设。
+  if (relay.deviceIssue === 'revoked') {
+    // 设备被移除 = 这台手机的凭据作废：连 15 天登录会话一起清掉，
+    // 下一次真正走一遍口令登录（口令是唯一凭据）。
+    clearAuthSession();
+    relay.session = null;
+  }
+  // 设备令牌只有一个来源：口令登录成功时桌面随应答下发的这张。
+  // 拿不到就是拿不到 —— 链接里的 `t` 是电脑自己的中继身份，用它顶替等于让
+  // 电脑端的「移除设备」形同虚设，所以这里不做任何回落。
+  const deviceToken = relay.deviceToken;
+
+  // Device session: app.js needs a record to build its Authorization header.
+  persistDeviceSession(deviceToken, relay.deviceId, { name, room });
 
   installShims(relay);
   hideSplash();
@@ -1304,6 +1408,24 @@ async function main() {
     baseUrl: REMOTE_ORIGIN,
     swUrl: './sw.js',
     assetBase: './',
+    /** 口令登录换来的设备令牌：app.js 拿到它就直接渲染任务列表。 */
+    deviceToken,
+    deviceId: relay.deviceId,
+    /** 为什么没有令牌：'revoked' 已被电脑端移除，'limit' 设备数已达上限。 */
+    deviceError: relay.deviceIssue,
+    /** 重新登录：清掉登录会话与设备令牌，回到口令闸门（口令是唯一凭据）。 */
+    relogin() {
+      clearAuthSession();
+      relay.session = null;
+      relay.dropDevice('');
+      void showLoginGate(relay, { user: relay.authUser ?? '', reason: '请重新登录' })
+        .then((ok) => {
+          if (!ok) return;
+          // 闸门刚换到的新设备令牌得先落盘，否则刷新后又要重新登记一台。
+          persistDeviceSession(relay.deviceToken, relay.deviceId, { name, room });
+          location.reload();
+        });
+    },
   };
 
   try {

@@ -1202,27 +1202,19 @@ svg { stroke: currentColor; stroke-width: 1.8; fill: none; stroke-linecap: round
   border: 1px solid var(--line);
   background: var(--surface);
   box-shadow: var(--shadow-2);
+  text-align: left;
 }
-.connect-card .field-label { padding: 4px 1px 2px; font-size: 11.5px; color: var(--text-3); }
 
-.code-input, .text-input {
-  width: 100%;
-  height: 50px;
-  padding: 0 15px;
-  border-radius: 13px;
-  border: 1px solid var(--line);
-  background: var(--surface-2);
-  color: var(--text);
-  font-size: 17px;
-  letter-spacing: 3px;
-  outline: none;
-  transition: border-color .16s, background .16s;
+/* 中间那一步已经删掉：这张卡现在只负责解释「为什么没进任务列表」。 */
+.connect-status {
+  margin: 2px 1px 4px;
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: var(--text-2);
 }
-.text-input { font-size: 15px; letter-spacing: 0; }
-.code-input::placeholder, .text-input::placeholder { color: var(--text-3); letter-spacing: 0; font-size: 14px; }
-.code-input:focus, .text-input:focus { border-color: var(--accent); background: var(--surface); }
+.connect-status.is-issue { color: var(--warn); }
 
-.connect-submit { width: 100%; margin-top: 14px; height: 48px; border-radius: 13px; }
+.connect-submit { width: 100%; margin-top: 10px; height: 48px; border-radius: 13px; }
 .connect-error {
   margin-top: 10px;
   font-size: 12.5px;

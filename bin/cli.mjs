@@ -2,7 +2,7 @@
 /**
  * dsh-pocket 命令行：给「手边只有终端」的场景用。
  *
- *   dsh-pocket pair            打印中继链接、二维码与配对码（别名 link）
+ *   dsh-pocket pair            打印中继二维码 + 「账号 + 口令」登录指引（别名 link）
  *   dsh-pocket status          健康状态、中继状态、已配对设备数
  *   dsh-pocket devices         列出已配对设备
  *   dsh-pocket revoke <id|all> 撤销某台（或全部）设备
@@ -12,8 +12,11 @@
  * 没有任何一条能给远程用，所以这个 CLI 天然不可能从手机侧调用。
  *
  * 手机端的唯一入口是加密中继：链接来自 `remoteView().url`（`cloud.status().url`，
- * 形态 `<appBase>#s=<broker>&r=<room>&k=<key>`）。`/api/v1/pairing` 只给配对码，
- * 不再带任何地址，所以这里没有中继链接时就只报原因和下一步，绝不打印本机地址。
+ * 形态 `<appBase>#s=<broker>&r=<room>&k=<key>`），登录方式是「账号 + 口令」——
+ * 账号取 `remoteView().auth.user`，口令在电脑端校验。8 位配对码已不再需要，
+ * 所以本 CLI 既不打印它，也不在 `--json` 里输出 `code` 等配对码字段。
+ * `/api/v1/pairing` 不带任何地址，所以这里没有中继链接时就只报原因和下一步，
+ * 绝不打印本机地址。
  */
 import { qrcode } from '../lib/vendor/qrcode.mjs';
 
@@ -134,49 +137,72 @@ function relayHint(remote) {
   };
 }
 
+/**
+ * `--json` 里剔掉配对码及其有效期字段。
+ *
+ * 配对码已经不参与配对流程：`pairingView()` 只为后端口令兼容旧手机而保留。
+ * 留着 `code` 会让脚本继续依赖一条随时可能被删除的协议，所以这里主动抹掉；
+ * 设备上限、指纹、devices 这些仍然有用，原样保留。
+ */
+function pairingForJson(pairing) {
+  const copy = { ...(pairing !== null && typeof pairing === 'object' ? pairing : {}) };
+  for (const key of ['code', 'available', 'createdAt', 'expiresAt', 'ttlMs', 'uses', 'maxUses']) delete copy[key];
+  return copy;
+}
+
 async function commandPair() {
-  const data = await request('/api/v1/pairing');
-  const code = String(data?.code ?? '');
-  if (code.length === 0) throw new Error('电脑端还没生成配对码：先打开电脑上的配对页并刷新一次');
+  // 手机端不再需要配对码：在中继外壳的登录页输入「账号 + 口令」，登录成功时
+  // 电脑端自动登记设备。本命令只负责给出唯一入口（中继二维码 / 链接）与登录方式。
+  let pairing = null;
+  let apiFailed = false;
+  try {
+    // 只为了「已配对 N 台」这行和 --json 的 devices：拿不到也不该挡住入口展示。
+    pairing = await request('/api/v1/pairing');
+  } catch { pairing = null; apiFailed = true; }
 
   let remote;
+  let cloudFailed = false;
   try {
-    // `/api/v1/cloud/status` 返回的正是 remoteView()：url / state / appBase / lastError。
+    // `/api/v1/cloud/status` 返回的正是 remoteView()：url / state / appBase / lastError / auth。
     remote = await request('/api/v1/cloud/status');
   } catch (error) {
+    cloudFailed = true;
     remote = { state: 'error', url: '', lastError: `读不到中继状态（${error.message}）` };
   }
+  // 两个接口都打不通 = 插件根本没在跑（老版本这里会直接抛错退出 1），保持同样的语义。
+  if (apiFailed && cloudFailed) process.exitCode = 1;
   const url = typeof remote?.url === 'string' ? remote.url : '';
   const blocker = relayHint(remote);
-  const expiresAt = Number(data?.expiresAt) || 0;
-  const ttlMs = Number(data?.ttlMs) || 0;
-  const remainingSec = expiresAt > 0
-    ? Math.max(0, Math.round((expiresAt - Date.now()) / 1000))
-    : Math.round(ttlMs / 1000);
-  const ttlText = remainingSec > 0 ? `${remainingSec} 秒内有效` : '有效期未知';
-  const devices = Array.isArray(data?.devices) ? data.devices : [];
-  const maxDevices = Number(data?.maxDevices) || 0;
+  // 账号取服务端的真实值（auth.json 里的 user），不要在 CLI 里写死 admin。
+  const account = typeof remote?.auth?.user === 'string' && remote.auth.user.trim().length > 0
+    ? remote.auth.user.trim()
+    : '';
+  const accountText = account.length > 0 ? bold(account) : '设置口令时填的用户名';
+  const devices = Array.isArray(pairing?.devices) ? pairing.devices : [];
+  const maxDevices = Number(pairing?.maxDevices) || 0;
 
   if (url.length > 0 && blocker === null) {
     process.stdout.write(`\n${bold('手机入口 · 加密中继')}\n`);
     if (flag('no-qr') !== true) process.stdout.write(`${renderQr(url)}\n`);
     process.stdout.write(`${dim('链接')} ${cyan(url)}\n`);
-    process.stdout.write(`${dim('配对码')} ${bold(code)}   ${dim(`（${ttlText}）`)}\n`);
+    process.stdout.write(`${dim('登录')} 账号 ${accountText} + 你的口令（首次登录自动成为已配对设备，不需要配对码）\n`);
     if (devices.length > 0) {
       // 上限由插件下发（config.maxDevices，默认 8），不要在这里写死数字。
       const full = maxDevices > 0 && devices.length >= maxDevices;
       process.stdout.write(`${dim('已配对')} ${devices.length}${maxDevices > 0 ? `/${maxDevices}` : ''} 台${full ? `  ${yellow('已达上限，先 revoke 旧设备')}` : ''}\n`);
     }
-    process.stdout.write(`\n${dim('手机扫上面这张码（或在浏览器打开链接），再输入配对码完成认领；# 之后的密钥不会发给中转。')}\n\n`);
+    process.stdout.write(`\n${dim('手机扫上面这张码打开外壳，在登录页输入账号与口令即可进入；# 之后的密钥不会发给中转。')}\n\n`);
   } else {
     // 没有中继链接：只说原因和下一步，绝不打印本机地址假装手机能用。
-    process.stdout.write(`\n${bold('配对码')} ${bold(code)}   ${dim(`（${ttlText}）`)}\n`);
-    process.stdout.write(`${red('现在连不上')}  手机端暂时没有可用入口（中继没起来）。\n`);
+    process.stdout.write(`\n${red('现在连不上')}  手机端暂时没有可用入口（中继没起来）。\n`);
     process.stdout.write(`  ${dim('原因')}   ${blocker?.why ?? '中继不可用'}\n`);
     process.stdout.write(`  ${dim('下一步')} ${blocker?.next ?? '先把电脑端的中继启动起来。'}\n`);
+    process.stdout.write(`  ${dim('登录')}   中继起来后，手机用账号 ${accountText} + 口令登录；不需要配对码。\n`);
     process.stdout.write(`  ${dim('说明')}   中继是唯一通路；没有中继就没有手机入口，本命令不会给出任何备用地址。\n\n`);
   }
-  if (flag('json') === true) process.stdout.write(`${JSON.stringify({ ...data, relay: remote }, null, 2)}\n`);
+  if (flag('json') === true) {
+    process.stdout.write(`${JSON.stringify({ ...pairingForJson(pairing), relay: remote }, null, 2)}\n`);
+  }
 }
 
 async function commandStatus() {
@@ -283,7 +309,7 @@ function commandHelp() {
     '',
     `${bold('dsh-pocket-plugin')} ${dim('— DSH 随行 · 手机远程接管电脑上的 DeepSeek Harness')}`,
     '',
-    `  ${cyan('dsh-pocket-plugin pair')}             打印中继链接、二维码与配对码（别名 link）`,
+    `  ${cyan('dsh-pocket-plugin pair')}             打印中继二维码 + 账号/口令登录指引（别名 link）`,
     `  ${cyan('dsh-pocket-plugin status')}           健康状态、中继状态、设备数`,
     `  ${cyan('dsh-pocket-plugin devices')}          列出已配对设备`,
     `  ${cyan('dsh-pocket-plugin revoke <id|all>')}  撤销设备`,
@@ -293,7 +319,8 @@ function commandHelp() {
     `  ${dim('--base <url>')} 直接指定本机 API 地址（或环境变量 DSH_POCKET_BASE）`,
     `  ${dim('--no-qr')}      pair 只打印链接，不画二维码`,
     '',
-    `  ${dim('手机端唯一的入口是加密中继；中继没起来时 pair 只报原因和下一步，不给任何备用地址。')}`,
+    `  ${dim('手机端唯一的入口是加密中继，登录用「账号 + 口令」，不再需要配对码。')}`,
+    `  ${dim('中继没起来时 pair 只报原因和下一步，不给任何备用地址。')}`,
     '',
   ].join('\n'));
 }

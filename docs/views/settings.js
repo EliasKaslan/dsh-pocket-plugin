@@ -138,7 +138,7 @@ export function mountSettings(root, ctx) {
   async function unpair(mode) {
     const ok = await confirmDialog({
       title: mode === '切换' ? '换一台电脑？' : '断开连接？',
-      message: '这台手机上的配对信息会被清除，之后需要重新扫码或输码配对。',
+      message: '这台手机上的登录信息会被清除，之后需要重新用电脑上的账号 + 口令登录。',
       confirmText: mode === '切换' ? '去配对' : '断开',
       danger: true,
     });
@@ -152,9 +152,9 @@ export function mountSettings(root, ctx) {
       title: '安全模型',
       items: [
         { label: '手机与电脑之间是端到端加密：中继只转发密文，密钥只存在于你扫码时的链接片段里，不会上传。', run: () => {} },
-        { label: '配对链接本身就是凭据：能打开它的人就能控制这台电脑。别截图外传。', run: () => {} },
+        { label: '配对链接只负责建立加密通道，本身不是访问凭据：进面板还需要电脑上设置的账号 + 口令。即便如此也别外传。', run: () => {} },
         { label: '手机只能操作任务，不能读写任意文件；所有动作都在电脑端由 DSH 的权限策略决定。', run: () => {} },
-        { label: '想立即作废所有访问：在电脑端重置配对（旧链接与旧设备立刻失效）。', run: () => {} },
+        { label: '想立即作废某台手机的访问：在电脑配对页把它移除，它的设备令牌立刻失效、且不会因为重新登录自动复活。', run: () => {} },
       ],
     });
   }
