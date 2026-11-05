@@ -126,7 +126,7 @@ function boot() {
   const home = `${tmp.dir}/home`;
   const dataDir = `${home}/pocket`;
   core = new BridgeCore({}, {
-    home, dataDir, host: '127.0.0.1', port: 47901,
+    home, dataDir, port: 47901,
   }, logger);
   // 只构造、不 listen：本文件不占端口、不发请求。
   server = new BridgeServer(core, { logger, webRoot: `${tmp.dir}/web` });

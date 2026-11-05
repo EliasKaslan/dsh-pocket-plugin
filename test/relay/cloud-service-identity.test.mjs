@@ -27,7 +27,7 @@ function makeCore() {
   const dataDir = path.join(home, 'pocket');
   const logger = makeLogger();
   const core = new BridgeCore({}, {
-    home, dataDir, host: '127.0.0.1', port: 47901,
+    home, dataDir, port: 47901,
   }, logger);
   cores.push(core);
   return { core, dataDir, logger };
@@ -109,7 +109,7 @@ test('新进程（新 core，同一 dataDir）也复用同一套身份', () => {
   const home = path.dirname(first.dataDir);
   const logger = makeLogger();
   const secondCore = new BridgeCore({}, {
-    home, dataDir: first.dataDir, host: '127.0.0.1', port: 47901,
+    home, dataDir: first.dataDir, port: 47901,
   }, logger);
   cores.push(secondCore);
   const second = new CloudService(secondCore, {

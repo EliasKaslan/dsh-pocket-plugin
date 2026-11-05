@@ -58,6 +58,22 @@ test('伪造 Host（DNS rebinding）→ 403；回环名与本机名 → 200', as
   assert.equal(ctx.core.hostAllowed('evil.example'), false);
   assert.equal(ctx.core.hostAllowed('127.0.0.1'), true);
 
+  // v2 收紧：网卡内网 IPv4 不再被自动加进白名单。这三段是最可能被「顺手放行」的
+  // 地址形态，只要白名单里出现一个，就说明 allowedHosts() 又去枚举网卡了。
+  assert.equal(
+    [...ctx.core.allowedHosts()].some((name) => /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/u.test(name)),
+    false,
+    `allowedHosts 里混进了内网地址：${JSON.stringify([...ctx.core.allowedHosts()])}`,
+  );
+  for (const lanHost of [`192.168.1.50:${ctx.port}`, `10.0.0.5:${ctx.port}`, `172.16.4.7:${ctx.port}`]) {
+    assert.equal(ctx.core.hostAllowed(lanHost), false, `内网地址 ${lanHost} 不许自动进白名单`);
+    const blocked = await request(ctx.port, '/api/v1/health', { headers: { host: lanHost } });
+    assert.equal(jsonResponse(blocked, 403, `Host=${lanHost}`).error.code, 'bad_host', `Host=${lanHost} 必须 403`);
+    const blockedPage = await request(ctx.port, '/pair', { headers: { host: lanHost } });
+    assert.equal(blockedPage.status, 403, `Host=${lanHost} 的 /pair 必须 403`);
+    assert.equal(blockedPage.body.includes(ctx.core.state.pairing.code), false, `Host=${lanHost} 的 403 里泄漏了配对码`);
+  }
+
   for (const host of [
     `evil.example:${ctx.port}`,
     `127.0.0.1.evil.example:${ctx.port}`,

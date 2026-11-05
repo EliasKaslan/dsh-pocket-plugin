@@ -7,11 +7,11 @@
  */
 import './lib/sprite.js';
 import { $, empty, h, icon, raf } from './lib/dom.js';
-import { ApiError, Realtime, createApi, normalizeBase } from './lib/net.js';
+import { ApiError, Realtime, createApi } from './lib/net.js';
 import { relTime } from './lib/format.js';
 import { toast } from './lib/ui.js';
 import {
-  LIMITS, applyTheme, baseUrl, loadCache, loadPrefs, loadSession, rememberServer,
+  LIMITS, applyTheme, baseUrl, isRelayShell, loadCache, loadPrefs, loadSession,
   saveCache, savePrefs, saveSession, serverName, store, token,
 } from './store.js';
 import { mountCompose } from './views/compose.js';
@@ -27,7 +27,6 @@ const SESSION_CACHE = 'dsh.pocket.session.v1';
 const app = document.getElementById('app');
 const banner = createBanner();
 
-let pairBase = '';
 let pendingPair = null;
 let view = null;
 let viewName = '';
@@ -429,12 +428,8 @@ function makeContext() {
       } catch { /* ignore */ }
     },
     unpair() { signOut({ forget: true }); },
-    useBase(base) { pairBase = normalizeBase(base); },
-    currentBase() { return pairBase || baseUrl() || location.origin; },
     paired(session) {
       saveSession(session);
-      rememberServer({ baseUrl: session.baseUrl, serverName: session.serverName });
-      pairBase = '';
       void enterApp();
     },
     savedCwd(cwd) { savePrefs({ lastCwd: cwd }); },
@@ -533,13 +528,15 @@ async function registerWorker() {
 async function boot() {
   loadPrefs();
   applyTheme();
-  store.session = loadSession();
-  pairBase = SHELL?.baseUrl ? normalizeBase(SHELL.baseUrl) : '';
+  // 唯一通路是加密中继：不是中继外壳（例如桌面 `/app` 本机预览）就清掉旧会话，
+  // 免得残留一条不经中继的直连。
+  store.session = isRelayShell() ? loadSession() : null;
+  if (!isRelayShell()) saveSession(null);
 
   const pairPayload = readPairFragment(location.hash);
   if (pairPayload !== null && pairPayload.code.length > 0) {
+    // 老二维码里的 `u`（局域网地址）已被 readPairFragment 丢弃，这里也不再看地址。
     pendingPair = pairPayload;
-    if (pairPayload.baseUrl) pairBase = normalizeBase(pairPayload.baseUrl);
     history.replaceState(null, '', location.pathname + location.search);
   }
 
@@ -567,8 +564,11 @@ async function boot() {
 }
 
 async function tryAutoPair(payload) {
+  // 直连已删除：不在中继外壳里就不存在可用的 base，自动配对直接放弃。
+  if (!isRelayShell()) return false;
+  const base = baseUrl();
+  if (base.length === 0) return false;
   try {
-    const base = normalizeBase(payload.baseUrl || pairBase || location.origin);
     const deviceName = store.prefs.deviceName ?? '';
     const name = deviceName.length > 0 ? deviceName : defaultDeviceNameSafe();
     const data = await api('/api/v1/pair', {
@@ -586,7 +586,6 @@ async function tryAutoPair(payload) {
       serverName: data.server?.name ?? payload.name ?? '',
       pairedAt: Date.now(),
     });
-    pairBase = '';
     await enterApp();
     return true;
   } catch {

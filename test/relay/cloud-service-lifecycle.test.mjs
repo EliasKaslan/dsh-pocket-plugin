@@ -34,7 +34,7 @@ function makeContext() {
   const dataDir = path.join(home, 'pocket');
   mkdirSync(dataDir, { recursive: true });
   const logger = makeLogger();
-  const core = new BridgeCore({}, { home, dataDir, host: '127.0.0.1', port: 47901 }, logger);
+  const core = new BridgeCore({}, { home, dataDir, port: 47901 }, logger);
   cores.push(core);
   return { core, dataDir, logger, home };
 }

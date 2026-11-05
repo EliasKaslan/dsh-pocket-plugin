@@ -25,8 +25,8 @@
   Flow: this document paints the splash first (plain HTML, no JS needed), then
   loads ./remote.js as a module. remote.js validates the link, connects the
   encrypted relay, runs the login gate and only then does
-  `await import('./app.js')`. app.js is the same bundle the LAN build serves;
-  it receives `globalThis.__POCKET_SHELL__` right before that import.
+  `await import('./app.js')`. app.js is the same bundle the desktop serves at
+  `/app`; it receives `globalThis.__POCKET_SHELL__` right before that import.
 
   Every path below is relative. The shell may be published at the root of a
   static host or under an arbitrary sub-path (GitHub Pages project sites,

@@ -1,10 +1,9 @@
 /* Desktop pairing page controller. All dynamic text is inserted with
- * textContent; only the server-generated QR SVG is assigned as markup. */
+ * textContent; nothing from the server is ever parsed as markup. */
 (() => {
   'use strict';
 
   const $ = (id) => document.getElementById(id);
-  const qrFrame = $('qr-frame');
   const codeEl = $('pair-code');
   const bar = $('countdown-bar');
   const countdownText = $('countdown-text');
@@ -13,7 +12,7 @@
   const deviceCount = $('device-count');
   const toastEl = $('toast');
 
-  let state = { expiresAt: 0, ttlMs: 600000, link: '', uses: 0, maxUses: 10 };
+  let state = { expiresAt: 0, ttlMs: 600000, uses: 0, maxUses: 10 };
   let stopped = false;
   let toastTimer;
 
@@ -90,66 +89,14 @@
     }
   }
 
-  // 服务端唯一会传过来的「标记」是二维码 SVG。它由本机生成，但把它直接当
-  // HTML 塞进 DOM，就等于给未来任何一处服务端改动留了一个注入口；这里改成
-  // 解析后用白名单重建，只保留 svg/g/rect/path 与几何、描边类属性。
-  const SVG_NS = 'http://www.w3.org/2000/svg';
-  const QR_TAGS = new Set(['svg', 'g', 'rect', 'path']);
-  const QR_ATTRS = new Set([
-    'xmlns', 'viewBox', 'width', 'height', 'fill', 'stroke', 'stroke-width',
-    'transform', 'd', 'x', 'y', 'rx', 'ry', 'shape-rendering', 'class',
-  ]);
-
-  function copyQrChildren(source, target) {
-    for (const node of Array.from(source.childNodes)) {
-      if (node.nodeType === Node.ELEMENT_NODE) {
-        const tag = String(node.nodeName).toLowerCase();
-        if (!QR_TAGS.has(tag)) continue;
-        const child = document.createElementNS(SVG_NS, tag);
-        for (const attr of Array.from(node.attributes)) {
-          if (!QR_ATTRS.has(attr.name)) continue;
-          child.setAttribute(attr.name, attr.value);
-        }
-        copyQrChildren(node, child);
-        target.append(child);
-      } else if (node.nodeType === Node.TEXT_NODE) {
-        target.append(document.createTextNode(node.nodeValue ?? ''));
-      }
-    }
-  }
-
-  function safeQrSvg(markup) {
-    if (typeof markup !== 'string' || markup.startsWith('<svg') !== true) return null;
-    let parsed;
-    try {
-      parsed = new DOMParser().parseFromString(markup, 'image/svg+xml');
-    } catch {
-      return null;
-    }
-    const root = parsed.documentElement;
-    if (root === null || String(root.nodeName).toLowerCase() !== 'svg') return null;
-    // Malformed XML comes back as a <parsererror> tree instead of a throw.
-    if (parsed.getElementsByTagName('parsererror').length > 0) return null;
-    const out = document.createElementNS(SVG_NS, 'svg');
-    for (const attr of Array.from(root.attributes)) {
-      if (!QR_ATTRS.has(attr.name)) continue;
-      out.setAttribute(attr.name, attr.value);
-    }
-    copyQrChildren(root, out);
-    return out;
-  }
-
   function apply(data) {
     if (!data || typeof data !== 'object') return;
     state = {
       expiresAt: Number(data.expiresAt) || 0,
       ttlMs: Number(data.ttlMs) || 600000,
-      link: typeof data.link === 'string' ? data.link : state.link,
       uses: Number(data.uses) || 0,
       maxUses: Number(data.maxUses) || 10,
     };
-    const qr = safeQrSvg(data.qrSvg);
-    if (qrFrame && qr !== null) qrFrame.replaceChildren(qr);
     if (codeEl && typeof data.code === 'string') codeEl.textContent = data.code;
     if (usesEl) usesEl.textContent = `已配对 ${state.uses} 次`;
     renderDevices(data.devices);
@@ -220,12 +167,18 @@
     }
   }
 
+  // 中继状态词表与 lib/pair-page.mjs 保持一致：两处都渲染同一个 #remote-badge，
+  // 词表不一致会让 5 秒一次的轮询把服务端刚写好的正确标签覆盖成错的。
   const REMOTE_BADGE = {
     online: ['已连通', 'ok'],
     connecting: ['连接中', 'soft'],
     starting: ['启动中', 'soft'],
-    offline: ['重连中', 'warn'],
+    idle: ['待启动', 'soft'],
+    reconnecting: ['重连中', 'warn'],
+    offline: ['连不上', 'warn'],
     disabled: ['已暂停', 'soft'],
+    unconfigured: ['未配置', 'warn'],
+    blocked: ['缺少口令', 'warn'],
     error: ['中转异常', 'warn'],
   };
 
@@ -254,13 +207,7 @@
   }
 
   $('rotate')?.addEventListener('click', rotate);
-  $('copy-link')?.addEventListener('click', () => copy(state.link));
   document.addEventListener('click', (event) => {
-    const target = event.target.closest('[data-addr]');
-    if (target) {
-      copy(target.getAttribute('data-addr') || '');
-      return;
-    }
     if (event.target.closest('[data-copy-remote]')) {
       copy($('remote-url')?.textContent?.trim() || '');
     }

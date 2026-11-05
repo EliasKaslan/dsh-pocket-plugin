@@ -32,7 +32,7 @@ const ASSETS = [
   './icons/apple-touch-icon.png',
 ];
 
-/** 远端外壳额外注入的脚本/样式；局域网下不存在，缺失不算失败。 */
+/** 远端外壳额外注入的脚本/样式；本地外壳（`/app`）里没有这些文件，缺失不算失败。 */
 const OPTIONAL = ['./remote.js', './remote.css', './mqtt.min.js'];
 
 self.addEventListener('install', (event) => {

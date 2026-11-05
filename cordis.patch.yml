@@ -1,4 +1,4 @@
-# DSH 随行（dsh-pocket-plugin）· 插件行
+# DSH 随行（dsh-pocket-plugin）· 插件行  ·  v2.0.0
 #
 # 作为一个 DSH bundle 安装时，这一行由 bundle 自带，无需手写。
 # 用 `dsh plugin add <源>` 安装后，profile 的 package.json 会多一条依赖，
@@ -6,24 +6,30 @@
 #
 # 手写安装（例如直接 `link:` 本地目录）时，把这段复制进
 # `$DSH_HOME/profiles/<profile>/cordis.patch.yml` 的顶层数组即可。
+#
+# v2 只走加密中继：桌面端固定监听 127.0.0.1，局域网直连已移除，
+# 手机的唯一入口是「中继外壳 + 8 位配对码 + 口令登录」。
+# 旧配置里残留的 `host` / `publicBaseUrl` 会被忽略（只 warn 一次），
+# 改它们不会改变监听地址 —— 不存在任何能把面板暴露到内网/公网的开关。
 - insert:
     - id: pocket
       # 必须与 package.json 的 "name" 完全一致，否则加载不到。
       name: 'dsh-pocket-plugin'
       config:
-        # 局域网桥接端口；被占用时自动顺延（47901 → 47902 → …）
+        # 回环桥接端口；被占用时自动顺延（47901 → 47902 → …）。
+        # 监听地址不可配，恒为 127.0.0.1。
         port: 47901
         # 手机端显示的电脑名。留空则显示「我的电脑」（不会泄露主机名）
         serverName: ''
         cloud:
-          # 跨网络访问（手机不在同一局域网）默认关闭。远程要同时满足两个前提，
+          # 中继是 v2 的唯一通路，但它默认关闭。开启要同时满足两个前提，
           # 缺一个都起不来 —— 这是有意的 fail-closed，不是没做完：
           #   1) 设过访问口令（`node tools/set-auth.mjs`，或在配对页里设置）；
           #   2) `appBase` 填了你自己托管的手机端外壳地址。
           enabled: false
           # 手机端静态外壳的地址。**故意留空**：外壳是一段会在你手机上执行的
           # 代码，把某个第三方地址写成默认值，等于让每一次安装都去信任同一个人
-          # 的账号。要开远程访问就自己托管：
+          # 的账号。v2 里它是手机的唯一入口，填好才能连上：
           #   node tools/build-shell.mjs        # 生成 docs/
           #   把 docs/ 发布到任意静态托管        # GitHub Pages / OSS / 自己的站
           #   把地址填到这里（结尾带 /）

@@ -2,9 +2,9 @@
  * Transport layer: the JSON API and the realtime channel (WebSocket first,
  * Server-Sent Events as a fallback).
  *
- * Both transports are written so the app can be served either from the host
- * itself (`/app`) or from a static shell that talks to the host through the
- * encrypted relay. Only `baseUrl` differs.
+ * Both transports take one base — the relay shell origin. That is the only way
+ * in: the shell reaches the host through the encrypted tunnel that
+ * `remote/remote.js` installs, so `baseUrl` is the only thing that varies.
  */
 
 export class ApiError extends Error {
@@ -17,7 +17,7 @@ export class ApiError extends Error {
   }
 }
 
-/** Prepend http:// when the user typed a bare host, and drop a trailing slash. */
+/** Normalise the shell origin: add a scheme when missing, drop a trailing slash. */
 export function normalizeBase(input) {
   let text = String(input ?? '').trim();
   if (text.length === 0) return '';

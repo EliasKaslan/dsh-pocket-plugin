@@ -12,14 +12,12 @@ const LS = {
   prefs: `${NS}.prefs.v1`,
   cache: `${NS}.cache.v1`,
   device: `${NS}.device.v1`,
-  recent: `${NS}.recent.v1`,
 };
 
 export const LIMITS = {
   promptChars: 8000,
   taskPage: 300,
   cacheTasks: 120,
-  recentServers: 4,
 };
 
 /* ---------------- storage helpers (never throw) ---------------- */
@@ -103,13 +101,27 @@ export function emit() {
 
 /* ---------------- derived helpers ---------------- */
 
+/**
+ * 唯一通路是「静态外壳 + 加密中继」：只有 `remote/remote.js` 注入的
+ * `mode: 'remote'` 才算外壳。桌面 `/app`（回环本机预览）不算 —— 那里没有
+ * Service Worker 隧道，连不出去。
+ */
+export function isRelayShell() {
+  return globalThis.__POCKET_SHELL__?.mode === 'remote';
+}
+
+/**
+ * 请求前缀只有两个来源：已配对的会话，或中继外壳注入的 origin。
+ *
+ * 直连删除后**不再**回落到 `location.origin` —— 那个回落正是「在局域网里打开
+ * 页面就直接连上电脑」的实现方式。拿不到就返回空串，让调用方显式报错。
+ */
 export function baseUrl() {
   const fromSession = store.session?.baseUrl;
   if (typeof fromSession === 'string' && fromSession.length > 0) return fromSession;
+  if (!isRelayShell()) return '';
   const shell = globalThis.__POCKET_SHELL__;
-  if (shell?.baseUrl) return String(shell.baseUrl);
-  const origin = location.origin && location.origin !== 'null' ? location.origin : '';
-  return origin;
+  return typeof shell.baseUrl === 'string' ? shell.baseUrl : '';
 }
 
 export function serverName() {
@@ -234,23 +246,6 @@ export function saveCache() {
     .filter((task) => task !== undefined && (task.status === 'running' || (Number(task.updatedAt) || 0) > cutoff))
     .slice(0, LIMITS.cacheTasks);
   writeJson(LS.cache, { baseUrl: baseUrl(), tasks, summary: store.summary, at: Date.now() });
-}
-
-/* ---------------- recent servers ---------------- */
-
-export function recentServers() {
-  const list = readJson(LS.recent, []);
-  return Array.isArray(list) ? list.filter((item) => typeof item?.baseUrl === 'string') : [];
-}
-
-export function rememberServer(entry) {
-  if (typeof entry?.baseUrl !== 'string' || entry.baseUrl.length === 0) return;
-  const rest = recentServers().filter((item) => item.baseUrl !== entry.baseUrl);
-  writeJson(LS.recent, [{ ...entry, at: Date.now() }, ...rest].slice(0, LIMITS.recentServers));
-}
-
-export function forgetServers() {
-  removeKey(LS.recent);
 }
 
 /* ---------------- theme ---------------- */

@@ -100,33 +100,47 @@ test('resolvePaths 用显式目录，绝不推断到真实 home', () => {
   assert.ok(path.isAbsolute(resolvePaths({}).home));
 });
 
-test('normalizeConfig 清洗端口 / host / 配额', () => {
-  const logger = recorder();
+test('normalizeConfig 清洗端口 / 配额（host 已不是配置项）', () => {
   assert.equal(normalizeConfig({ port: 8081 }).port, 8081);
   assert.equal(normalizeConfig({ port: 0 }).port, DEFAULT_CONFIG.port, '0 不是合法端口，回退');
   assert.equal(normalizeConfig({ port: 70000 }).port, DEFAULT_CONFIG.port);
   assert.equal(normalizeConfig({ port: 'abc' }).port, DEFAULT_CONFIG.port);
-  assert.equal(normalizeConfig({ host: '127.0.0.1' }).host, '127.0.0.1');
-  assert.equal(normalizeConfig({ host: 'evil.example' }, logger).host, '0.0.0.0', '非法 host 回退到默认');
-  assert.ok(logger.warnings.some((line) => line.includes('host')));
   assert.equal(normalizeConfig({ maxDevices: 999 }).maxDevices, 32);
   assert.equal(normalizeConfig({ maxDevices: 0 }).maxDevices, 1);
   assert.equal(normalizeConfig({ maxPairUses: 0 }).maxPairUses, 1);
   assert.equal(normalizeConfig({ pairTtlMs: 1 }).pairTtlMs, 60_000);
+
+  // 只监听回环之后，host 不再是一个配置项：默认表里没有，结果对象里也不该有。
+  assert.equal('host' in DEFAULT_CONFIG, false, 'DEFAULT_CONFIG 不许再带 host');
+  assert.equal('host' in normalizeConfig({}), false, '没配 host 时 config 上不该出现 host');
 });
 
-test('publicBaseUrl / allowedHosts 只接受干净的值', () => {
-  assert.equal(normalizeConfig({}).publicBaseUrl, '');
-  assert.equal(
-    normalizeConfig({ publicBaseUrl: 'https://p.example/path?q=1#h' }).publicBaseUrl,
-    'https://p.example/path',
-    'query 与 fragment 必须被剥掉',
-  );
-  assert.equal(normalizeConfig({ publicBaseUrl: 'https://u:p@p.example' }).publicBaseUrl, '', '不许带口令');
-  assert.equal(normalizeConfig({ publicBaseUrl: 'ftp://p.example' }).publicBaseUrl, '');
+test('allowedHosts 只接受干净的值', () => {
   assert.deepEqual(
     normalizeConfig({ allowedHosts: ['A.example', 'a.example', 'bad host!', 'phone.local:47901'] }).allowedHosts,
     ['a.example', 'phone.local'],
     '去重 + 丢弃非法字符 + 去掉端口',
   );
+});
+
+/*
+ * 旧配置兼容：v1 允许 `host: '0.0.0.0'`，v2 只监听 127.0.0.1。
+ * 升级后配置文件里往往还留着这个键 —— 必须「忽略 + 告警 + 不崩」，
+ * 而不是三种更糟的结局：抛错、静默照配、或者把 host 原样透传进 config
+ * 让人以为「配了但没生效」。
+ */
+test('旧配置里的 host:0.0.0.0 被忽略：不抛错、warn 一次、config 上不留 host 键', () => {
+  const logger = recorder();
+  let config;
+  assert.doesNotThrow(() => {
+    config = normalizeConfig({ host: '0.0.0.0', port: 48123 }, logger);
+  }, '老配置不能让插件起不来');
+
+  assert.equal('host' in config, false, 'host 不许跟着对象展开漏进 config');
+  assert.equal(config.host, undefined);
+  assert.equal(config.port, 48123, '忽略 host 不该连累其它字段');
+
+  const hostWarnings = logger.warnings.filter((line) => line.includes('host'));
+  assert.equal(hostWarnings.length, 1, `host 必须告警且只告警一次，实际：${JSON.stringify(logger.warnings)}`);
+  assert.match(hostWarnings[0], /127\.0\.0\.1/u, '告警必须说清楚只监听回环，否则用户以为还能开回局域网');
 });

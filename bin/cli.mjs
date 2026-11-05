@@ -2,7 +2,7 @@
 /**
  * dsh-pocket 命令行：给「手边只有终端」的场景用。
  *
- *   dsh-pocket link            打印配对链接、二维码与配对码
+ *   dsh-pocket pair            打印中继链接、二维码与配对码（别名 link）
  *   dsh-pocket status          健康状态、中继状态、已配对设备数
  *   dsh-pocket devices         列出已配对设备
  *   dsh-pocket revoke <id|all> 撤销某台（或全部）设备
@@ -10,6 +10,10 @@
  *
  * 所有请求都打到 127.0.0.1 的插件端口：这些接口在电脑端只对回环开放，
  * 没有任何一条能给远程用，所以这个 CLI 天然不可能从手机侧调用。
+ *
+ * 手机端的唯一入口是加密中继：链接来自 `remoteView().url`（`cloud.status().url`，
+ * 形态 `<appBase>#s=<broker>&r=<room>&k=<key>`）。`/api/v1/pairing` 只给配对码，
+ * 不再带任何地址，所以这里没有中继链接时就只报原因和下一步，绝不打印本机地址。
  */
 import { qrcode } from '../lib/vendor/qrcode.mjs';
 
@@ -84,43 +88,115 @@ function fail(error) {
   process.exitCode = 1;
 }
 
-async function commandLink() {
-  const data = await request('/api/v1/pairing');
-  const link = String(data?.link ?? '');
-  const code = String(data?.code ?? '');
-  if (link.length === 0) throw new Error('电脑端没有返回配对链接');
-
-  process.stdout.write(`\n${bold('扫码配对')}\n`);
-  if (flag('no-qr') !== true) process.stdout.write(`${renderQr(link)}\n`);
-  process.stdout.write(`${dim('链接')} ${cyan(link)}\n`);
-  process.stdout.write(`${dim('配对码')} ${bold(code)}   ${dim(`（${data?.expiresInSec ?? data?.ttlMs / 1000 ?? '?'} 秒内有效）`)}\n`);
-  const devices = Array.isArray(data?.devices) ? data.devices : [];
-  if (devices.length > 0) {
-    // 上限由插件下发（config.maxDevices，默认 8），不要在这里写死 10。
-    const maxDevices = Number(data?.maxDevices) || 0;
-    const full = maxDevices > 0 && devices.length >= maxDevices;
-    process.stdout.write(`${dim('已配对')} ${devices.length}${maxDevices > 0 ? `/${maxDevices}` : ''} 台${full ? `  ${yellow('已达上限，先 revoke 旧设备')}` : ''}\n`);
+/**
+ * 中继不可用：给「为什么」和「下一步」，两者都不含任何地址。
+ * 中继是唯一通路，所以这里没有备用方案可给。
+ */
+function relayHint(remote) {
+  const state = typeof remote?.state === 'string' ? remote.state : 'unknown';
+  const url = typeof remote?.url === 'string' ? remote.url : '';
+  const appBase = typeof remote?.appBase === 'string' ? remote.appBase : '';
+  const lastError = typeof remote?.lastError === 'string' ? remote.lastError : '';
+  if (state === 'online' && url.length > 0) return null;
+  if (state === 'unconfigured' || (appBase.length === 0 && url.length === 0)) {
+    return {
+      why: lastError || '中继未启动：没有配置手机端外壳地址（cloud.appBase）',
+      next: '在电脑的 DSH 插件配置里把 cloud.appBase 设成你自己托管的静态外壳地址，然后重启 DSH，再跑一次 pair。',
+    };
   }
-  process.stdout.write(`\n${dim('手机与电脑同一个 Wi-Fi 时扫上面这个；不在同一个网络请用中继链接（DSH 界面 → 手机访问 → 远程）。')}\n\n`);
-  if (flag('json') === true) process.stdout.write(`${JSON.stringify(data, null, 2)}\n`);
+  if (state === 'blocked') {
+    return {
+      why: lastError || '中继未启动：本机还没有访问口令（fail-closed，刻意的失败即关闭）',
+      next: '先在电脑上设置口令（本仓 tools/set-auth.mjs，写入数据目录的 auth.json），或把 auth.required 改为 false，然后重试。',
+    };
+  }
+  if (state === 'disabled') {
+    return {
+      why: lastError || '远程访问被暂停了',
+      next: '在电脑配对页的中继卡片里点「启用远程」，然后重试。',
+    };
+  }
+  if (state === 'error') {
+    return {
+      why: lastError || '中继启动失败，但没有给出原因',
+      next: '看 DSH 日志里「远程访问未启动」那一行，修好后重试。',
+    };
+  }
+  if (state === 'online') {
+    return {
+      why: lastError || '中继在线，但没有生成出可用的手机端链接',
+      next: '在电脑配对页里点「重置链接」重新生成；仍然失败就看 DSH 日志里生成链接时的报错。',
+    };
+  }
+  return {
+    why: lastError || '中继还没连上 broker',
+    next: '等 10 秒重试；一直重连就检查网络或代理是否拦了 wss:// 连接。',
+  };
+}
+
+async function commandPair() {
+  const data = await request('/api/v1/pairing');
+  const code = String(data?.code ?? '');
+  if (code.length === 0) throw new Error('电脑端还没生成配对码：先打开电脑上的配对页并刷新一次');
+
+  let remote;
+  try {
+    // `/api/v1/cloud/status` 返回的正是 remoteView()：url / state / appBase / lastError。
+    remote = await request('/api/v1/cloud/status');
+  } catch (error) {
+    remote = { state: 'error', url: '', lastError: `读不到中继状态（${error.message}）` };
+  }
+  const url = typeof remote?.url === 'string' ? remote.url : '';
+  const blocker = relayHint(remote);
+  const expiresAt = Number(data?.expiresAt) || 0;
+  const ttlMs = Number(data?.ttlMs) || 0;
+  const remainingSec = expiresAt > 0
+    ? Math.max(0, Math.round((expiresAt - Date.now()) / 1000))
+    : Math.round(ttlMs / 1000);
+  const ttlText = remainingSec > 0 ? `${remainingSec} 秒内有效` : '有效期未知';
+  const devices = Array.isArray(data?.devices) ? data.devices : [];
+  const maxDevices = Number(data?.maxDevices) || 0;
+
+  if (url.length > 0 && blocker === null) {
+    process.stdout.write(`\n${bold('手机入口 · 加密中继')}\n`);
+    if (flag('no-qr') !== true) process.stdout.write(`${renderQr(url)}\n`);
+    process.stdout.write(`${dim('链接')} ${cyan(url)}\n`);
+    process.stdout.write(`${dim('配对码')} ${bold(code)}   ${dim(`（${ttlText}）`)}\n`);
+    if (devices.length > 0) {
+      // 上限由插件下发（config.maxDevices，默认 8），不要在这里写死数字。
+      const full = maxDevices > 0 && devices.length >= maxDevices;
+      process.stdout.write(`${dim('已配对')} ${devices.length}${maxDevices > 0 ? `/${maxDevices}` : ''} 台${full ? `  ${yellow('已达上限，先 revoke 旧设备')}` : ''}\n`);
+    }
+    process.stdout.write(`\n${dim('手机扫上面这张码（或在浏览器打开链接），再输入配对码完成认领；# 之后的密钥不会发给中转。')}\n\n`);
+  } else {
+    // 没有中继链接：只说原因和下一步，绝不打印本机地址假装手机能用。
+    process.stdout.write(`\n${bold('配对码')} ${bold(code)}   ${dim(`（${ttlText}）`)}\n`);
+    process.stdout.write(`${red('现在连不上')}  手机端暂时没有可用入口（中继没起来）。\n`);
+    process.stdout.write(`  ${dim('原因')}   ${blocker?.why ?? '中继不可用'}\n`);
+    process.stdout.write(`  ${dim('下一步')} ${blocker?.next ?? '先把电脑端的中继启动起来。'}\n`);
+    process.stdout.write(`  ${dim('说明')}   中继是唯一通路；没有中继就没有手机入口，本命令不会给出任何备用地址。\n\n`);
+  }
+  if (flag('json') === true) process.stdout.write(`${JSON.stringify({ ...data, relay: remote }, null, 2)}\n`);
 }
 
 async function commandStatus() {
   const health = await request('/api/v1/health');
   const ready = health?.ready === true || health?.status === 'ok' || health?.started === true;
   const lines = [
-    `${dim('地址')}   ${BASE}`,
-    `${dim('状态')}   ${ready ? green('运行中') : yellow('启动中')}`,
-    `${dim('版本')}   ${String(health?.version ?? '?')}${health?.protocol === undefined ? '' : dim(`  协议 v${health.protocol}`)}`,
-    `${dim('运行')}   ${formatUptime(health?.uptimeMs)}`,
+    `${dim('本机 API')} ${BASE}`,
+    `${dim('状态')}     ${ready ? green('运行中') : yellow('启动中')}`,
+    `${dim('版本')}     ${String(health?.version ?? '?')}${health?.protocol === undefined ? '' : dim(`  协议 v${health.protocol}`)}`,
+    `${dim('运行')}     ${formatUptime(health?.uptimeMs)}`,
   ];
   // 中继状态是最有用的一行，读不到也要给出原因，而不是整块消失。
   try {
     const cloud = await request('/api/v1/cloud/status');
-    lines.push(`${dim('中继')}   ${cloudStateText(cloud?.state)}`);
-    if (typeof cloud?.link === 'string' && cloud.link.length > 0) lines.push(`${dim('远程')}   ${cyan(cloud.link)}`);
+    lines.push(`${dim('中继')}     ${cloudStateText(cloud?.state)}`);
+    // 手机端唯一入口是 remoteView().url，`/api/v1/pairing` 里已经没有任何地址。
+    if (typeof cloud?.url === 'string' && cloud.url.length > 0) lines.push(`${dim('手机入口')} ${cyan(cloud.url)}`);
+    else if (typeof cloud?.lastError === 'string' && cloud.lastError.length > 0) lines.push(`${dim('中继原因')} ${red(cloud.lastError)}`);
   } catch (error) {
-    lines.push(`${dim('中继')}   ${dim(`读不到状态（${error.message}）`)}`);
+    lines.push(`${dim('中继')}     ${dim(`读不到状态（${error.message}）`)}`);
   }
   // `/api/v1/health` 是**未鉴权**视图，publicStatus() 只给 ok/version/protocol/
   // started/ready/uptimeMs/requiresPairing —— 故意不含任务数与设备数。所以这里
@@ -130,19 +206,22 @@ async function commandStatus() {
     const pairing = await request('/api/v1/pairing');
     const devices = Array.isArray(pairing?.devices) ? pairing.devices.length : 0;
     const maxDevices = Number(pairing?.maxDevices) || 0;
-    lines.push(`${dim('设备')}   ${devices}${maxDevices > 0 ? `/${maxDevices}` : ''} 台`);
+    lines.push(`${dim('设备')}     ${devices}${maxDevices > 0 ? `/${maxDevices}` : ''} 台`);
   } catch (error) {
-    lines.push(`${dim('设备')}   ${dim(`读不到（${error.message}）`)}`);
+    lines.push(`${dim('设备')}     ${dim(`读不到（${error.message}）`)}`);
   }
   process.stdout.write(`${lines.join('\n')}\n`);
 }
 
 function cloudStateText(state) {
   switch (state) {
-    case 'online': return green('已连接');
+    case 'online': return green('已连接（手机走这条中继）');
     case 'connecting': return yellow('连接中');
-    case 'unconfigured': return dim('未配置（在 DSH 界面里开启远程访问）');
+    case 'reconnecting': return yellow('重连中');
+    case 'offline': return red('连不上（broker 无响应）');
+    case 'unconfigured': return dim('未配置（缺 cloud.appBase，中继不会启动）');
     case 'blocked': return red('已阻止（未设置访问口令）');
+    case 'disabled': return dim('已暂停');
     case 'error': return red('连接失败');
     default: return dim(String(state ?? '未知'));
   }
@@ -204,21 +283,24 @@ function commandHelp() {
     '',
     `${bold('dsh-pocket-plugin')} ${dim('— DSH 随行 · 手机远程接管电脑上的 DeepSeek Harness')}`,
     '',
-    `  ${cyan('dsh-pocket-plugin link')}             打印配对链接、二维码与配对码`,
+    `  ${cyan('dsh-pocket-plugin pair')}             打印中继链接、二维码与配对码（别名 link）`,
     `  ${cyan('dsh-pocket-plugin status')}           健康状态、中继状态、设备数`,
     `  ${cyan('dsh-pocket-plugin devices')}          列出已配对设备`,
     `  ${cyan('dsh-pocket-plugin revoke <id|all>')}  撤销设备`,
     `  ${cyan('dsh-pocket-plugin broker [url]')}     查看或设置中继地址`,
     '',
     `  ${dim('--port <n>')}   插件端口，默认 ${DEFAULT_PORT}（或环境变量 DSH_POCKET_PORT）`,
-    `  ${dim('--base <url>')} 直接指定地址（或环境变量 DSH_POCKET_BASE）`,
-    `  ${dim('--no-qr')}      link 只打印链接，不画二维码`,
+    `  ${dim('--base <url>')} 直接指定本机 API 地址（或环境变量 DSH_POCKET_BASE）`,
+    `  ${dim('--no-qr')}      pair 只打印链接，不画二维码`,
+    '',
+    `  ${dim('手机端唯一的入口是加密中继；中继没起来时 pair 只报原因和下一步，不给任何备用地址。')}`,
     '',
   ].join('\n'));
 }
 
 const handlers = {
-  link: commandLink,
+  pair: commandPair,
+  link: commandPair,
   status: commandStatus,
   devices: commandDevices,
   revoke: commandRevoke,
@@ -228,8 +310,12 @@ const handlers = {
   '-h': commandHelp,
 };
 
+const wantsHelp = args.includes('--help') || args.includes('-h');
 const handler = handlers[command];
-if (handler === undefined) {
+if (wantsHelp && command !== 'help' && command !== '--help' && command !== '-h') {
+  // `pair --help` 这类只读调用不该去打网络。
+  commandHelp();
+} else if (handler === undefined) {
   process.stderr.write(`未知命令：${command}\n`);
   commandHelp();
   process.exitCode = 2;

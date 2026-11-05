@@ -129,7 +129,7 @@ export async function startBridge(options = {}) {
   const core = new BridgeCore({}, {
     home,
     dataDir,
-    host: '127.0.0.1',
+    // host 已不是配置项（只监听 127.0.0.1）；这里写它会触发一条废弃告警。
     port: 1,
     // 与线上一致：默认 fail-closed，必须有口令才允许中继；这里只测本机 HTTP 面。
     authRequired: true,

@@ -150,7 +150,7 @@ test('/api/v1/health：200、只暴露公开字段、端口是实际监听端口
   }
 });
 
-test('/api/v1/hello：200、地址端口与实际监听端口一致，且不含配对码/二维码/链接', async () => {
+test('/api/v1/hello：200、不含配对码/二维码/链接，也不再广播任何连接地址', async () => {
   const response = await request(ctx.port, '/api/v1/hello');
   const body = jsonResponse(response, 200, 'GET /api/v1/hello');
   assert.equal(body.ok, true);
@@ -160,13 +160,46 @@ test('/api/v1/hello：200、地址端口与实际监听端口一致，且不含�
   assert.equal(body.data.code, undefined);
   assert.equal(body.data.qrSvg, undefined);
   assert.equal(body.data.link, undefined);
+  assert.equal(body.data.deepLink, undefined);
   assert.equal(typeof body.data.fingerprint, 'string');
   assert.match(body.data.fingerprint, /^[0-9a-f]{10}$/u);
-  assert.ok(Array.isArray(body.data.addresses));
-  for (const entry of body.data.addresses) {
-    assert.match(entry.url, new RegExp(`:${ctx.port}/app$`, 'u'), `hello 里的地址端口不对：${entry.url}`);
-  }
+  // 字段集合钉死：v2 不再有任何「手机该连哪儿」的字段（局域网直连整条删除）。
+  // 把字段曾用名重新加回来，这条就会红，不用再记住每个名字。
+  assert.deepEqual(
+    Object.keys(body.data).sort(),
+    ['features', 'fingerprint', 'name', 'paired', 'platform', 'protocol', 'requiresPairing', 'time', 'version'],
+    `hello 的字段集合变了：${JSON.stringify(body.data)}`,
+  );
+  assert.equal(/192\.168\.|10\.\d+\.|172\.(1[6-9]|2\d|3[01])\.|0\.0\.0\.0/u.test(response.body), false, 'hello 里出现了内网地址形态');
   assert.equal(response.body.includes(ctx.core.state.pairing.code), false, 'hello 泄漏了配对码');
+});
+
+/*
+ * 新契约的地基：桌面端只监听 IPv4 回环。
+ * 断言打在**真的 listen 之后**的 server.address() 上，而不是配置值或常量 ——
+ * 配置里写着 127.0.0.1、代码却 listen(port, '0.0.0.0') 的情况必须红。
+ */
+test('监听地址恒为 127.0.0.1，绝不是 0.0.0.0 —— 读真实 server.address()', async () => {
+  const bound = ctx.httpServer.address();
+  assert.equal(typeof bound, 'object', `server 没有真的 listen：${JSON.stringify(bound)}`);
+  assert.equal(bound.address, '127.0.0.1', `必须只监听回环，实际监听 ${bound.address}`);
+  assert.notEqual(bound.address, '0.0.0.0', '监听 0.0.0.0 等于把面板暴露到整个局域网');
+  assert.notEqual(bound.address, '::', '监听 :: 同样会覆盖所有网卡');
+  assert.equal(bound.family, 'IPv4');
+  assert.equal(bound.port, ctx.port, '读回的端口必须与 core 认的一致');
+
+  // 老配置里残留 host 也不能改变监听地址：host 已不是配置项，监听地址是常量。
+  const legacy = await startBridge({ config: { host: '0.0.0.0' } });
+  try {
+    const legacyBound = legacy.httpServer.address();
+    assert.equal(legacyBound.address, '127.0.0.1', `旧配置的 host:0.0.0.0 不许真的生效，实际 ${legacyBound.address}`);
+    assert.ok(
+      legacy.logs.some((line) => line.includes('host 配置已废弃')),
+      `旧配置必须留告警，实际日志：${legacy.logs.slice(0, 6).join(' | ')}`,
+    );
+  } finally {
+    await legacy.close();
+  }
 });
 
 test('/healthz：与 /api/v1/health 同一份 publicStatus，不需要令牌', async () => {
@@ -387,7 +420,9 @@ test('GET /api/v1/me：200、设备视图不含 tokenHash、不含配对码', as
   assert.equal(body.data.device.appVersion, '9.9.9');
   assert.equal(body.data.server.protocol, 1);
   assert.equal(body.data.stats.port, ctx.port);
-  assert.equal(body.data.baseUrl, ctx.core.baseUrl);
+  // v2：status() 里已经没有 baseUrl（只有回环监听，没有「手机该打开的地址」）。
+  assert.equal(body.data.baseUrl, undefined, '/me 不该再带 baseUrl');
+  assert.equal(body.data.stats.baseUrl, undefined, 'stats 就是 status()，同样不许带 baseUrl');
   assert.equal(response.body.includes('tokenHash'), false);
   assert.equal(response.body.includes(token), false, '/me 不应把令牌再回显出来');
   assert.equal(response.body.includes(ctx.core.state.pairing.code), false);
@@ -449,21 +484,62 @@ test('GET /api/v1/pairing：200，配对码与设备列表一起下发（回环�
   assert.match(body.data.fingerprint, /^[0-9a-f]{10}$/u);
   assert.ok(Array.isArray(body.data.devices));
   assert.ok(body.data.devices.some((device) => device.id === mainDeviceId));
-  // 回环页面才该有二维码；这里只确认它是 SVG，不校验图形内容。
-  assert.match(body.data.qrSvg, /^<svg /u);
+  // v2：配对视图只剩「码 + 计数 + 指纹」，二维码/链接/路由地址全部删除。
+  // 字段集合钉死，任何一处「顺手加回来」都会红。
+  assert.deepEqual(
+    Object.keys(body.data).sort(),
+    ['available', 'code', 'createdAt', 'devices', 'expiresAt', 'fingerprint', 'maxDevices', 'maxUses', 'ttlMs', 'uses'],
+    `配对视图的字段集合变了：${JSON.stringify(Object.keys(body.data))}`,
+  );
+  assert.equal('qrSvg' in body.data, false, '配对视图不该再有二维码');
+  assert.equal('link' in body.data, false, '配对视图不该再有链接');
+  assert.equal('deepLink' in body.data, false, '配对视图不该再有深链');
+  assert.equal('baseUrl' in body.data, false, '配对视图不该再有 baseUrl');
 });
 
-test('POST /api/v1/pairing/rotate：200，配对码变化且二维码重新生成', async () => {
-  const before = ctx.core.state.pairing.code;
-  const qrBefore = ctx.core.pairingView().qrSvg;
+/*
+ * spec 第 2 条：pairingView() 序列化后不许含任何内网地址形态。
+ * 直接对「方法返回值」断言（而不是某个路由的响应），这样以后新增调用方也覆盖到。
+ */
+test('pairingView()：序列化后不含任何内网地址形态，也不含任何 URL', () => {
+  const view = ctx.core.pairingView();
+  const text = JSON.stringify(view);
+
+  for (const [label, pattern] of [
+    ['192.168.x.x', /192\.168\./u],
+    ['10.x.x.x', /10\.\d+\./u],
+    ['172.16-31.x.x', /172\.(1[6-9]|2\d|3[01])\./u],
+    ['0.0.0.0', /0\.0\.0\.0/u],
+    ['localhost', /localhost/u],
+    ['任何 http(s) URL', /https?:\/\//u],
+  ]) {
+    assert.equal(pattern.test(text), false, `pairingView 序列化后出现了 ${label}：${text}`);
+  }
+
+  // 配对码本身只是 8 位字符，不暗示任何地址。
+  assert.match(view.code, /^[2-9A-Z]{4}-[2-9A-Z]{4}$/u);
+  assert.deepEqual(
+    Object.keys(view).sort(),
+    ['available', 'code', 'createdAt', 'expiresAt', 'fingerprint', 'maxDevices', 'maxUses', 'ttlMs', 'uses'],
+    'pairingView 只该有这 9 个键',
+  );
+});
+
+test('POST /api/v1/pairing/rotate：200，配对码与有效期一起刷新，且不吐二维码/链接', async () => {
+  const before = ctx.core.pairingView();
   const body = jsonResponse(await requestJson(ctx.port, '/api/v1/pairing/rotate', {
     method: 'POST',
     headers: authed(),
   }), 200, 'POST /api/v1/pairing/rotate');
-  assert.notEqual(body.data.code, before, 'rotate 必须换码');
+  assert.notEqual(body.data.code, before.code, 'rotate 必须换码');
   assert.match(body.data.code, /^[2-9A-Z]{4}-[2-9A-Z]{4}$/u);
-  assert.notEqual(body.data.qrSvg, qrBefore, '换码后二维码必须跟着变');
+  assert.equal(body.data.available, true);
   assert.equal(body.data.uses, 0);
+  assert.ok(body.data.expiresAt >= before.expiresAt, '换码必须把有效期重新顺延');
+  // 写路径（rotate）同样走 pairingView()，二维码/链接不许借这条路径回流。
+  for (const gone of ['qrSvg', 'link', 'deepLink', 'baseUrl']) {
+    assert.equal(gone in body.data, false, `rotate 响应里出现了已删除的 ${gone}`);
+  }
 });
 
 test('GET /api/v1/devices：200，只列出未吊销设备，视图与 /pairing 一致', async () => {

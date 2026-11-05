@@ -1231,7 +1231,23 @@ svg { stroke: currentColor; stroke-width: 1.8; fill: none; stroke-linecap: round
   padding: 9px 12px;
   border-radius: 10px;
 }
-.recent-wrap { margin-top: 6px; }
+/* 中继之外没有可用的连接方式：这条提示必须压过「手输地址」的直觉。 */
+.connect-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0 0 14px;
+  padding: 12px 13px;
+  border-radius: 13px;
+  border: 1px solid rgba(251, 191, 36, .38);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.connect-notice-text { display: flex; flex-direction: column; gap: 3px; }
+.connect-notice strong { font-size: 13px; }
+.connect-notice span { color: var(--text-2); }
 .connect-foot {
   padding: 22px 6px 0;
   font-size: 11.5px;

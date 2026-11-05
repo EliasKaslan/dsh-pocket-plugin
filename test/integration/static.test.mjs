@@ -236,7 +236,7 @@ test('/download：存在的文件 200、缺失 404、穿越 400、中继 403', a
 
 /* ------------------------------------------------- 根路径 / 配对页 / 落地页 */
 
-test('根路径：回环 302 到 /pair；中继（= 局域网访客）拿到落地页且不含配对码', async () => {
+test('根路径：回环 302 到 /pair；中继请求拿到落地页，且既不含配对码也不给本地入口', async () => {
   const local = await request(ctx.port, '/');
   assert.equal(local.status, 302);
   assert.equal(local.headers.location, '/pair');
@@ -247,7 +247,9 @@ test('根路径：回环 302 到 /pair；中继（= 局域网访客）拿到落�
   assert.equal(remote.status, 200);
   assert.equal(remote.headers['content-type'], 'text/html; charset=utf-8');
   assert.match(remote.body, /请在电脑上完成配对/u);
-  assert.match(remote.body, /打开手机版/u);
+  // v2 起手机没有本地入口：落地页不能再给 /app 链接，只能指向中继。
+  assert.equal(remote.body.includes('href="/app"'), false, '落地页不该再提供本地入口');
+  assert.match(remote.body, /中继/u, '落地页必须指向中继这条唯一通路');
   assert.equal(remote.body.includes(ctx.core.state.pairing.code), false, '落地页泄漏了配对码');
   assert.equal(remote.body.includes(ctx.core.csrfToken), false, '落地页泄漏了 CSRF token');
 });
