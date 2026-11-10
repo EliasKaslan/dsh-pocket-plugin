@@ -1,0 +1,586 @@
+/**
+ * DSH 随行 · phone client entry point.
+ *
+ * Boots the connect flow, owns the router, and is the single place that talks to
+ * the host: every view gets its actions through `ctx` instead of importing the
+ * network layer itself.
+ *
+ * 登录只有一种方式：中继外壳（`remote/remote.js`）用口令向电脑换一张设备
+ * 令牌，再通过 `__POCKET_SHELL__` 交过来。拿到令牌就直接渲染任务列表，
+ * 中间没有任何需要手输的码。
+ */
+import './lib/sprite.js';
+import { $, empty, h, icon, raf } from './lib/dom.js';
+import { ApiError, Realtime, createApi } from './lib/net.js';
+import { relTime } from './lib/format.js';
+import { toast } from './lib/ui.js';
+import {
+  LIMITS, applyTheme, baseUrl, isRelayShell, loadCache, loadPrefs, loadSession,
+  saveCache, savePrefs, saveSession, serverName, sessionFromShell, shellDeviceError, store, token,
+} from './store.js';
+import { mountCompose } from './views/compose.js';
+import { mountConnect } from './views/connect.js';
+import { mountDetail } from './views/detail.js';
+import { mountSettings } from './views/settings.js';
+import { mountTasks } from './views/tasks.js';
+
+const APP_VERSION = '1.0.0';
+const SHELL = globalThis.__POCKET_SHELL__ ?? null;
+const SESSION_CACHE = 'dsh.pocket.session.v1';
+
+const app = document.getElementById('app');
+const banner = createBanner();
+
+let view = null;
+let viewName = '';
+let viewSeq = 0;
+let realtime = null;
+let lastBeatAt = 0;
+let detailTimer = null;
+let pollTimer = null;
+let lastFrameAt = 0;
+const tasksCache = new Map();
+
+/* ---------------- api ---------------- */
+
+const api = createApi({
+  getBase: () => baseUrl(),
+  getToken: token,
+  onUnauthorized: (message) => {
+    toast(message || '登录已失效，请重新用口令登录', { tone: 'danger' });
+    signOut();
+  },
+});
+
+/* ---------------- connection banner ---------------- */
+
+function createBanner() {
+  const el = h('div', { class: 'offline-banner', hidden: true },
+    icon('alert', { size: 16 }),
+    h('span', { class: 'offline-text' }),
+    h('button', {
+      class: 'offline-action', type: 'button', text: '重连',
+      on: { click: () => { realtime?.kick(); void loadTasks({ silent: true }); } },
+    }),
+  );
+  document.body.append(el);
+  return el;
+}
+
+function setConn(state) {
+  if (store.connState === state) return;
+  store.connState = state;
+  const online = state === 'online';
+  banner.hidden = online || state === 'connecting' || store.session === null;
+  if (!banner.hidden) {
+    banner.querySelector('.offline-text').textContent = state === 'stale'
+      ? '电脑那边没有响应，数据可能已经过期'
+      : '与电脑的连接中断了，正在重试';
+  }
+  repaint();
+}
+
+/* ---------------- realtime ---------------- */
+
+function startRealtime() {
+  stopRealtime();
+  if (store.session === null) return;
+  lastBeatAt = Date.now();
+  realtime = new Realtime({
+    api,
+    getBase: () => baseUrl(),
+    getToken: token,
+    onFrame,
+    onBeat: () => { lastBeatAt = Date.now(); },
+    onState: (state) => {
+      if (state === 'online') setConn('online');
+      else if (state === 'polling') setConn('polling');
+      else if (store.connState !== 'stale') setConn(state === 'connecting' ? 'connecting' : 'offline');
+    },
+  });
+  realtime.start();
+}
+
+function stopRealtime() {
+  realtime?.stop();
+  realtime = null;
+}
+
+function onFrame(frame) {
+  lastFrameAt = Date.now();
+  lastBeatAt = Date.now();
+  const payload = frame.payload ?? {};
+  switch (frame.type) {
+    case 'hello': {
+      store.me = { device: payload.device, server: payload.server };
+      if (payload.server) store.bridge = { ...(store.bridge ?? {}), ...payload.server };
+      setConn('online');
+      void loadTasks({ silent: true });
+      break;
+    }
+    case 'bridge.status': {
+      store.bridge = { ...(store.bridge ?? {}), ...payload };
+      if (payload.loading === false) store.loading = false;
+      if (typeof payload.error === 'string' && payload.error.length > 0) store.loadError = payload.error;
+      repaint();
+      break;
+    }
+    case 'task.created':
+    case 'task.updated': {
+      upsertTask(payload);
+      if (store.detailId === payload.id) {
+        const detail = store.detail;
+        if (detail !== null && detail !== undefined && detail.task) detail.task = payload;
+        view?.updateHeader?.();
+      }
+      repaint();
+      break;
+    }
+    case 'task.removed': {
+      if (typeof payload.id === 'string') {
+        store.tasks.delete(payload.id);
+        store.order = store.order.filter((id) => id !== payload.id);
+        repaint();
+      }
+      break;
+    }
+    case 'task.message': {
+      // The list only needs the preview, which `task.updated` already carries;
+      // the open transcript needs a debounced refetch.
+      if (store.detailId !== null && payload.taskId === store.detailId) scheduleDetailRefresh(280);
+      break;
+    }
+    case 'devices.changed': {
+      if (store.screen === 'settings') void loadMe();
+      break;
+    }
+    default: break;
+  }
+}
+
+/* ---------------- data loading ---------------- */
+
+async function loadMe() {
+  try {
+    const data = await api('/api/v1/me');
+    store.me = data;
+    if (data?.server) {
+      store.bridge = { ...(store.bridge ?? {}), ...data.server };
+      if (store.session !== null && !store.session.serverName) {
+        saveSession({ ...store.session, serverName: data.server.name ?? '' });
+      }
+    }
+    const started = performance.now();
+    try {
+      const health = await api('/api/v1/health', { auth: false, timeout: 6000 });
+      store.latency = Math.max(1, Math.round(performance.now() - started));
+      if (health !== null && typeof health === 'object') store.bridge = { ...(store.bridge ?? {}), ...health };
+    } catch { /* latency is best effort */ }
+  } catch (error) {
+    if (error?.status !== 401) throw error;
+  }
+}
+
+async function loadTasks({ silent = false } = {}) {
+  if (store.session === null) return;
+  if (!silent) store.loading = store.tasks.size === 0;
+  try {
+    const subagents = store.prefs.showSubagents === true ? '1' : '0';
+    const data = await api(`/api/v1/tasks?limit=${LIMITS.taskPage}&subagents=${subagents}`, { timeout: 25_000 });
+    const list = Array.isArray(data?.tasks) ? data.tasks : [];
+    store.tasks = new Map(list.map((task) => [task.id, task]));
+    store.order = list.map((task) => task.id);
+    if (typeof data?.total === 'number') store.orderTotal = data.total;
+    store.summary = { ...store.summary, ...(data?.summary ?? {}) };
+    store.loadError = typeof data?.error === 'string' ? data.error : '';
+    store.loading = false;
+    saveCache();
+    if (store.draft.cwd.length === 0) {
+      const recent = list.find((task) => typeof task.cwd === 'string' && task.cwd.length > 0 && task.isSubagent !== true);
+      if (recent !== undefined) store.draft.cwd = recent.cwd;
+    }
+    if (store.detailId !== null) {
+      const fresh = store.tasks.get(store.detailId);
+      if (fresh !== undefined && store.detail !== null) store.detail.task = fresh;
+    }
+  } catch (error) {
+    store.loading = false;
+    if (!silent) {
+      store.loadError = error?.message ?? '读取任务失败';
+      if (error?.status !== 401) toast(store.loadError, { tone: 'danger' });
+    }
+  }
+  repaint();
+  view?.updateHeader?.();
+}
+
+async function loadPresets() {
+  try {
+    const data = await api('/api/v1/presets');
+    store.presets = Array.isArray(data?.presets) ? data.presets : [];
+    if (store.draft.preset.length === 0 && typeof data?.defaultId === 'string') store.draft.preset = data.defaultId;
+  } catch { /* optional capability */ }
+}
+
+async function loadWorkspaces() {
+  try {
+    const data = await api('/api/v1/workspaces');
+    store.workspaces = Array.isArray(data?.workspaces) ? data.workspaces : [];
+    if (store.draft.cwd.length === 0) {
+      const usable = store.workspaces.find((workspace) => workspace.available !== false);
+      if (usable !== undefined) store.draft.cwd = usable.path;
+    }
+  } catch { /* optional capability */ }
+}
+
+async function loadDetail(id, { silent = false } = {}) {
+  const seq = ++viewSeq;
+  if (!silent) { store.detail = null; store.detailError = ''; }
+  try {
+    const data = await api(`/api/v1/tasks/${encodeURIComponent(id)}`, { timeout: 25_000 });
+    if (seq !== viewSeq || store.detailId !== id) return;
+    store.detail = data;
+    store.detailError = '';
+    if (data?.task) upsertTask(data.task, { repaint: false });
+  } catch (error) {
+    if (seq !== viewSeq || store.detailId !== id) return;
+    store.detailError = error?.message ?? '读取会话失败';
+  }
+  if (store.screen === 'detail') {
+    view?.paint();
+    if (!silent) view?.scrollToBottom?.(true);
+  }
+}
+
+function scheduleDetailRefresh(delay = 320) {
+  if (detailTimer !== null) clearTimeout(detailTimer);
+  detailTimer = setTimeout(() => {
+    detailTimer = null;
+    if (store.detailId !== null && store.session !== null) void loadDetail(store.detailId, { silent: true });
+  }, delay);
+}
+
+/* ---------------- task helpers ---------------- */
+
+function upsertTask(task, { repaint: shouldRepaint = true } = {}) {
+  if (typeof task?.id !== 'string') return;
+  store.tasks.set(task.id, task);
+  if (!store.order.includes(task.id)) store.order.unshift(task.id);
+  if (shouldRepaint) repaint();
+}
+
+/* ---------------- routing ---------------- */
+
+function parseRoute(hash) {
+  const raw = String(hash ?? location.hash ?? '').replace(/^#/u, '');
+  if (raw.startsWith('/task/')) return { name: 'detail', id: decodeURIComponent(raw.slice(6)) };
+  if (raw === '/new') return { name: 'new' };
+  if (raw === '/settings') return { name: 'settings' };
+  if (raw === '/connect') return { name: 'connect' };
+  if (raw === '/tasks' || raw.length === 0) return { name: 'tasks' };
+  return { name: 'tasks' };
+}
+
+function navigate(path, { replace = false } = {}) {
+  const target = path.startsWith('#') ? path : `#${path}`;
+  if (location.hash === target) { void applyRoute(); return; }
+  if (replace) history.replaceState(null, '', target);
+  else location.hash = target;
+  if (replace) void applyRoute();
+}
+
+function destroyView() {
+  if (view === null) return;
+  if (viewName === 'tasks') {
+    // Keep the list alive so returning from a task restores scroll position.
+    view.screen.remove();
+  } else {
+    view.destroy?.();
+    view.screen.remove();
+    view = null;
+  }
+  viewName = '';
+}
+
+async function applyRoute() {
+  const route = parseRoute();
+  if (route.name !== 'connect' && store.session === null) {
+    store.screen = 'connect';
+  } else if (route.name === 'connect' && store.session !== null) {
+    navigate('/tasks', { replace: true });
+    return;
+  } else {
+    store.screen = route.name;
+  }
+
+  const next = store.screen;
+  if (viewName !== next) {
+    destroyView();
+    viewName = next;
+    view = mountFor(next, route);
+    if (view.screen !== undefined && !view.screen.isConnected) app.append(view.screen);
+  }
+
+  if (next === 'detail' && store.detailId !== route.id) {
+    store.detailId = route.id;
+    store.detail = null;
+    store.detailError = '';
+    store.chatAuto = true;
+    view.paint();
+    void loadDetail(route.id);
+  }
+  if (next === 'new') {
+    if (store.draft.cwd.length === 0) {
+      store.draft.cwd = store.prefs.lastCwd || store.workspaces.find((w) => w.available !== false)?.path || '';
+    }
+    void Promise.all([loadWorkspaces(), loadPresets()]).then(() => view?.paint());
+  }
+  if (next === 'settings') {
+    void loadMe().then(() => view?.paint());
+  }
+
+  view?.paint?.();
+  updateTabbarState();
+  window.scrollTo(0, 0);
+}
+
+function mountFor(name, route) {
+  empty(app);
+  const ctx = makeContext();
+  switch (name) {
+    case 'connect': return mountConnect(app, ctx);
+    case 'detail': return mountDetail(app, ctx);
+    case 'new': return mountCompose(app, ctx);
+    case 'settings': return mountSettings(app, ctx);
+    default: {
+      const cached = tasksCache.get('tasks');
+      if (cached !== undefined) {
+        app.append(cached.screen);
+        return cached;
+      }
+      const created = mountTasks(app, ctx);
+      tasksCache.set('tasks', created);
+      return created;
+    }
+  }
+}
+
+function updateTabbarState() {
+  for (const tab of document.querySelectorAll('.tabbar .tab')) {
+    const label = tab.textContent ?? '';
+    const active = (store.screen === 'tasks' && label.includes('任务'))
+      || (store.screen === 'settings' && label.includes('我的'));
+    tab.classList.toggle('active', active);
+  }
+}
+
+/* ---------------- context handed to views ---------------- */
+
+function makeContext() {
+  return {
+    appVersion: APP_VERSION,
+    api,
+    navigate,
+    back() {
+      if (history.length > 1) history.back();
+      else navigate('/tasks', { replace: true });
+    },
+    reframe() {},
+    repaintAll() { repaint(); },
+    paint: repaint,
+    refresh() { void loadTasks(); },
+    reloadTasks() { void loadTasks(); },
+    openTask(id) { navigate(`/task/${encodeURIComponent(id)}`); },
+    setFilter(filter) { store.filter = filter; repaint(); },
+    setQuery(query) { store.query = query; repaint(); },
+    clearFilters() { store.filter = 'all'; store.query = ''; repaint(); },
+    toggleSearch(force) {
+      const show = force ?? (store.searching !== true);
+      store.searching = show;
+      if (show) view?.focusSearch?.();
+      else { view?.hideSearch?.(); store.query = ''; repaint(); }
+    },
+    reconnect() {
+      realtime?.kick();
+      void loadTasks();
+      toast('正在重连…', { tone: 'info' });
+    },
+    async copyDiagnostics() {
+      const lines = [
+        `DSH 随行 v${APP_VERSION}`,
+        `地址：${baseUrl()}`,
+        `连接：${store.connState}`,
+        `延迟：${store.latency} ms`,
+        `任务：${store.tasks.size} 条`,
+        `设备：${store.session?.deviceName ?? '未知'}`,
+        `服务端：${serverName()}`,
+        `UA：${navigator.userAgent}`,
+      ].join('\n');
+      try {
+        await navigator.clipboard.writeText(lines);
+        toast('诊断信息已复制', { tone: 'ok' });
+      } catch {
+        toast('复制失败，请手动长按选择', { tone: 'danger' });
+      }
+    },
+    async requestNotifications() {
+      if (typeof Notification === 'undefined') { toast('这个浏览器不支持通知', { tone: 'danger' }); return; }
+      try {
+        const result = await Notification.requestPermission();
+        if (result !== 'granted') { savePrefs({ notify: false }); toast('没有拿到通知授权', { tone: 'danger' }); view?.paint(); }
+      } catch { /* ignore */ }
+    },
+    unpair() { signOut({ forget: true }); },
+    /** 回到口令闸门：清掉登录会话与设备令牌，由中继外壳重新弹登录页。 */
+    relogin() {
+      const shell = globalThis.__POCKET_SHELL__;
+      if (typeof shell?.relogin === 'function') { shell.relogin(); return; }
+      location.reload();
+    },
+    reloadPage() { location.reload(); },
+    savedCwd(cwd) { savePrefs({ lastCwd: cwd }); },
+    reloadDetail() { if (store.detailId !== null) void loadDetail(store.detailId); },
+    refreshDetailSoon() { scheduleDetailRefresh(400); },
+  };
+}
+
+/* ---------------- paint ---------------- */
+
+const repaintScheduled = raf(() => {
+  view?.paint?.();
+  updateTabbarState();
+});
+
+function repaint() { repaintScheduled(); }
+
+/* ---------------- session lifecycle ---------------- */
+
+function signOut({ forget = false } = {}) {
+  stopRealtime();
+  saveSession(null);
+  if (forget) store.tasks = new Map();
+  store.order = [];
+  store.detail = null;
+  store.detailId = null;
+  tasksCache.clear();
+  navigate('/connect', { replace: true });
+}
+
+async function enterApp() {
+  store.loading = store.tasks.size === 0;
+  loadCache();
+  store.screen = 'tasks';
+  navigate('/tasks', { replace: true });
+  startRealtime();
+  const results = await Promise.allSettled([loadMe(), loadTasks(), loadPresets(), loadWorkspaces()]);
+  const failed = results.find((result) => result.status === 'rejected');
+  if (failed !== undefined && failed.reason?.status !== 401) {
+    setConn('offline');
+  }
+  repaint();
+}
+
+/* ---------------- timers ---------------- */
+
+function startTimers() {
+  setInterval(() => {
+    if (store.session === null) return;
+    const age = Date.now() - lastBeatAt;
+    if (realtime?.state === 'online') {
+      setConn(age > 26_000 ? 'stale' : 'online');
+    }
+    const running = [...store.tasks.values()].some((task) => task.status === 'running');
+    if (running && document.visibilityState === 'visible' && realtime?.state !== 'online') {
+      void loadTasks({ silent: true });
+    }
+  }, 5000);
+
+  setInterval(() => {
+    if (document.visibilityState !== 'visible') return;
+    for (const node of document.querySelectorAll('[data-ts]')) {
+      const ts = Number(node.dataset.ts);
+      if (ts > 0) node.textContent = relTime(ts);
+    }
+  }, 30_000);
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    realtime?.kick();
+    if (Date.now() - lastFrameAt > 20_000) void loadTasks({ silent: true });
+  });
+
+  pollTimer = setInterval(() => {
+    if (document.visibilityState !== 'visible') return;
+    if (store.connState === 'online' || store.session === null) return;
+    void loadTasks({ silent: true });
+    if (store.detailId !== null) scheduleDetailRefresh(0);
+  }, 12_000);
+}
+
+/* ---------------- service worker ---------------- */
+
+async function registerWorker() {
+  if (!('serviceWorker' in navigator) || !window.isSecureContext) return;
+  const swUrl = SHELL?.swUrl ?? '/app/sw.js';
+  const options = typeof SHELL?.scope === 'string' ? { scope: SHELL.scope } : undefined;
+  try {
+    const registration = await navigator.serviceWorker.register(swUrl, options);
+    registration.addEventListener('updatefound', () => { /* 新外壳在下次启动生效 */ });
+  } catch { /* 离线与安装到桌面是加分项，不是硬依赖 */ }
+}
+
+/* ---------------- boot ---------------- */
+
+async function boot() {
+  loadPrefs();
+  applyTheme();
+  // 唯一通路是加密中继：不是中继外壳（例如桌面 `/app` 本机预览）就清掉旧会话，
+  // 免得残留一条不经中继的直连。
+  store.session = isRelayShell() ? loadSession() : null;
+  if (!isRelayShell()) saveSession(null);
+
+  // 外壳刚用口令换到设备令牌：以它为准重建会话 —— 有令牌就直接进任务列表，
+  // 中间不再有任何连接页。外壳明确说这台设备没有令牌可用
+  // （被电脑端移除 / 设备数已满）时，本地那份旧会话一律作废。
+  if (shellDeviceError().length > 0) saveSession(null);
+  else adoptShellSession();
+
+  window.addEventListener('hashchange', () => { void applyRoute(); });
+  window.addEventListener('online', () => { realtime?.kick(); void loadTasks({ silent: true }); });
+
+  if (store.session !== null) {
+    await enterApp();
+  } else {
+    navigate('/connect', { replace: true });
+    await applyRoute();
+  }
+  startTimers();
+  void registerWorker();
+}
+
+/** 用外壳给的设备令牌重建会话；没有令牌就什么也不做（返回 false）。 */
+function adoptShellSession() {
+  const adopted = sessionFromShell(store.session);
+  if (adopted === null) return false;
+  saveSession(adopted);
+  return true;
+}
+
+boot().catch((error) => {
+  console.error('boot failed', error);
+  empty(app);
+  app.append(
+    h('div', { class: 'boot-failed' },
+      h('div', { class: 'boot-failed-mark' }, icon('alert', { size: 28 })),
+      h('h1', { text: '启动失败' }),
+      h('p', { text: error?.message ?? '页面没能初始化' }),
+      h('button', {
+        class: 'btn btn-primary', type: 'button', text: '重试',
+        on: { click: () => location.reload() },
+      }),
+    ),
+  );
+});
+
+/** Exposed for the debug console and for the E2E harness. */
+globalThis.__pocket = { store, api, navigate, loadTasks, LIMITS };

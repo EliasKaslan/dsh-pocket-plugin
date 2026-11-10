@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#070b16">
+<meta name="color-scheme" content="dark light">
+<meta name="format-detection" content="telephone=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="DSH 随行">
+<meta name="description" content="DSH 随行：扫码连接电脑端 DeepSeek Harness，实时查看任务、远程下发。">
+<meta name="referrer" content="no-referrer">
+<!--
+  GitHub Pages 不能设置响应头，CSP 只能写在这里。脚本只允许同源，
+  这样即便有人在仓库里塞进内联脚本或远程 SDK，浏览器也直接拒跑。
+  connect-src 必须放开 wss:，因为中继地址是可以自定义的。
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' https: wss:; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>DSH 随行 · 远程</title>
+<!--
+  Remote shell entry.
+
+  Flow: this document paints the splash first (plain HTML, no JS needed), then
+  loads ./remote.js as a module. remote.js validates the link, connects the
+  encrypted relay, runs the login gate and only then does
+  `await import('./app.js')`. app.js is the same bundle the desktop serves at
+  `/app`; it receives `globalThis.__POCKET_SHELL__` right before that import.
+
+  Every path below is relative. The shell may be published at the root of a
+  static host or under an arbitrary sub-path (GitHub Pages project sites,
+  object storage prefixes, a self-hosted directory) — absolute paths would
+  break every deployment except one.
+-->
+<link rel="icon" href="./favicon.svg" type="image/svg+xml">
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="stylesheet" href="./app.css">
+<link rel="stylesheet" href="./remote.css">
+</head>
+<body class="pocket-body">
+
+<!-- Painted before any script runs, so the first frame is never a blank page. -->
+<div id="pocket-splash" class="pocket-splash" role="status" aria-live="polite">
+  <div class="pocket-splash-mark"><span class="pocket-orbit"></span></div>
+  <div class="pocket-splash-title" id="pocket-splash-text">正在连接电脑…</div>
+  <div class="pocket-splash-sub" id="pocket-splash-sub">通过加密中继建立通道</div>
+  <div class="pocket-splash-extra" id="pocket-splash-extra"></div>
+</div>
+
+<div id="app" class="app-root">
+  <div class="boot">
+    <div class="boot-mark"><span class="logo-orbit"></span><svg viewBox="0 0 48 48" width="56" height="56" aria-hidden="true"><defs><linearGradient id="bootGrad" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5B8CFF"/><stop offset="1" stop-color="#8B5CF6"/></linearGradient></defs><rect x="3" y="3" width="42" height="42" rx="13" fill="url(#bootGrad)"/><path d="M15 24.5c3.2-6.8 14.8-6.8 18 0" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/><circle cx="24" cy="30.5" r="3" fill="#fff"/></svg></div>
+    <div class="boot-title">DSH 随行</div>
+    <div class="boot-sub">正在连接你的电脑…</div>
+    <div class="boot-bar"><span></span></div>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<div id="modal-root" class="layer-root"></div>
+
+<noscript>
+  <div class="pocket-gate">
+    <div class="pocket-card">
+      <h1 class="pocket-title">需要启用 JavaScript</h1>
+      <p class="pocket-sub">这个页面通过加密中继连接你的电脑，必须在浏览器里运行脚本。</p>
+    </div>
+  </div>
+</noscript>
+
+<script src="./mqtt.min.js"></script>
+<script type="module" src="./remote.js"></script>
+</body>
+</html>
