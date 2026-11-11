@@ -432,3 +432,21 @@ test('列表：预览截到 LIST_PREVIEW_CHARS（卡片只显示两行，长预�
   assert.ok(listed.lastText.length <= LIST_PREVIEW_CHARS + 1, `预览必须被截短，实际 ${listed.lastText.length}`);
   taskIndex.dispose();
 });
+
+test('外壳：流式期间走增量追新，不再整页重拉', () => {
+  const source = readRepo('web/app.js');
+  assert.match(source, /scheduleDetailAppend/u, '必须有增量调度器');
+  assert.match(source, /\?after=\$\{encodeURIComponent\(cursor\)\}/u, '必须用 after 游标');
+  assert.match(source, /detailAppending/u, '必须有并发闸');
+
+  // task.message 分支不能再走整页刷新
+  const at = source.indexOf("case 'task.message'");
+  assert.ok(at > 0, '找不到 task.message 分支');
+  const branch = source.slice(at, at + 800);
+  assert.ok(!branch.includes('scheduleDetailRefresh'), 'task.message 不许再整页刷新');
+  assert.ok(branch.includes('scheduleDetailAppend'), 'task.message 必须走增量');
+
+  // 游标失效要退回整页，不能把两段拼起来；被预算截断要续追
+  assert.match(source, /data\?\.reset === true/u, 'reset 必须被识别');
+  assert.match(source, /hasMoreAfter === true/u, '被预算截断时要续追');
+});
