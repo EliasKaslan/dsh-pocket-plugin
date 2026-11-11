@@ -38,6 +38,21 @@
 
 只加依赖不够：`dsh.profile.bundles` 里没有这一行时，插件不会加载。
 
+### 推荐：让 DSH 自己装（一步到位）
+
+最省事的办法是走 DSH 的插件管理器，用本地 `link:` 规格安装：
+
+- **图形界面**：设置 → 插件 → 从本地路径安装，填你 clone 下来的目录
+- **让 agent 装**：调用 `plugin_manager` 工具，`action: install_bundle`，`target: link:D:/path/to/dsh-pocket`（Windows 路径用正斜杠）
+
+它会把该做的三件事一次做完，并且都写入正确的文件：
+
+1. 在 `$DSH_HOME/profiles/<profile>/package.json` 的 `dependencies` 里加 `"dsh-pocket-plugin": "link:<你的路径>"`
+2. 把 `dsh-pocket-plugin` 追加进同一文件的 `dsh.profile.bundles`
+3. 跑一次 pnpm，让 `node_modules/dsh-pocket-plugin` 正确指向你的目录（不要手工 `mklink`：手建的链接 pnpm 不认识，下一次依赖变动就可能被冲掉）
+
+装完返回 `application: applied` 即已生效。**下面的手写步骤是实现原理与排障用的等价路径**，不确定插件管理器能不能用时再走。
+
 ```jsonc
 // $DSH_HOME/profiles/<你的 profile>/package.json
 {
@@ -57,11 +72,39 @@
 ```
 
 ```powershell
-# 让包名可解析（不用联网）
+# 手写路径的最后一步：手工建 junction。
+# 仅在你没法用插件管理器、且 pnpm 没装过它的排障场景下用；pnpm 装过就别再建。
 cmd /c mklink /J "%USERPROFILE%\.dsh\profiles\<你的 profile>\node_modules\dsh-pocket-plugin" "D:\path\to\dsh-pocket"
 ```
 
-装完重启 DSH，启动日志里应出现 `plugin loading; data=<数据目录>` 与 `bridge listening on 127.0.0.1:<port>`（`lib/index.mjs:35`、`lib/core.mjs:624`）；没有就回去检查 `bundles` 与 `node_modules` 链接。
+装完重启 DSH，按下面四条验收（缺一条都算没装上）：
+
+```powershell
+# 1. 回环接口起来了，且版本对、需要登录
+Invoke-RestMethod http://127.0.0.1:47901/api/v1/health | ConvertTo-Json -Depth 4
+#   期望：started=true  ready=true  version=1.0.0  requiresLogin=true
+
+# 2. 启动日志里有监听与二维码落点
+Get-Content "$env:USERPROFILE\.dsh\pocket\bridge.log" -Tail 12
+#   期望：bridge listening on 127.0.0.1:47901
+#        二维码文件在 C:\Users\<你>\dsh-pocket-qr.png
+#        二维码已写入 C:\Users\<你>\dsh-pocket-qr.png（<N> 字节）
+
+# 3. 二维码真的落到个人目录
+Test-Path "$env:USERPROFILE\dsh-pocket-qr.png"      # 期望 True
+
+# 4. 桌面连接页能打开
+Start-Process http://127.0.0.1:47901/pair
+```
+
+中继没起来时（`cloud.enabled` 为 false、或没填 `cloud.appBase`、或没设口令）第 2、3 条不会出现二维码——那是 fail-closed 的正常表现，页面会写明原因。没有 `plugin loading` 就回去检查 `bundles` 与 `node_modules` 链接。
+
+想知道二维码里到底编码了什么，把它解出来跟接口比对（肉眼"看着像二维码"不算）：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:47901/api/v1/cloud/status | ForEach-Object { $_.data.url }
+# 与二维码解码结果应当逐字符一致
+```
 
 要改配置就在同一个 profile 的 `cordis.patch.yml` 里按 id 覆盖（**不要**再复制一份 `- insert:` 行）：
 
