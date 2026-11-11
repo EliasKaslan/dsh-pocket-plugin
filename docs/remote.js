@@ -732,12 +732,19 @@ class Relay {
       await this.connect();
       this.readyAt = Date.now();
       this.restartCount = 0;
+      // 上面直接把 pcStale 置了 false，true→false 的边沿被吞掉，onpcStale 不再
+      // 触发，横幅「电脑端已离线 N 秒…」会永久挂着。显式通知一次已恢复。
+      try { this.onpcStale(false, null); } catch { /* 界面回调不该影响重建 */ }
       this.announce(true);
       this.startStaleWatch();
       return true;
     } catch (error) {
       console.warn('[pocket] 重建失败', error?.message);
       try { this.onstate('offline'); } catch { /* ignore */ }
+      // 失败后必须排下一次重试：看门狗在 ready=false 时会跳过（避免重建风暴），
+      // 如果这里不排，自愈链就断在原地 —— 界面停在「中继断开，正在重连…」其实没在连。
+      const retryDelay = Math.min(15_000, 1_000 * (2 ** Math.min(this.restartCount, 4)));
+      setTimeout(() => { void this.restart('重建失败重试'); }, retryDelay);
       if (this.restartCount >= HARD_RESET_AFTER) {
         const key = 'dsh.pocket.hardreset';
         let last = 0;
@@ -756,7 +763,11 @@ class Relay {
   startStaleWatch() {
     if (this.staleTimer !== undefined) return;
     this.staleTimer = setInterval(() => {
-      if (!this.ready) return;
+      if (!this.ready) {
+        // 未就绪也要管：重建失败后靠这里兜底（冷却期内不打扰）。
+        if (Date.now() - this.lastRestartAt > RESTART_COOLDOWN_MS) void this.restart('未就绪兜底');
+        return;
+      }
       // 以前 pcSeenAt===0 就直接 return —— 而"连上了却一帧都没收到"恰恰是
       // 最需要重建的状态。改用以 readyAt 为下界。
       const idle = Date.now() - Math.max(this.pcSeenAt, this.stats.lastRxAt, this.readyAt);

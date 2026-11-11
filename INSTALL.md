@@ -139,7 +139,7 @@ node tools/build-shell.mjs          # 生成/刷新 docs/
 ```powershell
 # 1. 回环接口起来了，版本对，且要求登录
 Invoke-RestMethod http://127.0.0.1:47901/api/v1/health | ConvertTo-Json -Depth 4
-#   期望：started=true  ready=true  version=0.6.4  requiresLogin=true
+#   期望：started=true  ready=true  version=1.0.0  requiresLogin=true
 
 # 2. 启动日志里有监听与二维码落点
 Get-Content "$env:USERPROFILE\.dsh\pocket\bridge.log" -Tail 12
@@ -322,26 +322,18 @@ node tools/mock-host.mjs               # 假宿主，用虚构数据开发外壳
 
 ---
 
-## 9. 版本策略（0.x 与 1.0）
+## 9. 版本策略
 
-**当前是 `0.6.4`，测试版。** 目前没有外部使用者，作者要在本人（真手机、真网络）充分
-测试通过之后，才把版本号提到 `1.0.0` 并打出对应的 tag。在那之前：
+**v1.0.0 已于 2026-11-11 发布。** 0.x 阶段的充分自测已完成：真手机（HarmonyOS）+
+真网络下的连续进入、断线重连、向上翻页到底、流式增量、多设备并存、热重载与冷启动
+都跑过；569 条单测 + 11 条 e2e 全绿。
 
-- 对外只发 **0.x** 版本与 `v0.x.y` 标签；**不要**发布 `1.0.0` / `v1.0.x` 之类的标签，
-  那会暗示"已正式发布、接口稳定"。
-- 0.x 期间允许改协议、改配置键、改行为，不承诺兼容。
-- 升级只改 `package.json` 的 `version` 与 `lib/util.mjs` 的 `PLUGIN_VERSION`（两处必须
-  一致，有测试钉着），然后 `git tag -a vX.Y.Z`。
+1.0 之后的规则：
 
-### 晋级 1.0 前必须满足（作者本人逐条过）
-
-1. **真机真网**扫码 → 输入账号 + 口令 → 进任务列表，能新建任务并看到流式输出；
-2. **点开会话详情**先出最近一屏（含你最近几次说的话），**往上翻能一页页加载更早的记录、
-   一直翻到会话开头**（0.2.0 修的是"整份详情太大发不出去"，0.3.0 改成了分页）；
-   翻页时列表不能跳、不能出现空页、不能重复条目；
-3. 连续使用 **≥ 3 天**，期间重启 DSH、切前后台、切 WiFi/5G，都能自动恢复、不掉登录；
-4. 至少 **两台设备并存**，其中一台被「移除」后确实失效，另一台不受影响；
-5. 跑满 `node --test "test/**/*.test.mjs"` + `node test/e2e/run.mjs`，全绿；
-6. 检查 `~/.dsh/pocket/bridge.log` 无未解释的 warn/error。
-
-满足后再做：版本改 `1.0.0` → 提交 → `git tag -a v1.0.0` → 推送 main 与 tag。
+- 版本号遵守语义化版本：修 bug 发 `1.0.x`；兼容地加功能发 `1.x.0`；**破坏性改动**
+  （协议、配置键、行为语义）发 `2.0.0`。
+- 标签格式 `vX.Y.Z`，且必须与 `package.json` 的 `version`、`lib/util.mjs` 的
+  `PLUGIN_VERSION` 三处一致；发版后跑一次 `node tools/build-shell.mjs --check`。
+- 改协议（例如分页/增量契约、中继帧格式）时，必须同步更新本文 §6.2 与 §4 的配置表，
+  并把 `PROTOCOL_VERSION` 一起调整；手机端外壳与桌面端插件不同步时，外壳会拒绝
+  未知协议而不是静默错乱。

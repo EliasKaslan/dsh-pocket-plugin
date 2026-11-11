@@ -126,6 +126,9 @@ function onFrame(frame) {
       if (payload.server) store.bridge = { ...(store.bridge ?? {}), ...payload.server };
       setConn('online');
       void loadTasks({ silent: true });
+      // 断线期间丢掉的帧补不回来（这段时间可能正好结束一轮）：
+      // 顺手把当前打开的会话追一次尾部，避免"停在旧内容直到用户手动刷新"。
+      if (store.detailId !== null) scheduleDetailAppend(0);
       break;
     }
     case 'bridge.status': {
@@ -371,12 +374,24 @@ async function appendDetailTail() {
   const id = store.detailId;
   const detail = store.detail;
   if (id === null || detail === null || detail === undefined) return;
-  if (store.detailAppending === true) return;
+  if (store.detailAppending === true) {
+    // 并发闸命中不能直接丢弃：掉线前最后一条消息最典型 —— 之后既没有新帧、
+    // 也没有定时器，这条增量就永远补不回来了。记待办，收尾时立刻补一次。
+    store.detailAppendPending = true;
+    return;
+  }
 
-  const messages = Array.isArray(detail.messages) ? detail.messages : [];
-  const tail = messages.length > 0 ? messages[messages.length - 1] : null;
-  const cursor = typeof tail?.id === 'string' ? tail.id : '';
-  // 连一条都没有（页面刚进、首屏还没到）：走正常加载，别发无游标的增量请求。
+  /** 游标必须是服务端真实存在的消息 id；本地"发送中"的假 id 会让服务端 reset。 */
+  const pickCursor = () => {
+    const list = Array.isArray(detail.messages) ? detail.messages : [];
+    for (let index = list.length - 1; index >= 0; index -= 1) {
+      const candidate = list[index]?.id;
+      if (typeof candidate === 'string' && candidate.length > 0 && !candidate.startsWith('pending')) return candidate;
+    }
+    return '';
+  };
+
+  const cursor = pickCursor();
   if (cursor.length === 0) {
     if (store.detailLoading === true || store.detailLoadingOlder === true) return;
     void loadDetail(id, { silent: true });
@@ -386,27 +401,43 @@ async function appendDetailTail() {
   store.detailAppending = true;
   try {
     const data = await api(`/api/v1/tasks/${encodeURIComponent(id)}?after=${encodeURIComponent(cursor)}`, { timeout: 20_000 });
-    // 期间用户切走了会话 / 详情被替换：这一批已经过时，直接丢弃。
     if (store.detailId !== id || store.detail !== detail) return;
     if (data?.reset === true) {
+      // 游标失效：清掉本地假 id 再整页重载，避免"发送中"气泡永久卡住。
+      detail.messages = (Array.isArray(detail.messages) ? detail.messages : [])
+        .filter((message) => !String(message?.id ?? '').startsWith('pending'));
       void loadDetail(id, { silent: true });
       return;
     }
     const fresh = Array.isArray(data?.messages) ? data.messages : [];
-    const known = new Set(messages.map((message) => message.id));
+    // 关键：用**此刻**的 messages。await 期间用户可能刚翻出更早一页，
+    // 用 await 之前的快照重建会把那一整页覆盖掉。
+    const current = Array.isArray(detail.messages) ? detail.messages : [];
+    const known = new Set(current.map((message) => message.id));
     const added = fresh.filter((message) => !known.has(message.id));
-    if (added.length === 0) return;
-    detail.messages = [...messages, ...added];
+    if (added.length === 0) {
+      store.detailAppendFailures = 0;
+      return;
+    }
+    detail.messages = [...current, ...added];
     if (typeof data?.total === 'number') detail.total = data.total;
+    store.detailAppendFailures = 0;
     if (store.screen === 'detail') {
       view?.paintChat?.();
-      // 用户停在底部就跟进最新；他正在往上翻历史时不要抢位置。
+      // 用户停在底部就跟进最新；正在往上翻历史时不要抢位置。
       if (store.chatAuto === true) view?.scrollToBottom?.(false);
     }
-    // 这一批被预算截断了，说明还有更新的，继续追。
     if (data?.hasMoreAfter === true) scheduleDetailAppend(60);
-  } catch { /* 增量失败静默：下一条消息或手动刷新会补上 */ } finally {
+  } catch {
+    // 静默失败但记账：连续失败说明追新链路有问题，露在连接状态上。
+    store.detailAppendFailures = (store.detailAppendFailures ?? 0) + 1;
+    if (store.detailAppendFailures >= 3) setConn('offline');
+  } finally {
     store.detailAppending = false;
+    if (store.detailAppendPending === true) {
+      store.detailAppendPending = false;
+      scheduleDetailAppend(0);
+    }
   }
 }
 
@@ -469,6 +500,17 @@ async function applyRoute() {
     viewName = next;
     view = mountFor(next, route);
     if (view.screen !== undefined && !view.screen.isConnected) app.append(view.screen);
+  }
+
+  // 离开会话必须清干净：否则再次进入同一个任务时 `detailId !== route.id` 为假，
+  // 会直接复用旧转录、不重拉，而且定时器还在给没人看的会话发请求。
+  if (next !== 'detail' && store.detailId !== null) {
+    store.detailId = null;
+    store.detail = null;
+    store.detailError = '';
+    store.detailAppendPending = false;
+    if (appendTimer !== null) { clearTimeout(appendTimer); appendTimer = null; }
+    if (detailTimer !== null) { clearTimeout(detailTimer); detailTimer = null; }
   }
 
   if (next === 'detail' && store.detailId !== route.id) {

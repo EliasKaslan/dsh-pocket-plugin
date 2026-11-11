@@ -255,7 +255,18 @@ export function mountDetail(root, ctx) {
       }
       if (added > 0) {
         // 先登记锚点，再触发渲染；真正的 scrollTop 修正在 paintChatNow 里做。
-        if (!auto) pendingScrollAnchor = { height: beforeHeight, top: beforeTop };
+        if (!auto) {
+      // 记下当前视口顶部的那条消息：翻页后按它的位移补偿，最稳。
+      const rect = chat.getBoundingClientRect();
+      const anchorEl = [...chat.querySelectorAll('.msg')]
+        .find((el) => el.getBoundingClientRect().bottom > rect.top) ?? null;
+      pendingScrollAnchor = {
+        height: beforeHeight,
+        top: beforeTop,
+        offset: anchorEl === null ? 0 : anchorEl.getBoundingClientRect().top - rect.top,
+        element: anchorEl,
+      };
+    }
         paintChat();
       }
       return added;
@@ -473,7 +484,15 @@ export function mountDetail(root, ctx) {
     if (pendingScrollAnchor !== null) {
       const applied = pendingScrollAnchor;
       pendingScrollAnchor = null;
-      chat.scrollTop = applied.top + (chat.scrollHeight - applied.height);
+      // 用"翻页前锚定的那条消息"的位置差来补偿，而不是 scrollHeight 差值：
+      // 期间尾部可能又插入了新消息（流式），高度差会把那部分也算进来，位置就偏了。
+      const anchorEl = applied.element;
+      if (anchorEl !== null && anchorEl.isConnected) {
+        const shift = anchorEl.getBoundingClientRect().top - chat.getBoundingClientRect().top;
+        chat.scrollTop = applied.top + shift - applied.offset;
+      } else {
+        chat.scrollTop = applied.top + (chat.scrollHeight - applied.height);
+      }
     }
     updateOlderHint();
     // 内容还不够一屏、但服务端说还有更早的：自动补齐，别让用户对着一屏空白。

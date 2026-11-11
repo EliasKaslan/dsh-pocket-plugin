@@ -302,12 +302,14 @@ test('手机端：detail 视图有"往上翻加载更早"的触发、锚点与�
   assert.match(source, /ctx\.loadOlder/u, '必须通过 ctx 调回 app');
   // 补位置必须在**渲染之后**：paintChat() 只是把渲染排到下一帧，渲染前设
   // scrollTop 会被随后插入的内容覆盖回顶部（这个坑实测踩过）。
-  assert.match(source, /pendingScrollAnchor = \{ height: beforeHeight, top: beforeTop \}/u,
-    '翻页前要登记锚点');
-  assert.match(source, /chat\.scrollTop = applied\.top \+ \(chat\.scrollHeight - applied\.height\)/u,
-    '按"插入前的高度/位置"补 scrollTop，否则画面会跳');
+  assert.match(source, /pendingScrollAnchor = \{/u, '翻页前要登记锚点');
+  // 锚点用"顶部那条消息元素的位置"补偿，而不是 scrollHeight 差值：
+  // 期间尾部可能又插入新消息（流式），高度差会把那部分也算进来，位置就偏了。
+  assert.match(source, /element: anchorEl/u, '锚点要记元素而非只记高度');
+  assert.match(source, /chat\.scrollTop = applied\.top \+ shift - applied\.offset/u,
+    '按锚点元素的位移补偿滚动位置');
   assert.match(source, /pendingScrollAnchor !== null/u, '锚点要在渲染时被消费');
-  const applyAt = source.indexOf('chat.scrollTop = applied.top');
+  const applyAt = source.indexOf('chat.scrollTop = applied.top + shift');
   const setAt = source.indexOf('chatList.set(entries, messageNode)');
   assert.ok(applyAt > 0 && setAt > 0 && applyAt > setAt,
     '补位置必须排在这轮渲染之后（applyAt > setAt）');
