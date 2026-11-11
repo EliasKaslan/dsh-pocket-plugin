@@ -139,7 +139,7 @@ node tools/build-shell.mjs          # 生成/刷新 docs/
 ```powershell
 # 1. 回环接口起来了，版本对，且要求登录
 Invoke-RestMethod http://127.0.0.1:47901/api/v1/health | ConvertTo-Json -Depth 4
-#   期望：started=true  ready=true  version=0.6.1  requiresLogin=true
+#   期望：started=true  ready=true  version=0.6.2  requiresLogin=true
 
 # 2. 启动日志里有监听与二维码落点
 Get-Content "$env:USERPROFILE\.dsh\pocket\bridge.log" -Tail 12
@@ -324,7 +324,7 @@ node tools/mock-host.mjs               # 假宿主，用虚构数据开发外壳
 
 ## 9. 版本策略（0.x 与 1.0）
 
-**当前是 `0.6.1`，测试版。** 目前没有外部使用者，作者要在本人（真手机、真网络）充分
+**当前是 `0.6.2`，测试版。** 目前没有外部使用者，作者要在本人（真手机、真网络）充分
 测试通过之后，才把版本号提到 `1.0.0` 并打出对应的 tag。在那之前：
 
 - 对外只发 **0.x** 版本与 `v0.x.y` 标签；**不要**发布 `1.0.0` / `v1.0.x` 之类的标签，

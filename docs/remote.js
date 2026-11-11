@@ -51,6 +51,20 @@ const RPC_ATTEMPTS = 4;
 const RPC_BACKOFF_MS = [1_200, 2_400, 4_800];
 /** Desktop beats every 8 s; keep 3x headroom for mobile network jitter. */
 const PC_STALE_MS = 26_000;
+/**
+ * 下行静默多久就允许重建一次中继连接（冷却，避免抖动时狂重建）。
+ */
+const RESTART_COOLDOWN_MS = 15_000;
+/**
+ * 连续重建这么多次仍然连不上，就交给外壳做最后一次兜底：刷新页面。
+ *
+ * 为什么需要它：浏览器里的 mqtt.js 有一种典型死法 —— WebSocket 半死（既不触发
+ * close 也不触发 error），内部每 3 秒的自动重连**永远不会触发**，所有请求都石沉
+ * 大海，界面只会显示「连不上电脑」。重建客户端能救大部分情况；救不回来时，只有
+ * 重新加载页面能保证把 MQTT、WebSocket、定时器全部重来。
+ */
+const HARD_RESET_AFTER = 3;
+const HARD_RESET_MIN_GAP_MS = 120_000;
 /** A request stalled longer than this may be re-sent on the next beat. */
 const BEAT_RESEND_AFTER_MS = 4_000;
 /** Fragment reassembly limits, mirroring the desktop side. */
@@ -577,6 +591,12 @@ class Relay {
     /** `ts` is sent in the desktop's clock domain to survive phone clock skew. */
     this.clockOffset = 0;
     this.lastHelloAt = 0;
+    /** 重建互斥 + 计数：连续失败到阈值就触发硬兜底。 */
+    this.restarting = false;
+    this.restartCount = 0;
+    this.lastRestartAt = 0;
+    this.readyAt = 0;
+    this.onhardreset = () => {};
     this.onpc = () => {};
     this.onstate = () => {};
     this.onpcStale = () => {};
@@ -684,17 +704,73 @@ class Relay {
    * MQTT 'close' event never fires, so "desktop is dead" is only observable as
    * silence on the downlink.
    */
+  /**
+   * 推倒重建底层 MQTT 连接。
+   *
+   * 触发点：下行静默超时、手机从后台回到前台、用户点「重连」、连续失败兜底。
+   * 返回是否重建成功；互斥，避免同时开两条。
+   */
+  async restart(reason = '') {
+    if (this.restarting === true) return false;
+    this.restarting = true;
+    this.restartCount += 1;
+    this.lastRestartAt = Date.now();
+    console.warn('[pocket] 重建中继连接：' + reason + '（第 ' + this.restartCount + ' 次）');
+
+    const previous = this.client;
+    this.client = undefined;
+    this.ready = false;
+    this.readyAt = 0;
+    this.pcHello = null;
+    this.pcStale = false;
+    this.parts.clear();
+    this.failAll('中继连接重建中');
+    try { this.onstate('connecting'); } catch { /* 界面回调不该影响重建 */ }
+    try { previous?.end?.(true); } catch { /* 已经断了 */ }
+
+    try {
+      await this.connect();
+      this.readyAt = Date.now();
+      this.restartCount = 0;
+      this.announce(true);
+      this.startStaleWatch();
+      return true;
+    } catch (error) {
+      console.warn('[pocket] 重建失败', error?.message);
+      try { this.onstate('offline'); } catch { /* ignore */ }
+      if (this.restartCount >= HARD_RESET_AFTER) {
+        const key = 'dsh.pocket.hardreset';
+        let last = 0;
+        try { last = Number(globalThis.sessionStorage?.getItem(key) ?? 0) || 0; } catch { last = 0; }
+        if (Date.now() - last > HARD_RESET_MIN_GAP_MS) {
+          try { globalThis.sessionStorage?.setItem(key, String(Date.now())); } catch { /* 隐私模式 */ }
+          try { this.onhardreset(); } catch { /* ignore */ }
+        }
+      }
+      return false;
+    } finally {
+      this.restarting = false;
+    }
+  }
+
   startStaleWatch() {
     if (this.staleTimer !== undefined) return;
     this.staleTimer = setInterval(() => {
-      if (this.pcSeenAt === 0) return;
-      const idle = Date.now() - this.pcSeenAt;
+      if (!this.ready) return;
+      // 以前 pcSeenAt===0 就直接 return —— 而"连上了却一帧都没收到"恰恰是
+      // 最需要重建的状态。改用以 readyAt 为下界。
+      const idle = Date.now() - Math.max(this.pcSeenAt, this.stats.lastRxAt, this.readyAt);
       const stale = idle > PC_STALE_MS;
       if (stale !== this.pcStale) {
         this.pcStale = stale;
         this.onpcStale(stale, stale
           ? `电脑端已离线 ${Math.round(idle / 1000)} 秒 · 正在重连…（列表可能不是最新）`
           : null);
+      // 只显示横幅是不够的：这条链路的坏法就是"看起来连着、其实发不出去"。
+      // 静默够久就必须把底层客户端整个重建，否则永远等不到自动重连。
+      if (stale && Date.now() - this.lastRestartAt > RESTART_COOLDOWN_MS) {
+        void this.restart('下行静默');
+      }
       }
     }, 2_000);
   }
@@ -1365,6 +1441,16 @@ async function main() {
     return;
   }
   relay.startStaleWatch();
+  // 用户可见的「重连」、以及手机从后台回到前台，都要能把底层连接推倒重建。
+  // 只重开 WS 隧道救不了"MQTT 已死但自以为活着"的状态。
+  globalThis.__POCKET_RELAY_RESTART__ = (reason) => relay.restart(reason || '手动重连');
+  relay.onhardreset = () => { location.reload(); };
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    const last = Math.max(relay.pcSeenAt, relay.stats?.lastRxAt ?? 0);
+    const idle = last === 0 ? Number.POSITIVE_INFINITY : Date.now() - last;
+    if (!relay.ready || idle > 20_000) void relay.restart('回到前台');
+  });
 
   await new Promise((resolve) => {
     const started = Date.now();

@@ -180,6 +180,11 @@ export class Realtime {
     if (this.stopped) return;
     if (this.state === 'online') return;
     if (this.state === 'connecting' && !force) return;
+        // force：连同底层中继一起重建。只重开 WS 隧道救不了"MQTT 已死"的状态，
+        // 那正是"点重连没反应"的原因。
+        if (force) {
+          try { globalThis.__POCKET_RELAY_RESTART__?.('用户点重连'); } catch { /* 没有外壳 */ }
+        }
     if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.failures = 0;
