@@ -467,3 +467,93 @@ test('buildTranscript：Unicode 文本与 emoji 原样进入气泡', () => {
   assert.equal(messages[0].text, '帮我改一下这个函数 🚀');
   assert.equal(messages[1].text, '好的，改好了 ✅');
 });
+
+/* --------------------------------------------------- 体积闸（按字节有界） */
+
+// 为什么要有这一组：中继一次响应的发帧预算是 64 片 × 64 KiB。一条会话详情
+// 若因为某个巨大的工具输出涨到几十 MB，桌面端**根本发不出去**，手机端只能等到
+// RPC 超时并显示「连接中断」。所以详情必须在服务端就按体量裁掉。
+
+test('buildTranscript：单条超长正文被裁，保留开头并写明截断了多少', () => {
+  const huge = 'x'.repeat(50_000);
+  const stats = { dropped: 0, clipped: 0 };
+  const messages = buildTranscript([
+    { type: 'user/message', seq: 1, data: { content: huge } },
+  ], { stats });
+
+  assert.equal(messages.length, 1);
+  const text = messages[0].text;
+  assert.ok(text.length < huge.length, '必须真的变短');
+  assert.ok(text.startsWith('x'.repeat(100)), '开头（用户能认出是那条）必须保留');
+  assert.match(text, /已截断 [\d,]+ 个字符/u, '必须在正文里写明截断了多少');
+  assert.ok(text.includes('在电脑上查看'), '必须告诉用户完整内容去哪看');
+  assert.equal(stats.clipped, 1);
+  assert.equal(stats.dropped, 0, '单条裁剪不算"丢消息"');
+});
+
+test('buildTranscript：工具结果在归一化阶段就被压到 1200 字符（现状，单条闸只是兜底）', () => {
+  const giantOutput = 'y'.repeat(200_000);
+  const stats = { dropped: 0, clipped: 0 };
+  const messages = buildTranscript([
+    { type: 'tool/call', seq: 1, data: { callId: 'c1', name: 'shell', arguments: '{"command":"cat big.log"}' } },
+    { type: 'tool/result', seq: 2, data: { message: { toolCallId: 'c1', content: giantOutput } } },
+  ], { stats });
+
+  const tool = messages.find((message) => message.role === 'tool');
+  // normalizeEvent 里工具结果走 truncate(…, 1200)，所以到不了单条闸的 6000 阈值。
+  assert.ok(tool.tool.result.length <= 1200, `工具结果必须被压到 1200 以内，实际 ${tool.tool.result.length}`);
+  assert.ok(tool.tool.result.endsWith('…'), '截断后应有省略号');
+  assert.equal(stats.clipped, 0, '这条没走到单条闸，不计入 clipped');
+});
+
+test('buildTranscript：user / assistant 正文也会被单条闸兜住（这才是真正没上限的字段）', () => {
+  const big = 'a'.repeat(300_000);
+  for (const event of [
+    { type: 'user/message', seq: 1, data: { content: big } },
+    { type: 'assistant/message', seq: 2, data: { message: { content: big } } },
+  ]) {
+    const stats = { dropped: 0, clipped: 0 };
+    const messages = buildTranscript([event], { stats });
+    assert.ok(messages[0].text.length < 10_000, `单条正文必须被压下来，实际 ${messages[0].text.length}`);
+    assert.match(messages[0].text, /已截断/u);
+    assert.equal(stats.clipped, 1);
+  }
+});
+
+test('buildTranscript：总量超预算时丢最旧的、保留最新的，并计入 dropped', () => {
+  // 每条 400 字符 × 10 条 = 4000，预算给 1000 → 只能留下最后两三条。
+  const events = Array.from({ length: 10 }, (_, index) => ({
+    type: 'assistant/message',
+    seq: index + 1,
+    data: { message: { content: `${index}:`.padEnd(400, 'z') } },
+  }));
+  const stats = { dropped: 0, clipped: 0 };
+  const messages = buildTranscript(events, { budget: 1000, stats });
+
+  assert.ok(messages.length > 0, '不能把内容裁光');
+  assert.ok(messages.length < events.length, '必须真的丢了东西');
+  assert.equal(stats.dropped, events.length - messages.length, 'dropped 必须如实等于丢掉的条数');
+  // 留下的必须是最新的那几条：最后一条一定在，且内容是最末尾的那条。
+  assert.ok(messages[messages.length - 1].text.startsWith('9:'), '必须保留最新一条');
+  const total = messages.reduce((sum, message) => sum + message.text.length, 0);
+  assert.ok(total <= 1000, `裁剪后总量必须落在预算内，实际 ${total}`);
+});
+
+test('buildTranscript：预算内的普通会话一个字符都不动，也不报截断', () => {
+  const stats = { dropped: 0, clipped: 0 };
+  const events = [
+    { type: 'user/message', seq: 1, data: { content: '你好' } },
+    { type: 'assistant/message', seq: 2, data: { message: { content: '你好，有什么可以帮你？' } } },
+  ];
+  const messages = buildTranscript(events, { stats });
+  assert.deepEqual(messages.map((message) => message.text), ['你好', '你好，有什么可以帮你？']);
+  assert.deepEqual(stats, { dropped: 0, clipped: 0 });
+});
+
+test('buildTranscript：不传 stats 也不抛（老调用方兼容）', () => {
+  const messages = buildTranscript([
+    { type: 'user/message', seq: 1, data: { content: 'x'.repeat(50_000) } },
+  ]);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].text, /已截断/u);
+});
