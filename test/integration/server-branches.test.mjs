@@ -165,7 +165,7 @@ test('WS：ticket 握手 → hello → ping/pong → resync → 畸形帧被忽�
   await until(() => ctx.server.wsCount() === 0, { label: 'WS 清理' });
 });
 
-test('WS：升级请求的四种拒绝（无 ticket 401 / 路径不对 404 / Host 不对 403 / 每设备超限 503）', async () => {
+test('WS：升级请求的三种拒绝（无 ticket 401 / 路径不对 404 / Host 不对 403）+ 同设备新连接顶掉旧连接', async () => {
   const none = await wsHandshake(ctx.port, '/ws', { expectFirstFrame: false });
   assert.equal(none.status, 401);
   assert.equal(none.body, '');
@@ -183,16 +183,19 @@ test('WS：升级请求的四种拒绝（无 ticket 401 / 路径不对 404 / Hos
   badHost.socket.terminate();
   assert.ok(ctx.logs.some((line) => line.includes('rejected upgrade with untrusted Host header')), '必须留 warn');
 
+  // 同一台手机只保留最新的一条隧道。
+  //
+  // 这曾经是个真 bug：每次进入页面都会新开一条，旧的那条在手机上被销毁却永远
+  // 不发 close，中继槽位只增不减（实测连进 5 次 slots 从 3 涨到 4）。涨到
+  // MAX_SOCKETS(12) 就再也开不了新隧道，手机上永远卡在「正在连接…」。
   const sockets = [];
   try {
-    for (let i = 0; i < 6; i += 1) {
+    for (let i = 0; i < 3; i += 1) {
       const one = await wsHandshake(ctx.port, `/ws?ticket=${encodeURIComponent(await wsTicket())}`);
       sockets.push(one.socket);
+      assert.equal(ctx.server.wsCount(), 1, '同一设备任何时刻只允许一条隧道');
     }
-    assert.equal(ctx.server.wsCount(), 6);
-    const over = await wsHandshake(ctx.port, `/ws?ticket=${encodeURIComponent(await wsTicket())}`, { expectFirstFrame: false });
-    assert.equal(over.status, 503);
-    over.socket.terminate();
+    await until(() => ctx.server.wsCount() === 1);
   } finally {
     for (const socket of sockets) socket.close();
   }
