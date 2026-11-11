@@ -5,7 +5,9 @@
  *  - 生成：room/key/token/deviceId 一次写全，令牌必须是本机真实可鉴权的设备；
  *  - 持久化：同一台机器重启后二维码不变（否则每次重启都要重扫）；
  *  - 损坏：缺字段 / 密钥格式非法 / 文件不是 JSON → **重新生成**，绝不静默沿用；
- *  - 令牌被吊销 → 重新生成（不能复活一个已吊销的凭证）。
+ *  - 令牌被吊销 → **只补发令牌，保留 room/key**：房间与密钥才是"要不要重扫码"的
+ *    决定因素，换掉它们会让所有已连上的手机被孤立。想让旧码彻底作废是「重置链接」
+ *    的职责（连身份文件一起删）。
  */
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -161,18 +163,57 @@ test('身份文件不是 JSON / 是空对象 → 重新生成而不是崩', () =
   }
 });
 
-test('令牌被吊销 → 重新生成（已吊销的凭证不允许复活）', () => {
+test('令牌被吊销 → 只补发令牌，room/key 保持不变（已扫码的手机不需要重扫）', () => {
   const context = makeCore();
   const service = makeService(context, { appBase: APP_BASE });
   const first = service.ensureIdentity();
-  assert.equal(context.core.revokeDevice(first.deviceId), true);
+  // 模拟"令牌被别处吊销"：直接走状态层 —— `core.revokeDevice` 现在会拒绝中继设备。
+  context.core.state.revokeDevice(first.deviceId);
 
   const second = service.ensureIdentity();
+  // 这是本用例的核心：房间与密钥是"要不要重扫码"的唯一决定因素，必须原样保留。
+  assert.equal(second.room, first.room, 'room 必须保持不变，否则所有已扫码的手机都要重扫');
+  assert.equal(second.key, first.key, 'key 必须保持不变');
+  // 令牌仍然必须换掉：已吊销的凭证不允许复活。
   assert.notEqual(second.token, first.token, '吊销后必须换令牌');
-  assert.notEqual(second.room, first.room);
+  assert.notEqual(second.deviceId, first.deviceId, '新令牌对应新设备记录');
   assert.equal(context.core.authenticateToken(first.token), undefined, '旧令牌必须彻底失效');
-  assert.notEqual(context.core.authenticateToken(second.token), undefined);
-  assert.ok(context.logger.lines.some((line) => line.includes('令牌已失效')));
+  assert.notEqual(context.core.authenticateToken(second.token), undefined, '新令牌必须可用');
+  assert.ok(context.logger.lines.some((line) => line.includes('补发新令牌')), '必须说清是补发而不是换房间');
+
+  // 补发后的身份要落盘，重启不会又变一次。
+  const saved = JSON.parse(readFileSync(identityFile(context.dataDir), 'utf8'));
+  assert.equal(saved.room, first.room);
+  assert.equal(saved.token, second.token);
+});
+
+test('中继设备不允许从设备列表移除（它不是手机，移除只会弄坏自己的二维码）', () => {
+  const context = makeCore();
+  const service = makeService(context, { appBase: APP_BASE });
+  const identity = service.ensureIdentity();
+
+  assert.equal(context.core.revokeDevice(identity.deviceId), false, '必须拒绝');
+  assert.notEqual(context.core.authenticateToken(identity.token), undefined, '拒绝之后令牌必须仍然有效');
+  assert.ok(context.logger.lines.some((line) => line.includes('拒绝移除本机中继设备')));
+
+  // 手机设备照旧可以移除。
+  const phone = context.core.provisionDevice({ name: '手机', platform: 'web', installId: 'install-x' });
+  assert.equal(context.core.revokeDevice(phone.device.id), true, '手机必须仍然可以移除');
+});
+
+test('重置链接：身份文件被删除、旧令牌作废、下次生成全新房间', () => {
+  const context = makeCore();
+  const service = makeService(context, { appBase: APP_BASE });
+  const first = service.ensureIdentity();
+  assert.equal(existsSync(identityFile(context.dataDir)), true);
+
+  service.discardIdentity();
+  assert.equal(existsSync(identityFile(context.dataDir)), false, '必须删掉身份文件，否则"重置"会变成空操作');
+  assert.equal(context.core.authenticateToken(first.token), undefined, '旧令牌必须作废');
+
+  const next = service.ensureIdentity();
+  assert.notEqual(next.room, first.room, '重置之后必须是全新房间（旧二维码彻底失效）');
+  assert.notEqual(next.key, first.key);
 });
 
 test('身份写入失败只报错、不抛（磁盘/权限问题不能拖垮插件）', () => {

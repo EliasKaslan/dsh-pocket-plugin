@@ -45,18 +45,27 @@
       name.textContent = device.name || '未命名设备';
       const meta = document.createElement('div');
       meta.className = 'device-meta';
+      const isRelay = device.platform === 'relay';
       const parts = [];
-      if (device.platform) parts.push(device.platform);
-      if (device.appVersion) parts.push(`v${device.appVersion}`);
+      parts.push(isRelay ? '中继通道' : (device.platform || 'unknown'));
+      if (device.appVersion && !isRelay) parts.push(`v${device.appVersion}`);
       parts.push(device.lastIp || '未知地址');
       meta.textContent = parts.join(' · ');
       main.append(name, meta);
-      const revoke = document.createElement('button');
-      revoke.type = 'button';
-      revoke.className = 'ghost danger';
-      revoke.textContent = '移除';
-      revoke.addEventListener('click', () => revokeDevice(device.id, revoke));
-      row.append(icon, main, revoke);
+      if (isRelay) {
+        // 中继不是手机：给它「移除」只会让你自己的二维码失效、手机被踢下线。
+        const tag = document.createElement('span');
+        tag.className = 'device-tag';
+        tag.textContent = '本机 · 不可移除';
+        row.append(icon, main, tag);
+      } else {
+        const revoke = document.createElement('button');
+        revoke.type = 'button';
+        revoke.className = 'ghost danger';
+        revoke.textContent = '移除';
+        revoke.addEventListener('click', () => revokeDevice(device.id, revoke));
+        row.append(icon, main, revoke);
+      }
       deviceList.append(row);
     }
   }

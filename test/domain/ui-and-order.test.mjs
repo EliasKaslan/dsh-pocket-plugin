@@ -183,3 +183,20 @@ test('store.visibleTasks：前端再按 updatedAt 倒序排一次（unshift / �
   assert.match(body, /out\.sort\(/u, 'visibleTasks 必须排序');
   assert.match(body, /right\.updatedAt \?\? 0\) - \(left\.updatedAt \?\? 0/u, '排序键必须是 updatedAt 倒序');
 });
+
+/* -------------------------------- 中继设备不可移除（两个渲染入口都要守） ---- */
+
+test('配对页：中继设备不给「移除」按钮（它是本机凭据，不是手机）', () => {
+  // 服务端渲染
+  const page = read('lib/pair-page.mjs');
+  assert.match(page, /isRelay/u, '服务端渲染要识别中继设备');
+  assert.match(page, /本机 · 不可移除/u, '要给出不可移除的说明');
+  const relayAt = page.indexOf('const isRelay');
+  const buttonAt = page.indexOf('data-revoke=');
+  assert.ok(relayAt > 0 && buttonAt > relayAt, '「移除」按钮必须出现在 isRelay 判断之后（即中继设备走不到它）');
+
+  // 前端刷新
+  const js = read('web/pair.js');
+  assert.match(js, /const isRelay = device\.platform === 'relay'/u, '前端刷新也要识别');
+  assert.match(js, /本机 · 不可移除/u);
+});
