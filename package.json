@@ -30,6 +30,7 @@
     "bin",
     "cordis.patch.yml",
     "README.md",
+    "INSTALL.md",
     "SECURITY.md",
     "THIRD-PARTY-NOTICES.md",
     "LICENSE"

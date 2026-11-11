@@ -1,0 +1,244 @@
+# 安装与运维指南（给 agent / 排障用）
+
+> 这份文件不是给人读的产品介绍。人读 [`README.md`](README.md)。
+> 这里的每一条命令都在 Windows + Node 24 上实跑过；涉及路径的地方按你的实际位置替换。
+
+---
+
+## 1. 前置条件
+
+| 项 | 要求 | 怎么验 |
+|---|---|---|
+| DSH | 能正常启动，且你有一个可写的 profile | `$env:DSH_HOME`（默认 `%USERPROFILE%\.dsh`） |
+| Node.js | ≥ 22.15（`package.json` 的 `engines`） | `node -v` |
+| 网络 | 装依赖要能访问 npm；插件运行时要能连 broker（出站 `wss://`） | — |
+
+插件是 **bundle** 形态：它的 `package.json` 里 `dsh.bundle.patch` 指向仓内的 `cordis.patch.yml`，
+DSH 把它当作一层补丁叠进 profile。所以安装要做两件事：**登记为 bundle** + **让包名可解析**。
+只加依赖不够 —— `dsh.profile.bundles` 里没有这一行时，插件不会被加载。
+
+---
+
+## 2. 推荐：让 DSH 自己装（一步到位）
+
+用 DSH 的插件管理器，以本地 `link:` 规格安装（Windows 路径用正斜杠）：
+
+```
+plugin_manager(action: "install_bundle", target: "link:D:/path/to/dsh-pocket")
+```
+
+成功判据：返回里 `application: "applied"`，且 `packageResult.exitCode: 0`。
+
+它会把三件事一次做完，并且写进正确的文件：
+
+1. `$DSH_HOME/profiles/<profile>/package.json` 的 `dependencies` 里加 `"dsh-pocket-plugin": "link:<你的路径>"`
+2. 把 `dsh-pocket-plugin` 追加进同一文件的 `dsh.profile.bundles`
+3. 跑一次 pnpm，让 `node_modules/dsh-pocket-plugin` 正确指向你的目录
+
+**不要手工 `mklink` 建 junction**（除非走第 3 节的手写路径）：pnpm 不认识手建的链接，
+下一次依赖变动就可能把它冲掉。
+
+---
+
+## 3. 等价手写安装（实现原理 / 排障用）
+
+只有插件管理器不可用时才走这条。
+
+改 `$DSH_HOME/profiles/<profile>/package.json`：
+
+```jsonc
+{
+  "dependencies": {
+    "dsh-pocket-plugin": "link:D:/path/to/dsh-pocket"   // 你 clone 下来的目录
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-pocket-plugin"                             // 关键：缺这行插件不会被加载
+      ]
+    }
+  }
+}
+```
+
+然后让包名可解析（两种，优先第一种）：
+
+```powershell
+# 优先：正常装依赖
+pnpm install --dir "$env:USERPROFILE\.dsh\profiles\<profile>"
+
+# 最后手段（pnpm 装不了时）：手工建 junction
+cmd /c mklink /J "%USERPROFILE%\.dsh\profiles\<profile>\node_modules\dsh-pocket-plugin" "D:\path\to\dsh-pocket"
+```
+
+---
+
+## 4. 配置
+
+配置写在**同一个 profile** 的 `cordis.patch.yml` 里，按 id 覆盖 bundle 已经插入的那一行
+（**不要**再复制一份 `- insert:`，否则会出现两行同名插件）：
+
+```yaml
+- id: pocket
+  config:
+    port: 47901
+    serverName: ''
+    qrFile: ''
+    cloud:
+      enabled: true
+      appBase: 'https://<你的账号>.github.io/dsh-pocket-plugin/'
+```
+
+### 4.1 插件配置键
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `port` | `47901` | 回环 HTTP 端口。被占用时自动顺延（47901 → 47902 → …）。**监听地址不可配，恒为 `127.0.0.1`** |
+| `serverName` | `''` | 手机端显示的电脑名；留空显示「我的电脑」（不泄露主机名） |
+| `qrFile` | `''` | 二维码 PNG 落点。空 = `~/dsh-pocket-qr.png`；填绝对路径改位置；填 `false` 不写文件（仍可在 `/pair` 页面扫码） |
+| `authRequired` | `true` | 是否要求口令。设为 `false` 只有在同时开 `cloud.allowAnonymous` 时才有意义，**别关** |
+| `allowedRoots` | `[]` | 允许手机创建任务的工作目录白名单；为空时 fail-closed（403 `cwd_forbidden`） |
+| `allowedHosts` | `[]` | 额外允许的 Host 头（一般不用） |
+
+### 4.2 中继配置键（`cloud.*`）
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | 随 bundle 为 `false` | 中继总开关。**默认关闭，要显式开** |
+| `appBase` | `''` | 手机端静态外壳地址（`docs/` 部署到哪）。**空 = 起不来**，这是有意的：外壳是一段会在你手机上跑的代码 |
+| `broker` | `wss://broker-cn.emqx.io:8084/mqtt` | 公共 MQTT broker，只承载密文。可换自建；支持数组（≤ 4 个，按序回退） |
+| `allowAnonymous` | `false` | 免口令模式。仅在你自建私有 broker 时考虑 |
+
+### 4.3 设口令（手机登录用）
+
+- **推荐**：打开连接页 `http://127.0.0.1:<port>/pair`，在「账号 + 口令」卡片里设置/修改
+- 或者命令行（**交互式**，需要真终端）：`node tools/set-auth.mjs --user <用户名>`
+- 查看现状：`node tools/set-auth.mjs --status`（显示用户名、scrypt 参数、有效会话数、最早到期时间）
+- 清除：`node tools/set-auth.mjs --remove`
+
+改口令会同时清空所有登录会话 —— 所有手机必须重新登录，这是预期行为。
+
+### 4.4 自己托管手机端外壳
+
+手机打开的页面是 `docs/`（由 `web/` + `remote/` 构建出来的静态站），必须由你自己托管：
+
+```powershell
+node tools/build-shell.mjs          # 生成/刷新 docs/
+# 把 docs/ 发布到任意静态托管（GitHub Pages / OSS / 自己的站），
+# 然后把地址填进 cloud.appBase（结尾带 /）
+```
+
+改过 `web/` 或 `remote/` 之后必须重跑构建，否则 CI 的 `--check` 会红。
+
+---
+
+## 5. 装完验收（四条，缺一条都算没装上）
+
+```powershell
+# 1. 回环接口起来了，版本对，且要求登录
+Invoke-RestMethod http://127.0.0.1:47901/api/v1/health | ConvertTo-Json -Depth 4
+#   期望：started=true  ready=true  version=1.0.0  requiresLogin=true
+
+# 2. 启动日志里有监听与二维码落点
+Get-Content "$env:USERPROFILE\.dsh\pocket\bridge.log" -Tail 12
+#   期望：bridge listening on 127.0.0.1:47901
+#        二维码文件在 C:\Users\<你>\dsh-pocket-qr.png
+#        二维码已写入 C:\Users\<你>\dsh-pocket-qr.png（<N> 字节）
+
+# 3. 二维码真的落到个人目录
+Test-Path "$env:USERPROFILE\dsh-pocket-qr.png"      # 期望 True
+
+# 4. 连接页能打开
+Start-Process http://127.0.0.1:47901/pair
+```
+
+**二维码内容必须和线上链接逐字符一致**，肉眼"看着像二维码"不算。解法：把 PNG 解码
+（例如 Python `cv2.QRCodeDetector`），与下面这条接口的 `url` 比对：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:47901/api/v1/cloud/status | ForEach-Object { $_.data.url }
+```
+
+> 比对时注意 BOM：`Set-Content -Encoding UTF8` 在 PowerShell 5.1 会写 BOM，
+> 读回来多一个 `\ufeff`，会让你误判"差一个字符"。读的时候用 `utf-8-sig`。
+
+命令行也能自查（在插件目录里跑）：
+
+```powershell
+node bin/cli.mjs status      # 运行状态 + 中继状态 + 手机入口 + 已登记设备数
+node bin/cli.mjs pair        # 打印二维码与链接；加 --no-qr 只打印链接
+node bin/cli.mjs devices     # 列出已登记设备
+```
+
+---
+
+## 6. 常见故障
+
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| 日志没有 `plugin loading` | 没登记进 `dsh.profile.bundles`，或包名解析不到 | 回第 2/3 节；确认 `node_modules/dsh-pocket-plugin/package.json` 存在 |
+| `health` 502/连不上 | 端口被别的程序占了 | 看日志 `port <n> is owned by another service`；插件会自动顺延一个端口 |
+| 没有二维码文件 | 三种 fail-closed：`cloud.enabled=false` / `cloud.appBase` 为空 / 没设口令 | 页面 `/pair` 会写明具体是哪一种，按提示补 |
+| 手机扫码后白屏 / 404 | `cloud.appBase` 指错，或 `docs/` 没部署 | 浏览器直接打开 `appBase` 应看到「DSH 随行」启动页 |
+| 改了代码但行为没变 | ESM 模块缓存，热重载只重读配置不重载代码 | **冷启动 DSH**。只改配置（`cordis.patch.yml`）可以热重载 |
+| 连接页每 4 秒弹「连接已断开」 | 页面在轮询一个不存在的接口（历史版本会这样） | 1.0.0 已改为 `/api/v1/devices`；若是旧代码请更新 |
+| 手机一直「正在连接」但列表能刷 | WS 隧道槽位被僵尸连接占满 | 重启中继（DSH 里关掉再开远程访问）；1.0.0 已有槽位回收 |
+| `npm run verify` 报执行策略错误 | 本机 PowerShell 禁止跑 `npm.ps1` | 直接调 node（见第 8 节）；注意此时 PowerShell 仍可能回 `exit 0`，是假绿 |
+
+### 6.1 已知限制（别当成 bug 去查）
+
+- **手机端没有文件下载**。`/download/*` 是回环专属，中继明确拒绝它
+  （`lib/cloud.mjs` 的 `DENIED_TARGETS`：`文件下载不能经中继访问`）。
+  手机能看任务的对话与工具输出，但下载文件要回电脑。
+- **手机端不能改配置、不能改口令**。账号/口令、设备管理与重置链接都在回环连接页上。
+- **中继是第三方公共服务**，可用性不受本插件控制；断线时页面会提示重连，不会静默丢消息。
+
+---
+
+## 7. 升级 / 卸载 / 回滚
+
+**升级**（源码目录是 link 进来的，拉代码即可，随后冷启动 DSH）：
+
+```powershell
+git -C D:\path\to\dsh-pocket pull
+```
+
+**卸载**：
+
+```
+plugin_manager(action: "remove_bundle", target: "dsh-pocket-plugin")
+```
+
+或手工：删掉 `package.json` 里那条 `dsh-pocket-plugin` 依赖、从 `dsh.profile.bundles` 里删掉同名项，
+再删 `node_modules/dsh-pocket-plugin`，然后冷启动。
+
+**回滚到某个已知可用版本**：把 `node_modules/dsh-pocket-plugin` 指向一份该版本的克隆
+（或改 `dependencies` 里的 `link:` 路径），冷启动即可。插件运行态（`~/.dsh/pocket/`）不用动：
+凭据、设备与中继身份都在那里，版本切换不会丢。
+
+> 运行态文件：`auth.json`（口令哈希）、`sessions.json`（15 天会话摘要）、`state.json`（设备）、
+> `cloud.json`（中继身份）、`bridge.log`。**别手改 `auth.json`**，用第 4.3 节的办法。
+
+---
+
+## 8. 开发与测试（CI 跑的就是这四条）
+
+```powershell
+node tools/check-syntax.mjs            # 语法（全仓 .mjs）
+node --test "test/**/*.test.mjs"       # 单测 + 集成 + 中继（约 500 条）
+node test/e2e/run.mjs                  # 端到端（真 HTTP 打真 server）
+node tools/build-shell.mjs --check     # 外壳产物与源码是否一致
+```
+
+其它工具：
+
+```powershell
+node tools/build-shell.mjs             # 重新生成 docs/
+node tools/dev-server.mjs --token <t>  # 本地开发外壳（需要一枚设备令牌）
+node tools/mock-host.mjs               # 假宿主，用虚构数据开发外壳
+```
+
+**别用 `npm run verify` 自动化判断**：在本机 `npm.ps1` 被执行策略禁止时它根本不会执行，
+但 PowerShell 仍可能返回 `exit 0` —— 这是假绿。要么直调上面四条 `node`，要么改用 `bash`。
