@@ -60,7 +60,14 @@ function createBanner() {
     h('span', { class: 'offline-text' }),
     h('button', {
       class: 'offline-action', type: 'button', text: '重连',
-      on: { click: () => { realtime?.kick(); void loadTasks({ silent: true }); } },
+      on: {
+        click: () => {
+          // force：卡在"正在连接"时那次尝试可能已经死了，必须打断它再重来。
+          realtime?.kick(true);
+          toast('正在重连…', { tone: 'info' });
+          void loadTasks({ silent: true });
+        },
+      },
     }),
   );
   document.body.append(el);
@@ -90,6 +97,9 @@ function startRealtime() {
     api,
     getBase: () => baseUrl(),
     getToken: token,
+    // 中继外壳里禁止退回 SSE：中继只搬离散帧，SSE 那种长连接流一定拿不到。
+    // 一旦回退，实时通道就永久死掉，用户只会看到"一直在重连"。
+    allowSse: !isRelayShell(),
     onFrame,
     onBeat: () => { lastBeatAt = Date.now(); },
     onState: (state) => {
@@ -478,7 +488,7 @@ function makeContext() {
       else { view?.hideSearch?.(); store.query = ''; repaint(); }
     },
     reconnect() {
-      realtime?.kick();
+      realtime?.kick(true);
       void loadTasks();
       toast('正在重连…', { tone: 'info' });
     },
@@ -625,7 +635,8 @@ async function boot() {
   else adoptShellSession();
 
   window.addEventListener('hashchange', () => { void applyRoute(); });
-  window.addEventListener('online', () => { realtime?.kick(); void loadTasks({ silent: true }); });
+  // 网络恢复、以及"下拉刷新"这类主动动作都要能打断卡死的连接。
+  window.addEventListener('online', () => { realtime?.kick(true); void loadTasks({ silent: true }); });
 
   if (store.session !== null) {
     await enterApp();

@@ -104,6 +104,13 @@ const RECONNECT_BASE = 700;
 const RECONNECT_MAX = 15_000;
 const PING_EVERY = 20_000;
 const DEAD_AFTER = 75_000;
+/**
+ * 一次实时连接最多等这么久（从设置 connecting 到 onopen）。
+ *
+ * 没有这个上限时，只要票据请求或握手挂住，状态就永远是 connecting ——
+ * 而 kick() 在 connecting 下是空操作，用户点「重连」会**完全没反应**。
+ */
+const CONNECT_TIMEOUT = 9_000;
 
 /**
  * Owns a single logical subscription to the host's event stream.
@@ -112,8 +119,16 @@ const DEAD_AFTER = 75_000;
  * `onState` where state is one of: connecting | online | polling | offline.
  */
 export class Realtime {
-  constructor({ api, getBase, getToken, onFrame, onState, onError, onBeat }) {
+  constructor({ api, getBase, getToken, onFrame, onState, onError, onBeat, allowSse = true }) {
     this.api = api;
+    /**
+     * 是否允许在 WebSocket 连续失败后退回 SSE 轮询。
+     *
+     * 中继外壳（手机走加密中继）里必须关掉：中继只搬离散帧，承载不了 SSE
+     * 那种长连接流。一旦退回 SSE，实时通道就永久死掉，页面只能靠刷新恢复。
+     * 这正是"手机点了重连也没反应"的根因之一。
+     */
+    this.allowSse = allowSse !== false;
     this.onBeat = onBeat ?? (() => {});
     this.getBase = getBase;
     this.getToken = getToken;
@@ -127,6 +142,8 @@ export class Realtime {
     this.source = null;
     this.pingTimer = null;
     this.reconnectTimer = null;
+    this.connectTimer = null;
+    this.connectStartedAt = 0;
     this.lastPong = 0;
     this.closing = false;
     this.stopped = true;
@@ -153,9 +170,16 @@ export class Realtime {
   }
 
   /** Called when the tab becomes visible again: do not wait for the backoff. */
-  kick() {
+  /**
+   * 立刻（重新）连接。
+   *
+   * @param {boolean} [force] 为真时连 connecting 也打断 —— 用户点「重连」
+   *   时必须是这个语义：他看到的"正在连接"很可能已经卡死了。
+   */
+  kick(force = false) {
     if (this.stopped) return;
-    if (this.state === 'online' || this.state === 'connecting') return;
+    if (this.state === 'online') return;
+    if (this.state === 'connecting' && !force) return;
     if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.failures = 0;
@@ -163,6 +187,8 @@ export class Realtime {
   }
 
   teardown() {
+    if (this.connectTimer !== null) clearTimeout(this.connectTimer);
+    this.connectTimer = null;
     if (this.pingTimer !== null) clearInterval(this.pingTimer);
     this.pingTimer = null;
     if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
@@ -185,9 +211,10 @@ export class Realtime {
     if (this.stopped) return;
     this.teardown();
     this.setState('connecting');
-    // Two failed WebSocket attempts in a row mean a proxy is eating upgrades;
-    // poll with SSE instead of retrying the same dead path forever.
-    if (this.failures >= 2) {
+    // 两次 WebSocket 失败通常意味着有代理吃掉了 upgrade；这时退回 SSE 轮询。
+    // 但**中继外壳里不存在这种场景**：中继承载不了长连接流，退回 SSE 只会永久
+    // 失去实时通道。所以中继模式下继续老老实实用 WS 重试。
+    if (this.allowSse && this.failures >= 2) {
       this.openSse();
       return;
     }
@@ -201,7 +228,21 @@ export class Realtime {
       const since = this.lastSeq > 0 ? `&since=${this.lastSeq}` : '';
       const socket = new WebSocket(`${base}/ws?ticket=${encodeURIComponent(ticket.ticket)}${since}`);
       this.socket = socket;
+      // 连接超时：到点还没 open 就当作一次失败重来，绝不让状态吊在 connecting。
+      this.connectStartedAt = Date.now();
+      if (this.connectTimer !== null) clearTimeout(this.connectTimer);
+      this.connectTimer = setTimeout(() => {
+        this.connectTimer = null;
+        if (this.socket !== socket || this.state === 'online') return;
+        try { socket.close(); } catch { /* ignore */ }
+        this.socket = null;
+        this.failures += 1;
+        this.setState('offline');
+        this.scheduleReconnect();
+      }, CONNECT_TIMEOUT);
       socket.onopen = () => {
+        if (this.connectTimer !== null) clearTimeout(this.connectTimer);
+        this.connectTimer = null;
         this.failures = 0;
         this.lastPong = Date.now();
         this.setState('online');
@@ -215,6 +256,8 @@ export class Realtime {
       socket.onerror = () => { try { socket.close(); } catch { /* ignore */ } };
       socket.onclose = () => {
         if (this.socket !== socket) return;
+        if (this.connectTimer !== null) clearTimeout(this.connectTimer);
+        this.connectTimer = null;
         this.socket = null;
         this.stopPing();
         if (this.closing || this.stopped) return;
