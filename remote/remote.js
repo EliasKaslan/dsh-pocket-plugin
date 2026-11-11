@@ -1324,32 +1324,75 @@ function renderManualEntry(reason) {
   });
   // The hash is a value, never markup: URLSearchParams encodes it and we only
   // ever assign it to an input value.
-  input.value = new URLSearchParams(location.hash.slice(1)).toString();
+  // 预填：优先用本次地址栏的链接，其次用上次记住的。以前这里是空框，而空框 +
+  // 「连接」按钮 = 什么都不发生（提交处理里遇到空值直接静默返回）。
+  const fromHash = new URLSearchParams(location.hash.slice(1)).toString();
+  input.value = fromHash.length > 0 ? fromHash : (readStoredLink() ?? '');
+  const note = el('small', {
+    class: 'pocket-note',
+    text: '链接在电脑端「配对页 → 远程访问」里，形如 …/#r=…&k=…&t=…',
+  });
   const form = el('form', { class: 'pocket-card', id: 'pocket-manual-form' }, [
     el('h1', { class: 'pocket-title', text: '连接你的电脑' }),
     el('p', { class: 'pocket-sub', text: reason }),
     input,
     el('button', { class: 'pocket-btn pocket-btn-primary', type: 'submit', text: '连接' }),
-    el('small', { class: 'pocket-note', text: '链接在电脑端「配对页 → 远程访问」里，形如 …/#r=…&k=…&t=…' }),
+    note,
   ]);
   const layer = el('div', { class: 'pocket-gate', id: 'pocket-manual' }, [form]);
   document.body.append(layer);
   form.addEventListener('submit', (event) => {
     event.preventDefault();
     const value = input.value.trim();
-    if (value.length === 0) return;
     const next = value.includes('#') ? value.slice(value.indexOf('#') + 1) : value.replace(/^#/u, '');
-    if (next.length === 0) return;
+    const parsed = new URLSearchParams(next);
+    // 链接必须包含房间、密钥、初始凭据三件套；不完整就明确说出来，
+    // 而不是像以前那样静默 return —— 用户只会觉得"点了没反应"。
+    if (next.length === 0 || !parsed.get('r') || !parsed.get('k') || !parsed.get('t')) {
+      note.textContent = value.length === 0
+        ? '还没有填链接：请从电脑端「配对页 → 远程访问」复制完整链接（形如 …/#r=…&k=…&t=…）。'
+        : '这段链接不完整：需要同时包含 r、k、t 三段参数，请从电脑端重新复制。';
+      note.classList.add('pocket-note-error');
+      input.focus();
+      return;
+    }
     location.hash = next;
     location.reload();
   });
-  setTimeout(() => input.focus(), 50);
 }
 
 /* --------------------------------- boot --------------------------------- */
 
 function closeChannels(relay) {
   for (const [, socket] of relay.sockets) void relay.closeSocket(socket.id);
+}
+
+/**
+ * 链接记忆：把 `#r=…&k=…&t=…` 存进 localStorage，供"裸启动"恢复。
+ *
+ * 只存链接本身（房间、密钥、初始设备凭据），不存登录会话 —— 登录态仍由内层
+ * 应用自己保管。桌面端「重置链接」后房间会变，旧值失效时外壳会照常报连不上，
+ * 重新扫码即可覆盖。
+ */
+const LINK_KEY = 'dsh.pocket.link.v1';
+
+function readStoredLink() {
+  try {
+    const value = globalThis.localStorage?.getItem(LINK_KEY);
+    if (typeof value !== 'string' || value.length === 0 || value.length > 4096) return null;
+    const parsed = new URLSearchParams(value);
+    if (!parsed.get('r') || !parsed.get('k') || !parsed.get('t')) return null;
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+function storeLink(value) {
+  try {
+    if (typeof value !== 'string' || value.length === 0 || value.length > 4096) return;
+    globalThis.localStorage?.setItem(LINK_KEY, value);
+  } catch { /* 隐私模式：不记住也能用，只是下次要重新扫码 */ }
 }
 
 async function main() {
@@ -1367,19 +1410,39 @@ async function main() {
     // shell is the app. Fall through to the normal flow.
   }
 
-  const room = params.get('r');
-  const key = params.get('k');
+  /**
+   * 一次成功的链接必须被记住。
+   *
+   * 为什么：手机的 PWA 从桌面图标启动时，`manifest.start_url` 里带不了 hash，
+   * 浏览器也可能在"退出后再进来"时丢掉 `#r=…&k=…&t=…`。参数一没，外壳就判定
+   * "不是中继外壳"，把用户丢到「粘贴链接」页面 —— 那个页面的按钮只是把框里的
+   * 内容塞回 hash，框里没有完整链接时自然点了没反应。
+   */
+  const savedLink = readStoredLink();
+  let link = params;
+  if (!params.get('r') || !params.get('k') || !params.get('t')) {
+    if (savedLink !== null) {
+      link = new URLSearchParams(savedLink);
+      // 把地址栏也补回完整链接，后续任何读 location.hash 的代码都一致。
+      try { history.replaceState(null, '', '#' + savedLink); } catch { /* 老浏览器 */ }
+    }
+  }
+
+  let room = link.get('r');
+  let key = link.get('k');
   // `t` 只用来判断「这是不是一个完整的远程链接」。它以前被当成手机的 API
   // 凭据；现在凭据只有一条路——口令登录换来的 deviceToken（见 persistDeviceSession）。
-  const token = params.get('t');
-  const name = params.get('n') ?? 'DSH';
+  let token = link.get('t');
+  const name = link.get('n') ?? 'DSH';
 
   if (!room || !key || !token) {
     renderManualEntry('这个页面需要电脑端生成的远程链接才能工作。');
     return;
   }
+  // 记住这次可用的链接，下次裸启动直接进。
+  storeLink(link.toString());
 
-  const hint = resolveBrokerHint(params.get('s'));
+  const hint = resolveBrokerHint(link.get('s'));
   const brokers = hint === null ? DEFAULT_BROKERS.slice() : [hint, ...DEFAULT_BROKERS.filter((item) => item !== hint)];
 
   // The MQTT client is a classic script loaded before this module; without it
