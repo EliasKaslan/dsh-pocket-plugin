@@ -77,6 +77,8 @@ export const store = {
   detailError: '',
   /* 「往上翻加载更早」是否有请求在飞：防止快速滑动打出并发重复页。 */
   detailLoadingOlder: false,
+  /** 正在追新（`?after=` 增量），避免同一时刻并发多个增量请求。 */
+  detailAppending: false,
   chatAuto: true,
 
   workspaces: [],

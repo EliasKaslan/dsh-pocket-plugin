@@ -17,7 +17,7 @@ import { after, test } from 'node:test';
 
 import { buildTranscriptAsync, messageChars } from '../../lib/messages.mjs';
 import {
-  MIN_USER_MESSAGES, PAGE_CHARS, PAGE_DEFAULT, PAGE_MAX, TaskIndex, slicePage,
+  LIST_PREVIEW_CHARS, MIN_USER_MESSAGES, PAGE_CHARS, PAGE_DEFAULT, PAGE_MAX, TaskIndex, sliceAfter, slicePage,
 } from '../../lib/task-index.mjs';
 
 const roots = [];
@@ -331,4 +331,104 @@ test('手机端：store 提供分页参数与并发标志；样式表有透明�
   const css = readRepo('web/app.css');
   assert.match(css, /\.chat-list \{ display: contents; \}/u);
   assert.match(css, /\.older-hint/u);
+});
+
+/* ------------------------------------------------------ sliceAfter（纯） ---- */
+
+const makeMessages = (count) => Array.from({ length: count }, (_, index) => ({
+  id: `m${index}`,
+  role: index % 5 === 0 ? 'user' : 'assistant',
+  text: `第 ${index} 条`,
+  at: 1_000 + index,
+  seq: index + 1,
+}));
+
+test('sliceAfter：带游标只返回它之后的消息（增量追新的核心）', () => {
+  const messages = makeMessages(100);
+  const page = sliceAfter(messages, { after: 'm95' });
+  assert.deepEqual(page.messages.map((m) => m.id), ['m96', 'm97', 'm98', 'm99']);
+  assert.equal(page.reset, false);
+  assert.equal(page.hasMore, false, '取到尾部就没有更多了');
+  assert.equal(page.total, 100);
+});
+
+test('sliceAfter：游标就是最后一条 → 空数组且不算 reset（没有新消息是正常态）', () => {
+  const messages = makeMessages(10);
+  const page = sliceAfter(messages, { after: 'm9' });
+  assert.deepEqual(page.messages, []);
+  assert.equal(page.reset, false);
+  assert.equal(page.hasMore, false);
+});
+
+test('sliceAfter：游标找不到 → reset，并给出尾部一页（调用方应整页重载）', () => {
+  const messages = makeMessages(100);
+  const page = sliceAfter(messages, { after: 'm-不存在' });
+  assert.equal(page.reset, true, '找不到游标必须明确要求重置，不能假装是增量');
+  assert.equal(page.messages.length, PAGE_DEFAULT);
+  assert.equal(page.messages[page.messages.length - 1].id, 'm99');
+});
+
+test('sliceAfter：不带游标 → 尾部一页（不会返回整段转录）', () => {
+  const messages = makeMessages(500);
+  const page = sliceAfter(messages, {});
+  assert.equal(page.messages.length, PAGE_DEFAULT);
+  assert.equal(page.reset, false);
+  assert.equal(page.messages[page.messages.length - 1].id, 'm499', '取的是最新那一端');
+  assert.equal(page.hasMore, false, '已经给到尾部，更新方向没有剩余');
+});
+
+test('sliceAfter：条数与字符预算都生效，超预算时 hasMore=true 供调用方续追', () => {
+  const big = Array.from({ length: 30 }, (_, index) => ({
+    id: `b${index}`, role: 'assistant', text: 'x'.repeat(PAGE_CHARS / 3), at: index, seq: index + 1,
+  }));
+  const page = sliceAfter(big, { after: '', limit: 20 });
+  assert.ok(page.messages.length < 20, '字符预算要先于条数预算生效');
+  assert.equal(page.hasMore, true, '被预算截断时必须允许继续追');
+});
+
+test('sliceAfter：空转录不炸；带游标时明确 reset', () => {
+  assert.deepEqual(sliceAfter([], {}), { messages: [], total: 0, reset: false, hasMore: false });
+  assert.equal(sliceAfter([], { after: 'm1' }).reset, true);
+});
+
+test('detail({after})：只把新增的那几条发回去（流式期间的正常路径）', async () => {
+  const events = [];
+  for (let index = 0; index < 12; index += 1) {
+    events.push({ seq: index + 1, type: 'turn/start', at: 1_000 + index, data: {} });
+    events.push({
+      seq: index + 1,
+      type: index % 2 === 0 ? 'message/user' : 'message/assistant',
+      at: 1_000 + index,
+      data: { text: `第 ${index} 段` },
+    });
+  }
+  const { index: taskIndex } = await makeIndex({ events });
+  const first = await taskIndex.detail('task-page');
+  assert.ok(first.messages.length > 0);
+  const tail = first.messages[first.messages.length - 1];
+
+  const none = await taskIndex.detail('task-page', { after: tail.id });
+  assert.deepEqual(none.messages, [], '尾部之后没有新消息');
+  assert.equal(none.reset, false);
+
+  const bogus = await taskIndex.detail('task-page', { after: 'm-不存在' });
+  assert.equal(bogus.reset, true, '游标失效必须要求整页重载');
+  assert.ok(bogus.messages.length > 0, 'reset 时仍返回尾部一页，避免手机端白屏');
+
+  taskIndex.dispose();
+});
+
+/* ------------------------------------------------------- 列表瘦身 ---- */
+
+test('列表：预览截到 LIST_PREVIEW_CHARS（卡片只显示两行，长预览是响应体大头）', async () => {
+  const longText = '这是一段很长的助手输出，'.repeat(40);
+  const events = [{
+    seq: 1, type: 'message/assistant', at: 1_000, data: { text: longText },
+  }];
+  const { index: taskIndex } = await makeIndex({ events });
+  await taskIndex.load?.();
+  const listed = taskIndex.snapshot({ limit: 10 }).tasks[0];
+  assert.ok(typeof listed.lastText === 'string');
+  assert.ok(listed.lastText.length <= LIST_PREVIEW_CHARS + 1, `预览必须被截短，实际 ${listed.lastText.length}`);
+  taskIndex.dispose();
 });

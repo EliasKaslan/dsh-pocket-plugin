@@ -155,9 +155,10 @@ function onFrame(frame) {
       break;
     }
     case 'task.message': {
-      // The list only needs the preview, which `task.updated` already carries;
-      // the open transcript needs a debounced refetch.
-      if (store.detailId !== null && payload.taskId === store.detailId) scheduleDetailRefresh(280);
+      // 列表只需要预览，而预览由 `task.updated` 带着；打开着的会话只向电脑端
+      // **要新增的那几条**（`?after=<最后一条 id>`），不再整页重拉。
+      // 整页重拉在流式输出时是 112 KB × 每 280ms，增量只有几 KB。
+      if (store.detailId !== null && payload.taskId === store.detailId) scheduleDetailAppend(220);
       break;
     }
     case 'devices.changed': {
@@ -345,6 +346,68 @@ function scheduleDetailRefresh(delay = 320) {
     detailTimer = null;
     if (store.detailId !== null && store.session !== null) void loadDetail(store.detailId, { silent: true });
   }, delay);
+}
+
+/* ---------------- 会话增量追新 ---------------- */
+
+let appendTimer = null;
+
+/** 合并短时间内的多条新消息，只发一次增量请求。 */
+function scheduleDetailAppend(delay = 220) {
+  if (appendTimer !== null) clearTimeout(appendTimer);
+  appendTimer = setTimeout(() => {
+    appendTimer = null;
+    void appendDetailTail();
+  }, delay);
+}
+
+/**
+ * 只取「当前最后一条之后」的新消息，追加到已加载的转录末尾。
+ *
+ * 与整页重拉的区别：首屏 112 KB / 80 条，增量通常 1~3 条 / 2~4 KB。
+ * 服务端给出 `reset`（游标失效）时退回整页重载，绝不把两段拼接。
+ */
+async function appendDetailTail() {
+  const id = store.detailId;
+  const detail = store.detail;
+  if (id === null || detail === null || detail === undefined) return;
+  if (store.detailAppending === true) return;
+
+  const messages = Array.isArray(detail.messages) ? detail.messages : [];
+  const tail = messages.length > 0 ? messages[messages.length - 1] : null;
+  const cursor = typeof tail?.id === 'string' ? tail.id : '';
+  // 连一条都没有（页面刚进、首屏还没到）：走正常加载，别发无游标的增量请求。
+  if (cursor.length === 0) {
+    if (store.detailLoading === true || store.detailLoadingOlder === true) return;
+    void loadDetail(id, { silent: true });
+    return;
+  }
+
+  store.detailAppending = true;
+  try {
+    const data = await api(`/api/v1/tasks/${encodeURIComponent(id)}?after=${encodeURIComponent(cursor)}`, { timeout: 20_000 });
+    // 期间用户切走了会话 / 详情被替换：这一批已经过时，直接丢弃。
+    if (store.detailId !== id || store.detail !== detail) return;
+    if (data?.reset === true) {
+      void loadDetail(id, { silent: true });
+      return;
+    }
+    const fresh = Array.isArray(data?.messages) ? data.messages : [];
+    const known = new Set(messages.map((message) => message.id));
+    const added = fresh.filter((message) => !known.has(message.id));
+    if (added.length === 0) return;
+    detail.messages = [...messages, ...added];
+    if (typeof data?.total === 'number') detail.total = data.total;
+    if (store.screen === 'detail') {
+      view?.paintChat?.();
+      // 用户停在底部就跟进最新；他正在往上翻历史时不要抢位置。
+      if (store.chatAuto === true) view?.scrollToBottom?.(false);
+    }
+    // 这一批被预算截断了，说明还有更新的，继续追。
+    if (data?.hasMoreAfter === true) scheduleDetailAppend(60);
+  } catch { /* 增量失败静默：下一条消息或手动刷新会补上 */ } finally {
+    store.detailAppending = false;
+  }
 }
 
 /* ---------------- task helpers ---------------- */
