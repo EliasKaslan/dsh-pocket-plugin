@@ -9,7 +9,7 @@ importers:
   .:
     dependencies:
       mqtt:
-        specifier: ^5.16.1
+        specifier: 5.16.1
         version: 5.16.1
       ws:
         specifier: 8.22.0

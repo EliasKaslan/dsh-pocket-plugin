@@ -20,6 +20,18 @@ const WEB = join(ROOT, 'web');
 const REMOTE = join(ROOT, 'remote');
 const MQTT_DIST = join(ROOT, 'node_modules', 'mqtt', 'dist', 'mqtt.min.js');
 
+/**
+ * `docs/mqtt.min.js` 是被提交进仓库的第三方产物 —— 手机端加载的就是它。
+ *
+ * 只校验「体积大于 64 KiB」等于没有校验：换成一个体积相同的恶意 bundle 照样过 CI，
+ * 而这正是「改动一个文件」的攻击最可能选的位置。所以把它的字节钉在这里。
+ *
+ * 之所以不用「与 node_modules 逐字节比对」：那样 CI 里 `npm install` 装到任意
+ * 5.x 小版本都会假红。`package.json` 里 mqtt 是**精确版本**（不是 `^`），因此
+ * 钉住的哈希是确定的；升级 mqtt 时 `collect()` 会报出新哈希，照它改这一行即可。
+ */
+const MQTT_DIST_SHA256 = '75873d04a6400bbbac093b3602caf06f44ed92ee032925e1f4f21c03eba05a4e';
+
 const args = parseArgs(process.argv.slice(2));
 const OUT = resolve(ROOT, args.out ?? 'docs');
 const CHECK = args.check === true;
@@ -153,6 +165,16 @@ async function collect() {
   } catch {
     throw new Error(`找不到 ${MQTT_DIST}；先在仓库根目录运行 npm install（或 pnpm install），mqtt 的 dist 里就带上它了`);
   }
+  const mqttHash = createHash('sha256').update(mqtt).digest('hex');
+  if (mqttHash !== MQTT_DIST_SHA256) {
+    throw new Error([
+      '装到的 mqtt dist 与钉住的版本不一致：',
+      `  实际 sha256 = ${mqttHash}`,
+      `  钉住 sha256 = ${MQTT_DIST_SHA256}`,
+      '  若确实要升级 mqtt：package.json 改成新的精确版本，再把 tools/build-shell.mjs 里的',
+      '  MQTT_DIST_SHA256 换成上面的「实际 sha256」，然后重新 build:shell。',
+    ].join('\n'));
+  }
   entries.set('mqtt.min.js', mqtt);
 
   // 哈希覆盖除自身以外的全部产物，任一文件变化都会换掉 SW 缓存名。
@@ -207,12 +229,15 @@ async function verify(entries) {
   const onDisk = new Set(await walk(OUT).catch(() => []));
   for (const [path, buffer] of entries) {
     if (!onDisk.has(path)) { problems.push(`缺失 ${path}`); continue; }
-    // mqtt.min.js 是第三方发行物，不是「由本仓源码生成」的东西：它的字节取决于
-    // 装的是哪个 mqtt 版本。若按字节比对，CI 里 `npm install` 装到 5.x 的任意小版本
-    // 都会让 --check 假红。这里只验它在、且不是空壳（要换版本就重新 build:shell）。
+    // mqtt.min.js 是第三方发行物，不是「由本仓源码生成」的东西，所以不能拿
+    // node_modules 的当前字节当基准（CI 里装到别的 5.x 小版本就会假红）。
+    // 基准是钉住的 sha256：产物被换成任何别的 bundle 都会在这里红。
     if (path === 'mqtt.min.js') {
       const actual = await readFile(join(OUT, path));
-      if (actual.length < 64 * 1024) problems.push(`可疑 mqtt.min.js（只有 ${actual.length} 字节）`);
+      const digested = createHash('sha256').update(actual).digest('hex');
+      if (digested !== MQTT_DIST_SHA256) {
+        problems.push(`内容不一致 ${path}（sha256=${digested}，钉住=${MQTT_DIST_SHA256}）`);
+      }
       onDisk.delete(path);
       continue;
     }

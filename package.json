@@ -54,7 +54,7 @@
     "start": "node bin/cli.mjs"
   },
   "dependencies": {
-    "mqtt": "^5.16.1",
+    "mqtt": "5.16.1",
     "ws": "8.22.0"
   },
   "engines": {

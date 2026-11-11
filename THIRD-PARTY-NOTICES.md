@@ -24,7 +24,7 @@
 ### 1. `mqtt`（MQTT.js）— MIT
 
 - 上游：<https://github.com/mqttjs/MQTT.js>
-- 版本由 `pnpm-lock.yaml` 锁定为 `5.16.1`，`package.json` 的范围是 `^5.16.1`。
+- 版本由 `pnpm-lock.yaml` 锁定为 `5.16.1`，`package.json` 里写的是**精确版本** `5.16.1`（不是 `^`）：这个依赖有被提交进仓库的构建产物，范围漂移会让 `docs/mqtt.min.js` 的字节失去确定性。
 - 版权行（上游 `LICENSE.md`）：`Copyright (c) 2015-2016 MQTT.js contributors`。
 - **有一份被提交进仓库的构建产物**：`docs/mqtt.min.js`。它是 `node_modules/mqtt/dist/mqtt.min.js` 的逐字节复制（`tools/build-shell.mjs` 里的 `MQTT_DIST` 与 `entries.set('mqtt.min.js', mqtt)`），随手机端外壳一起静态托管。因此这一份**是**本仓库在分发 `mqtt` 的代码，MIT 的署名要求由本文件满足。
 - 升级方式：改 `package.json` 的版本范围 → `pnpm install` → `node tools/build-shell.mjs` 重新生成 `docs/`（`node tools/build-shell.mjs --check` 会在 CI 里发现产物没更新）。
@@ -47,7 +47,7 @@
 
 ### 4. `docs/mqtt.min.js`
 
-见上面第 1 条：它是 `mqtt` 的浏览器构建产物，随 `docs/` 提交，属"本仓库分发第三方代码"。不要手工编辑这个文件——它由 `node tools/build-shell.mjs` 生成，`--check` 会在 CI 里比对字节。
+见上面第 1 条：它是 `mqtt` 的浏览器构建产物，随 `docs/` 提交，属"本仓库分发第三方代码"。不要手工编辑这个文件——它由 `node tools/build-shell.mjs` 生成，`--check` 会按 `tools/build-shell.mjs` 里钉住的 `MQTT_DIST_SHA256` 校验它的字节。
 
 ## 本项目自身
 
