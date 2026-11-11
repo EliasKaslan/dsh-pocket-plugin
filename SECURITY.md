@@ -1,137 +1,201 @@
-# 安全模型：为什么这个插件不会把电脑暴露到公网
+# 安全模型与暴露面分析
 
-> 本文回答一个具体问题：**手机能在任何网络下操作这台电脑，而电脑为什么不需要公网 IP、不需要端口映射、也不在防火墙上开洞？**
+> 本文件回答两个问题：
+> 1. **这个插件**会不会把电脑暴露到公网？
+> 2. 它跑在 **DSH Desktop** 宿主里之后，整台电脑的暴露面是什么？
 >
-> 结论一句话：**电脑上没有任何一个端口在等待外部连接。** 手机和电脑都是"客户端"，各自向一个公共消息中转站发起**出站**连接；公网上不存在能直接敲到这台电脑的地址。
+> 上一版只回答了第 1 个问题，并把结论写成"电脑上没有任何端口在等待外部连接"。
+> 这个说法**对本插件成立，对宿主不成立**：DSH Desktop 为了手机配对会在 `0.0.0.0`
+> 上开一个随机端口，并且可以按需建立公网隧道。本版把两层分开写清楚。
 
 ---
 
-## 1. 三个"不存在"
+## 0. 结论
 
-| 常见暴露方式 | 本插件 |
-|---|---|
-| 监听 `0.0.0.0:端口` 等外部连接 | ❌ 不存在。桥接 HTTP 服务只绑回环 `127.0.0.1`（`lib/server.mjs` 的 `canBind(... '127.0.0.1')`；启动日志固定打印 `bridge listening on 127.0.0.1:<port>`） |
-| 路由器端口映射 / UPnP 打洞 | ❌ 不存在。仓库里没有 UPnP、NAT-PMP、frp/ngrok 一类逻辑 |
-| 反向代理 / 内网穿透服务 | ❌ 不存在。只有一条**出站** WSS 连到公共 MQTT broker |
+| 场景 | 公网可达 | 局域网可达 |
+|---|---|---|
+| 只装插件、宿主不开手机连接 | 否 | 否（仅回环 `127.0.0.1`） |
+| DSH Desktop 正常启动（未开手机连接） | 否 | **是**（宿主桥接随机端口） |
+| DSH Desktop 打开"连接手机"→ 局域网模式 | 否 | 是（需一次性配对码） |
+| DSH Desktop 切到"互联网"模式 | **是**（随机 `trycloudflare.com` 域名，需 6 位 PIN） | 是 |
 
-从公网扫描这台电脑：没有任何端口在 listen。扫局域网同样不行 —— 绑定地址是回环，不在任何网卡上。
-
----
-
-## 2. 实际链路
-
-```
-手机                                                    你的电脑
- │                                                         │
- │  出站 WSS ─┐                                  ┌─ 出站 WSS │
- └────────────┴──►  公共 broker（EMQX）  ◄───────┘           │
-                   topic  dshm/<room>/u   （手机 → 电脑）     │
-                   topic  dshm/<room>/d   （电脑 → 手机）     │
-                                                             │
-                                             127.0.0.1:47901 └── 只在本机回环
-```
-
-关键在于 **broker 是"消息中转站"，不是"隧道代理"**：
-
-- 电脑订阅 `dshm/<room>/u`（收手机发来的帧），发布到 `dshm/<room>/d`（回给手机）；
-- 手机反过来；
-- 双方各自 `mqtt.connect(...)` **出站**连 broker（见 `lib/cloud.mjs`）。
-
-**手机从来没有"连到这台电脑"这一步**，因此不存在"电脑在公网上有个入口"这个概念。出站连接是 NAT / 防火墙默认放行的方向，这就是不需要公网 IP 与端口映射的原因。
+一句话：**插件是"零入向"；宿主是"一个常开的局域网口 + 一个按需的公网口"。**
 
 ---
 
-## 3. 加密：密钥根本没经过服务器
+## 1. 资产与信任边界
 
-二维码里的链接形如：
+**资产**：会话内容、工作区文件、agent 的命令执行能力、设备令牌、端到端密钥。
 
-```
-<appBase>#r=<房间>&k=<密钥>&t=<令牌>&n=<名字>
-```
+**一律不信任**（按零信任设计）：
 
-`#` 之后是 URL fragment，**浏览器不会把它发给服务器**（客户端保留）。因此：
-
-- 托管外壳的 GitHub Pages **永远看不到密钥**（它只收到 `GET /index.html`）；
-- broker 只看到主题名 `dshm/<room>/…` 和一堆**密文**；
-- 密钥只存在两处：二维码图片的像素里，以及电脑上的 `~/.dsh/pocket/cloud.json`。
-
-每一帧都用 AES-256-GCM 封装，并把**主题名作为 AAD**（见 `lib/cloud.mjs` 的 `seal()` / `unseal()`）：
-
-```
-{ v: 1, n: <12 字节 IV base64>, c: <base64>(密文 ‖ 16 字节 GCM 认证标签) }
-```
-
-由此得到三条性质：
-
-1. **看不懂** —— 没有密钥无法解密；
-2. **改不了** —— 认证标签 + AAD 绑定，篡改任意字节都会解密失败，而不是静默改掉内容；
-3. **搬不走** —— 把 A 房间的帧搬到 B 房间，AAD 不匹配直接失败。
+- GitHub Pages（静态外壳）
+- 公共 MQTT broker（`broker-cn.emqx.io`）
+- Cloudflare Quick Tunnel / Pinggy
+- 本机其它进程、同网段设备、拿到二维码或链接的人
 
 ---
 
-## 4. 三层访问控制（即使房间被猜到）
+## 2. 插件层：逐条核验
 
-1. **房间号是 128 位随机 base64url**，不可枚举（`createIdentity()`）。
-2. **每条上行消息独立鉴权**：`authorized(type, message)` 校验 `message.token`（15 天登录会话换来的设备令牌）。不通过记 `拒绝未授权消息` 并累加 `stats.unauthorized`。校验是**逐帧、无状态**的，所以重启后仍然有效，也不会被"共用一条隧道"绕过。
-3. **防重放**：`checkFreshness()` 用 `sid + 单调 seq + ts`；超出 120 秒窗口或 seq 回退即 `reject(stale)`。
+### 2.1 只绑回环
 
-**知道房间主题 ≠ 能控制这台电脑** —— 还需要一枚有效登录令牌，而它只在用访问口令登录成功时由电脑签发。
+- `lib/core.mjs:636`：`server.listen(this.config.port, LOOPBACK_HOST)`，`LOOPBACK_HOST = '127.0.0.1'`
+- `lib/server.mjs:179-180`：先 `canBind(..., '127.0.0.1')` 探端口，再监听
+- `lib/index.mjs:4`：模块说明即 "loopback-only HTTP/WebSocket listener"
+
+→ **成立**。注意：这是**插件的**监听；宿主另有监听（见第 3 节）。
+
+### 2.2 Host 校验、CSRF、安全响应头
+
+- `lib/server.mjs:272-276`：`Host` 不在白名单 → `403 bad_host`（防 DNS rebinding）
+- `lib/server.mjs:374`：来源非回环 → `403 loopback_only`
+- `lib/server.mjs:379`：同源校验失败 → `403 csrf`
+- `lib/server.mjs:71-79`：`X-Frame-Options: DENY`、`nosniff`、`no-referrer`、`Permissions-Policy`、CSP `default-src 'self'; script-src 'self'`
+
+→ **成立**。CSP 的 `connect-src` 放开 `ws:/wss:` 是给 broker 连接用的；`script-src 'self'` 意味着外壳不会执行第三方脚本。
+
+### 2.3 端到端加密
+
+- `lib/cloud.mjs:204-205`：`createCipheriv('aes-256-gcm', key, iv)` + `setAAD(topic)`
+- `lib/cloud.mjs:220-221`：解密侧同样校验 AAD
+- 密钥只存在于二维码 URL fragment 与 `~/.dsh/pocket/cloud.json`；fragment 不会随 HTTP 请求发给 GitHub Pages
+
+→ **成立**。AAD 绑主题，搬帧/改帧都会解密失败。
+**残余**：静态密钥、无前向保密（no ratchet）；密钥一旦泄露，此前录下的密文可被解开。
+
+### 2.4 鉴权与重放防护
+
+- `lib/auth.mjs:8`：会话令牌只存 SHA-256 摘要，泄露 `sessions.json` 不能直接登录
+- `lib/auth.mjs:314-315`：32 字节随机令牌 + TTL
+- `lib/auth.mjs:85`：`timingSafeEqual` 常量时间比较
+- `lib/cloud.mjs:85`：`STALE_WINDOW_MS = 120_000`（时间戳窗口）
+- `lib/cloud.mjs:92-94`：每个 `sid` 单调递增 `seq`，重放/回退即 `reject(stale)`
+- `lib/cloud.mjs:87-88`：`res` 帧幂等缓存（独立于重放窗口）
+
+→ **成立**。逐帧、无状态鉴权，重启后仍有效。
+
+### 2.5 中继 nonce 与文件白名单
+
+- `lib/util.mjs:25`：`RELAY_HEADER = 'x-pocket-relay'`
+- `lib/core.mjs:198`：每进程随机 `relayNonce`，`safeEqual` 常量时间比较；缺失/伪造即按远程请求处理（fail-closed）
+- `lib/core.mjs:90-102`：`allowedRoots` 归一化 + 数量上限，文件访问受白名单约束
+
+→ **成立**（具体语义以实现与测试为准）。
+
+### 2.6 没有的东西
+
+仓库内没有 UPnP / NAT-PMP / frp / ngrok / 反向代理逻辑；唯一的对外连接是**出站** WSS 到 broker
+（`lib/cloud.mjs:112`，`DEFAULT_BROKERS = ['wss://broker-cn.emqx.io:8084/mqtt']`）。
 
 ---
 
-## 5. 回环端口也不是裸奔
+## 3. 宿主层：DSH Desktop 新增的暴露面
 
-`127.0.0.1:47901` 外部不可达，但本机的其它程序或网页仍可能敲门，所以再加两层：
+> 以下结论来自 `dataelement/dsh-desktop` 源码（`main`，v0.12.1）。这是第三方桌面壳，不是官方 Harness。
 
-- **Host 头校验**（`core.hostAllowed()` / `allowedHosts()`）：防 DNS rebinding —— 恶意网页把自己的域名解析到 127.0.0.1 来打本地服务时，Host 头对不上，直接 `403 bad_host`。
-- **relay nonce 标记**：中继转发的请求必须带一个每次启动随机生成、只存在于进程内的 nonce（`RELAY_HEADER`，用 `safeEqual` 常量时间比较）。伪造或泄露的头会被**剥离并按远程请求处理**（fail-closed，见 `stripRelayHeader()`）。
+### 3.1 启动即开的局域网端口
+
+- `src/main/mobile/lan-mobile-bridge.ts:235`：`server.listen(port ?? 0, '0.0.0.0')` —— **绑所有网卡、随机端口**
+- `src/main/index.ts:3636`：应用启动即 `mobileBridge.start()`（Safe Mode 除外）
+
+所以：**只要你开着 DSH Desktop，同网段就有一个可被扫描到的 HTTP 端口**，即使你从没用过手机功能。
+
+缓解：`lan-mobile-bridge.ts:664-665` 对非私网来源直接 `403 Private network only`；
+配对需要二维码里 256-bit 一次性 token（5 分钟）。没有 token 无法配对。
+
+### 3.2 按需的公网隧道
+
+- `src/main/mobile/cloudflared-tunnel.ts:279`：`cloudflared tunnel --url http://127.0.0.1:<bridge>`
+- `:125,132`：cloudflared 从 GitHub Releases 下载，**带 SHA256 校验**
+- 失败回落 Pinggy：`ssh -R 0:127.0.0.1:<port> dsh@free.pinggy.io`（`pinggy-tunnel.ts:10,63-68`，约 60 分钟）
+- 只转发**配对/移动桥接面**，不转发 Harness 本体
+
+### 3.3 鉴权
+
+| 机制 | 参数 | 代码 |
+|---|---|---|
+| 一次性配对 token | 32 字节，5 分钟，配对即作废 | `:446-452`、`:959` |
+| 互联网 PIN | 6 位；默认 5 分钟只存内存；勾选同意才落盘 `mobile-pairing-pin.json`（0600） | `:29,500` |
+| 爆破限速 | 5 次/IP、20 次/全局，10 分钟窗口 | `:30-32`、`:529-550` |
+| 会话 | 仅 cookie；tunnel 模式带 `Secure`；LAN 模式另校验来源地址 | `:590-600`、`:963,1003` |
+
+### 3.4 生命周期（容易被忽略）
+
+- **关掉"连接手机"窗口不会停隧道**：`src/main/index.ts:3501-3503` 只清窗口引用；
+  界面自己写着 "The connection stays active in the background."
+- **断开手机也不会停隧道**：`:898-908` 只清会话 + 轮换 token
+- **没有私网 IPv4 时会自动开隧道**：`:3478-3480`
+
+停隧道的唯一正常路径：在窗口里切回"局域网" / 关闭隧道，或退出应用（`mobileBridge.stop()`）。
 
 ---
 
-## 6. 边界：不暴露什么，仍然暴露什么
+## 4. 组合后的攻击面
 
-**不暴露**
-
-- 公网/内网 IP 上没有等待连接的端口；
-- 对话内容对 broker 是密文；
-- 文件系统访问被 `allowedRoots` 白名单限制，不能任意读盘。
-
-**仍然暴露（任何不自建中转的方案都躲不掉）**
-
-- **元数据**：broker 知道哪个房间在通信、时间、帧大小与频率，但不知道内容；
-- **出口 IP**：broker 知道这台电脑的出口 IP（和访问任何网站一样），可推断"有人在用这个房间"；
-- **二维码/链接是 bearer 凭据**：谁拿到那张图或那段链接，谁就能发起连接（仍需访问口令才能操作）。配对页的**「重置链接」**会换掉房间与密钥，使旧码立即作废；
-- **静态外壳是公开的**：GitHub Pages 上任何人可下载 `app.js` 等前端代码。这不是秘密 —— 安全性不依赖代码保密，而依赖只在你手里的那把密钥。
-
-### 二维码文件的存放
-
-默认写到 `~/dsh-pocket-qr.png`（可通过配置 `qrFile` 改路径，或设为 `false` 完全不落盘）。它等价于一把"连接入口"的钥匙，**不要截图外发**。
+| # | 场景 | 结果 | 前提 |
+|---|---|---|---|
+| S1 | 同网段扫描 | 发现宿主桥接端口；无 token 进不去 | 主机在线 |
+| S2 | 二维码/链接泄露 | 可发起配对；互联网模式还需 PIN | 拿到图/链接 |
+| S3 | PIN 在线爆破 | 每 10 分钟全局仅 20 次；默认 PIN 5 分钟即失效 | 隧道开着 |
+| S4 | broker 旁观 | 可见房间主题、时序、帧大小；内容为密文 | 订阅 `dshm/#` |
+| S5 | 静态外壳被篡改 | 可读 `location.hash` 偷 E2E 密钥 | Pages 账号/XSS |
+| S6 | 本机恶意进程 | 读 `cloud.json` 明文密钥、QR PNG、PIN 文件 | 已在本机执行 |
+| S7 | 第三方插件/工作台 | 任意代码执行（与宿主同权限） | 用户安装 |
 
 ---
 
-## 7. 如何自己验证
+## 5. 风险登记
+
+| ID | 风险 | 严重度 | 说明与缓解 |
+|---|---|---|---|
+| R1 | 宿主桥接常开在 `0.0.0.0` | 中 | 无 token 不可用，但端口可被扫描；无法在设置里关闭，只能靠防火墙限制 |
+| R2 | 隧道常驻、关窗/断开不停 | 中 | 公网 URL 在应用运行期间持续可达；用完请手动切回局域网 |
+| R3 | PIN 在线爆破 | 低 | 6 位 = 1e6；全局 20 次/10 分钟、PIN 5 分钟 TTL → 单个窗口约 10 次尝试，命中概率 ~1e-5 |
+| R4 | 无私网 IPv4 时自动开隧道 | 低 | 云主机/纯公网网卡场景；表现为"没点过也开了隧道" |
+| R5 | 公共 broker 匿名可订阅 | 低 | `cloud.mjs:483-490` 无 MQTT 用户名/口令；可观元数据、可刷流量，但不能解密或伪造（无密钥） |
+| R6 | 静态外壳供应链 | 中 | GitHub Pages 被篡改或前端 XSS 可窃取 fragment 密钥；CSP `script-src 'self'` 降低但非零 |
+| R7 | 密钥与 PIN 明文落盘 | 中 | `cloud.json` 明文；QR 默认写 `~/dsh-pocket-qr.png`；防本机恶意进程 |
+| R8 | 无前向保密 | 低-中 | 静态 E2E 密钥；泄露即可解历史密文 |
+| R9 | 插件/工作台任意代码 | 高 | 安装即等于授权；只在可信来源安装，必要时用 Safe Mode |
+| R10 | 更新与二进制供应链 | 中 | cloudflared 有 SHA256 校验；应用走 electron-updater + 签名安装包，但未在本仓库逐一验证 |
+
+---
+
+## 6. 不要做的事
+
+- 不要为了"手机能连"把宿主改成 `--host 0.0.0.0` 或自建反代裸奔（官方 Harness 本身会拒绝通配地址）
+- 不要把配对二维码/链接发到群里；它等价于连接入口凭据
+- 不要把长效 PIN 勾上后又长期开着互联网隧道
+- 不要在不可信目录安装第三方插件或工作台
+- 不要把 `cloud.json`、`mobile-pairing-pin.json`、QR PNG 提交进任何仓库
+
+---
+
+## 7. 自检
 
 ```powershell
-# ① 只在回环上监听（不应出现 0.0.0.0 或网卡地址）
+# 插件：应当只有 127.0.0.1
 Get-NetTCPConnection -LocalPort 47901 -State Listen |
   Select-Object LocalAddress, LocalPort, OwningProcess
 
-# ② 从另一台机器访问这台电脑的公网 IP:47901 —— 必然连不上
+# 宿主：桥接端口是随机的，出现在 0.0.0.0 上属于已知设计
+Get-NetTCPConnection -State Listen |
+  Where-Object LocalAddress -in @('0.0.0.0','::') |
+  Select-Object LocalAddress, LocalPort, OwningProcess
+
+# 隧道进程
+Get-Process cloudflared,ssh -ErrorAction SilentlyContinue | Format-Table Id,ProcessName,Path
 ```
 
-若第 ① 条出现 `0.0.0.0` 或本机网卡地址，说明绑定范围被改动过，属于必须立刻处理的信号。
+判读：插件端口出现 `0.0.0.0` = 异常，必须立刻处理；宿主端口出现 `0.0.0.0` = 设计如此，
+但意味着"这台机器在局域网上有一个配对入口"。
 
 ---
 
-## 8. 一句话总结
+## 8. 范围、版本与披露
 
-安全性来自**四件事的叠加**：
-
-| 层 | 挡住什么 | 单独不够的原因 |
-|---|---|---|
-| 没有入站入口（只绑回环 + 出站连接） | 公网扫描、端口探测 | 挡不住拿到二维码的人 |
-| 端到端加密（密钥走 fragment，AAD 绑主题） | broker 与旁观者读取/篡改 | 挡不住重放旧帧 |
-| 逐帧鉴权（设备令牌） | 未登录者下发指令 | 挡不住中间人看流量 |
-| 防重放 + Host/nonce 校验 | 重放、DNS rebinding、本地伪造 | 挡不住入口暴露 |
-
-四条一起，才让它既能跨网络使用，又不必把电脑放到公网上。
+- 审阅对象：`dsh-pocket-plugin` 1.0.1；宿主 `dataelement/dsh-desktop` v0.12.1（源码 `main`）
+- 方法：源码静态审计 + 本机运行时验证（回环/局域网探针、监听表、进程树）
+- 未覆盖：宿主打包后的二进制差异、Cloudflare/Pinggy 服务端行为、MQTT broker 自身安全
+- 本文不构成安全保证；发现新问题请通过仓库 Issue 或维护者邮箱私下披露
