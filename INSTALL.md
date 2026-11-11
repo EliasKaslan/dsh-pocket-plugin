@@ -139,7 +139,7 @@ node tools/build-shell.mjs          # 生成/刷新 docs/
 ```powershell
 # 1. 回环接口起来了，版本对，且要求登录
 Invoke-RestMethod http://127.0.0.1:47901/api/v1/health | ConvertTo-Json -Depth 4
-#   期望：started=true  ready=true  version=1.0.0  requiresLogin=true
+#   期望：started=true  ready=true  version=0.2.0  requiresLogin=true
 
 # 2. 启动日志里有监听与二维码落点
 Get-Content "$env:USERPROFILE\.dsh\pocket\bridge.log" -Tail 12
@@ -183,8 +183,8 @@ node bin/cli.mjs devices     # 列出已登记设备
 | 没有二维码文件 | 三种 fail-closed：`cloud.enabled=false` / `cloud.appBase` 为空 / 没设口令 | 页面 `/pair` 会写明具体是哪一种，按提示补 |
 | 手机扫码后白屏 / 404 | `cloud.appBase` 指错，或 `docs/` 没部署 | 浏览器直接打开 `appBase` 应看到「DSH 随行」启动页 |
 | 改了代码但行为没变 | ESM 模块缓存，热重载只重读配置不重载代码 | **冷启动 DSH**。只改配置（`cordis.patch.yml`）可以热重载 |
-| 连接页每 4 秒弹「连接已断开」 | 页面在轮询一个不存在的接口（历史版本会这样） | 1.0.0 已改为 `/api/v1/devices`；若是旧代码请更新 |
-| 手机一直「正在连接」但列表能刷 | WS 隧道槽位被僵尸连接占满 | 重启中继（DSH 里关掉再开远程访问）；1.0.0 已有槽位回收 |
+| 连接页每 4 秒弹「连接已断开」 | 页面在轮询一个不存在的接口（历史版本会这样） | 当前版本已改为 `/api/v1/devices`；若是旧代码请更新 |
+| 手机一直「正在连接」但列表能刷 | WS 隧道槽位被僵尸连接占满 | 重启中继（DSH 里关掉再开远程访问）；当前版本已有槽位回收 |
 | `npm run verify` 报执行策略错误 | 本机 PowerShell 禁止跑 `npm.ps1` | 直接调 node（见第 8 节）；注意此时 PowerShell 仍可能回 `exit 0`，是假绿 |
 
 ### 6.1 已知限制（别当成 bug 去查）
@@ -242,3 +242,27 @@ node tools/mock-host.mjs               # 假宿主，用虚构数据开发外壳
 
 **别用 `npm run verify` 自动化判断**：在本机 `npm.ps1` 被执行策略禁止时它根本不会执行，
 但 PowerShell 仍可能返回 `exit 0` —— 这是假绿。要么直调上面四条 `node`，要么改用 `bash`。
+
+---
+
+## 9. 版本策略（0.x 与 1.0）
+
+**当前是 `0.2.0`，测试版。** 目前没有外部使用者，作者要在本人（真手机、真网络）充分
+测试通过之后，才把版本号提到 `1.0.0` 并打出对应的 tag。在那之前：
+
+- 对外只发 **0.x** 版本与 `v0.x.y` 标签；**不要**发布 `1.0.0` / `v1.0.x` 之类的标签，
+  那会暗示"已正式发布、接口稳定"。
+- 0.x 期间允许改协议、改配置键、改行为，不承诺兼容。
+- 升级只改 `package.json` 的 `version` 与 `lib/util.mjs` 的 `PLUGIN_VERSION`（两处必须
+  一致，有测试钉着），然后 `git tag -a vX.Y.Z`。
+
+### 晋级 1.0 前必须满足（作者本人逐条过）
+
+1. **真机真网**扫码 → 输入账号 + 口令 → 进任务列表，能新建任务并看到流式输出；
+2. **点开会话详情**能完整加载（这也是 0.2.0 修的那两条：正文体积闸 + 超限回 413）；
+3. 连续使用 **≥ 3 天**，期间重启 DSH、切前后台、切 WiFi/5G，都能自动恢复、不掉登录；
+4. 至少 **两台设备并存**，其中一台被「移除」后确实失效，另一台不受影响；
+5. 跑满 `node --test "test/**/*.test.mjs"` + `node test/e2e/run.mjs`，全绿；
+6. 检查 `~/.dsh/pocket/bridge.log` 无未解释的 warn/error。
+
+满足后再做：版本改 `1.0.0` → 提交 → `git tag -a v1.0.0` → 推送 main 与 tag。
