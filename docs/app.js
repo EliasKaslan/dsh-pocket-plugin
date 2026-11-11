@@ -233,13 +233,51 @@ async function loadWorkspaces() {
   } catch { /* optional capability */ }
 }
 
+/**
+ * 静默刷新时把新的尾部页合并进已有列表，**不要**把用户已经往上翻出来的
+ * 历史冲掉。
+ *
+ * - 新尾页的第一条能在已有列表里找到 → 从那个位置往后整段替换；
+ *   更早的部分原样保留，`hasMore` / `nextBefore` 也保持。
+ * - 找不到锚点（会话被重建等）→ 保留已有，只把没见过的新消息追加到末尾。
+ */
+function mergeTailInto(previous, data) {
+  const incoming = Array.isArray(data?.messages) ? data.messages : [];
+  const existing = Array.isArray(previous?.messages) ? previous.messages : [];
+  if (existing.length === 0) {
+    return {
+      messages: incoming,
+      hasMore: data?.hasMore === true,
+      nextBefore: typeof data?.nextBefore === 'string' ? data.nextBefore : '',
+    };
+  }
+  const anchor = incoming.length > 0 ? existing.findIndex((message) => message.id === incoming[0].id) : -1;
+  if (anchor >= 0) {
+    return {
+      messages: [...existing.slice(0, anchor), ...incoming],
+      hasMore: previous.hasMore === true,
+      nextBefore: typeof previous.nextBefore === 'string' ? previous.nextBefore : '',
+    };
+  }
+  const known = new Set(existing.map((message) => message.id));
+  const appended = incoming.filter((message) => !known.has(message.id));
+  return {
+    messages: appended.length > 0 ? [...existing, ...appended] : existing,
+    hasMore: previous.hasMore === true,
+    nextBefore: typeof previous.nextBefore === 'string' ? previous.nextBefore : '',
+  };
+}
+
 async function loadDetail(id, { silent = false } = {}) {
   const seq = ++viewSeq;
   if (!silent) { store.detail = null; store.detailError = ''; }
   try {
     const data = await api(`/api/v1/tasks/${encodeURIComponent(id)}`, { timeout: 25_000 });
     if (seq !== viewSeq || store.detailId !== id) return;
-    store.detail = data;
+    const previous = silent ? store.detail : null;
+    store.detail = previous === null || previous === undefined
+      ? data
+      : { ...data, ...mergeTailInto(previous, data) };
     store.detailError = '';
     if (data?.task) upsertTask(data.task, { repaint: false });
   } catch (error) {
@@ -249,6 +287,45 @@ async function loadDetail(id, { silent = false } = {}) {
   if (store.screen === 'detail') {
     view?.paint();
     if (!silent) view?.scrollToBottom?.(true);
+  }
+}
+
+/**
+ * 往上翻：取当前最早那条消息**之前**的一页。
+ *
+ * @returns {number} 新增条数；`-1` 表示游标失效、列表已被服务端重置成尾部一页。
+ */
+async function loadOlder(id) {
+  const detail = store.detail;
+  if (detail === null || detail === undefined) return 0;
+  if (detail.hasMore !== true) return 0;
+  const cursor = typeof detail.nextBefore === 'string' ? detail.nextBefore : '';
+  if (cursor.length === 0) return 0;
+  if (store.detailLoadingOlder === true) return 0;
+  store.detailLoadingOlder = true;
+  try {
+    const query = `?before=${encodeURIComponent(cursor)}&limit=${LIMITS.detailPage}`;
+    const data = await api(`/api/v1/tasks/${encodeURIComponent(id)}${query}`, { timeout: 25_000 });
+    // 期间切走了会话 / 列表被换掉：这一页直接丢弃，别写进别人的详情。
+    if (store.detailId !== id || store.detail !== detail) return 0;
+    const older = Array.isArray(data?.messages) ? data.messages : [];
+    if (data?.cursorLost === true) {
+      detail.messages = older;
+      detail.hasMore = data?.hasMore === true;
+      detail.nextBefore = typeof data?.nextBefore === 'string' ? data.nextBefore : '';
+      return -1;
+    }
+    if (older.length === 0) {
+      detail.hasMore = false;
+      detail.nextBefore = '';
+      return 0;
+    }
+    detail.messages = [...older, ...(Array.isArray(detail.messages) ? detail.messages : [])];
+    detail.hasMore = data?.hasMore === true;
+    detail.nextBefore = typeof data?.nextBefore === 'string' ? data.nextBefore : '';
+    return older.length;
+  } finally {
+    store.detailLoadingOlder = false;
   }
 }
 
@@ -441,6 +518,8 @@ function makeContext() {
     savedCwd(cwd) { savePrefs({ lastCwd: cwd }); },
     reloadDetail() { if (store.detailId !== null) void loadDetail(store.detailId); },
     refreshDetailSoon() { scheduleDetailRefresh(400); },
+    /** 会话详情往上翻一页；返回新增条数（-1 = 游标失效已重置）。 */
+    loadOlder(id) { return loadOlder(id); },
   };
 }
 

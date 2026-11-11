@@ -17,6 +17,8 @@ const LS = {
 export const LIMITS = {
   promptChars: 8000,
   taskPage: 300,
+  /* 会话详情一页多少条：首屏与「往上翻」共用，服务端还会按字节预算二次收敛。 */
+  detailPage: 40,
   cacheTasks: 120,
 };
 
@@ -73,6 +75,8 @@ export const store = {
   detailId: null,
   detail: null,
   detailError: '',
+  /* 「往上翻加载更早」是否有请求在飞：防止快速滑动打出并发重复页。 */
+  detailLoadingOlder: false,
   chatAuto: true,
 
   workspaces: [],

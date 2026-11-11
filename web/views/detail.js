@@ -43,6 +43,13 @@ export function mountDetail(root, ctx) {
   const metaRow = h('div', { class: 'detail-meta' });
   const noticeRow = h('div', { class: 'detail-notice' });
   const chat = h('div', { class: 'chat', id: 'chat' });
+  // 「更早的记录」提示条 + 列表宿主。
+  // 为什么要有 listHost：滚动容器 `chat` 里除了消息还要放这条提示，而
+  // keyedList 会重排它的直接子节点。`.chat-list { display: contents }` 让这层
+  // 包装在布局上透明，于是消息仍然是 `chat` 的 flex 项，提示条也能待在最上面。
+  const olderHint = h('div', { class: 'older-hint', id: 'older-hint' });
+  const listHost = h('div', { class: 'chat-list' });
+  chat.append(olderHint, listHost);
   const jumpBtn = h('button', {
     class: 'jump-bottom', type: 'button', 'aria-label': '回到最新',
     on: { click: () => { scrollToBottom(true); } },
@@ -206,6 +213,77 @@ export function mountDetail(root, ctx) {
 
   /* ---------------- scrolling ---------------- */
 
+  /** 距顶部多近就预取更早的一页。给一屏的高度，滑动时不会等。 */
+  const LOAD_OLDER_AT_PX = 320;
+  let loadingOlder = false;
+  let autoFillBudget = 6;
+
+  /**
+   * 往上翻一页。
+   *
+   * 关键：插入更早消息会把内容顶上去，如果不管滚动位置，画面会"跳"。所以
+   * 前后各记一次 `scrollHeight`，把差值补进 `scrollTop`，视觉上原地不动。
+   *
+   * @param {{auto?: boolean}} [options] auto=true 表示这是"内容不足一屏时的自动补齐"
+   */
+  async function loadOlderHere({ auto = false } = {}) {
+    if (loadingOlder) return 0;
+    const detail = store.detail;
+    if (detail === null || detail === undefined || detail.hasMore !== true) return 0;
+    if (typeof ctx.loadOlder !== 'function' || store.detailId === null) return 0;
+    loadingOlder = true;
+    updateOlderHint();
+    const beforeHeight = chat.scrollHeight;
+    const beforeTop = chat.scrollTop;
+    try {
+      const added = await ctx.loadOlder(store.detailId);
+      if (added < 0) {
+        // 游标失效：服务端已经把列表重置成尾部一页，回到最新位置。
+        paintChat();
+        scrollToBottom(true);
+        return added;
+      }
+      if (added > 0) {
+        paintChat();
+        if (!auto) chat.scrollTop = beforeTop + (chat.scrollHeight - beforeHeight);
+      }
+      return added;
+    } catch (error) {
+      toast(error?.message ?? '加载更早的记录失败，请稍后再试', { tone: 'danger' });
+      return 0;
+    } finally {
+      loadingOlder = false;
+      updateOlderHint();
+    }
+  }
+
+  /** 内容不足一屏时自动补更早的页（有预算上限，避免无限拉）。 */
+  async function autoFill() {
+    if (autoFillBudget <= 0) return;
+    autoFillBudget -= 1;
+    const added = await loadOlderHere({ auto: true });
+    if (added > 0 && chat.scrollHeight <= chat.clientHeight + 8) void autoFill();
+  }
+
+  /** 顶部提示条：加载中 / 还能往上翻 / 已经到最早。 */
+  function updateOlderHint() {
+    const detail = store.detail;
+    if (detail === null || detail === undefined) { olderHint.hidden = true; return; }
+    if (loadingOlder) {
+      olderHint.hidden = false;
+      olderHint.textContent = '正在加载更早的记录…';
+      return;
+    }
+    if (detail.hasMore === true) {
+      olderHint.hidden = false;
+      olderHint.textContent = '往上翻看更早的记录';
+      return;
+    }
+    const total = Number(detail.total) || 0;
+    olderHint.hidden = total === 0;
+    olderHint.textContent = total > 0 ? '已经到最早的记录了' : '';
+  }
+
   function nearBottom() {
     return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 96;
   }
@@ -220,6 +298,8 @@ export function mountDetail(root, ctx) {
   chat.addEventListener('scroll', () => {
     store.chatAuto = nearBottom();
     jumpBtn.classList.toggle('show', !store.chatAuto && chat.scrollHeight > chat.clientHeight + 240);
+    // 翻到接近顶部：补更早的一页。
+    if (chat.scrollTop < LOAD_OLDER_AT_PX) void loadOlderHere();
   }, { passive: true });
 
   /* ---------------- transcript rendering ---------------- */
@@ -337,7 +417,7 @@ export function mountDetail(root, ctx) {
     }
   }
 
-  const chatList = keyedList(chat, (entry) => entry.key);
+  const chatList = keyedList(listHost, (entry) => entry.key);
   const paint = raf(() => paintChatNow());
   function paintChat() { paint(); }
 
@@ -345,6 +425,7 @@ export function mountDetail(root, ctx) {
     const detail = store.detail;
     if (detail === null || detail === undefined) {
       chatList.set([], messageNode);
+      updateOlderHint();
       return;
     }
     const entries = buildEntries(detail.messages ?? []);
@@ -355,6 +436,9 @@ export function mountDetail(root, ctx) {
       entries.unshift({ kind: 'system', key: 'm:truncated', message: { text: '更早的消息已省略。' }, at: 0 });
     }
     chatList.set(entries, messageNode);
+    updateOlderHint();
+    // 内容还不够一屏、但服务端说还有更早的：自动补齐，别让用户对着一屏空白。
+    if (detail.hasMore === true && chat.scrollHeight <= chat.clientHeight + 8) void autoFill();
   }
 
   /* ---------------- chrome ---------------- */

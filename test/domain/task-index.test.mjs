@@ -918,7 +918,7 @@ test('detail：非 live 任务走 readSurface；surface 抛错但有文件时降
   await assert.rejects(bare.index.detail('cold-2'), /no fallback for me/u);
 });
 
-test('detail：超过 20 条缓存时淘汰最旧的一条', async () => {
+test('detail：转录缓存超过 8 条时淘汰最久没用的', async () => {
   let calls = 0;
   const { index } = await makeIndex({
     services: {
@@ -928,16 +928,16 @@ test('detail：超过 20 条缓存时淘汰最旧的一条', async () => {
       },
     },
   });
-  for (let i = 0; i < 21; i += 1) {
+  for (let i = 0; i < 9; i += 1) {
     index.upsertRow(row({ id: `cache-${i}`, createdAt: i }));
     await index.detail(`cache-${i}`);
   }
-  assert.equal(calls, 21);
-  assert.ok(index.detailCache.size <= 20, `缓存必须被限制在 20 条，实际 ${index.detailCache.size}`);
-  assert.equal(index.detailCache.has('cache-0'), false, '最旧的一条必须被淘汰');
+  assert.equal(calls, 9);
+  assert.ok(index.transcripts.size <= 8, `转录缓存必须被限制在 8 条，实际 ${index.transcripts.size}`);
+  assert.equal(index.transcripts.has('cache-0'), false, '最久没用的那条必须被淘汰');
 
   await index.detail('cache-0');
-  assert.equal(calls, 22, '被淘汰的任务必须重新读 surface');
+  assert.equal(calls, 10, '被淘汰的任务必须重新读 surface');
 });
 
 test('detail：children 只含索引里真实存在的子任务', async () => {
@@ -1613,12 +1613,12 @@ test('dispose：清掉定时器、缓存与续聊锁，之后不再广播', asyn
   index.agentLocks.set('d1', Promise.resolve('x'));
   assert.equal(index.pendingUpdates.size, 1);
   assert.notEqual(index.summaryTimer, undefined);
-  assert.equal(index.detailCache.size, 1);
+  assert.equal(index.transcripts.size, 1);
 
   index.dispose();
   assert.equal(index.pendingUpdates.size, 0);
   assert.equal(index.summaryTimer, undefined);
-  assert.equal(index.detailCache.size, 0);
+  assert.equal(index.transcripts.size, 0);
   assert.equal(index.agentLocks.size, 0);
 
   emitted.length = 0;

@@ -654,6 +654,21 @@ svg { stroke: currentColor; stroke-width: 1.8; fill: none; stroke-linecap: round
    带 overflow:hidden 的 .tool 自动最小尺寸为 0，会被压成一条线。 */
 .chat > * { flex: none; }
 
+/* 分页用的列表宿主：布局上透明（display: contents），于是消息仍然直接参与
+   .chat 的 flex 布局，而顶部的「加载更早」提示条可以独占一个子位置。 */
+.chat-list { display: contents; }
+.chat-list > * { flex: none; }
+
+/* 顶部提示：跟随列表滚动，只在「还能翻」/「正在翻」/「到最早了」时出现。 */
+.older-hint {
+  align-self: center;
+  padding: 2px 0 4px;
+  font-size: 12px;
+  color: var(--text-3);
+  text-align: center;
+}
+.older-hint[hidden] { display: none; }
+
 .msg { display: flex; flex-direction: column; max-width: 100%; }
 .msg-user { align-items: flex-end; gap: 3px; }
 .bubble {
