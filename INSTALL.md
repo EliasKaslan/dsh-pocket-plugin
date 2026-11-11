@@ -139,7 +139,7 @@ node tools/build-shell.mjs          # 生成/刷新 docs/
 ```powershell
 # 1. 回环接口起来了，版本对，且要求登录
 Invoke-RestMethod http://127.0.0.1:47901/api/v1/health | ConvertTo-Json -Depth 4
-#   期望：started=true  ready=true  version=0.3.0  requiresLogin=true
+#   期望：started=true  ready=true  version=0.4.0  requiresLogin=true
 
 # 2. 启动日志里有监听与二维码落点
 Get-Content "$env:USERPROFILE\.dsh\pocket\bridge.log" -Tail 12
@@ -250,13 +250,58 @@ plugin_manager(action: "remove_bundle", target: "dsh-pocket-plugin")
 > 运行态文件：`auth.json`（口令哈希）、`sessions.json`（15 天会话摘要）、`state.json`（设备）、
 > `cloud.json`（中继身份）、`bridge.log`。**别手改 `auth.json`**，用第 4.3 节的办法。
 
+### 7.1 热加载 / 热卸载（**不需要重启 DSH**）
+
+改完插件代码想让它生效，不必重启 DSH：**把这个 bundle 关掉再打开**即可。DSH 重新
+apply 时会**重新加载模块**，所以磁盘上的新代码会生效（实测：内存里跑着 1.0.0 时，
+关掉再打开之后 `health.version` 直接变成磁盘上的 0.3.0）。
+
+两种操作方式：
+
+- **图形界面**：设置 → 插件，把「DSH 随行 / dsh-pocket-plugin」关掉，再打开；
+- **让 agent 做**：`plugin_manager` 工具，`action: set_bundle`，`target: dsh-pocket-plugin`，
+  先 `enabled: false` 再 `enabled: true`。
+
+**怎么确认真的换了一份新实例**（三条任一即可）：
+
+```powershell
+# 1) bootId 变了（每次 apply 换一个）
+Invoke-RestMethod http://127.0.0.1:47901/api/v1/health | % { $_.data.bootId }
+
+# 2) 版本变成了你刚改出来的那个
+Invoke-RestMethod http://127.0.0.1:47901/api/v1/health | % { $_.data.version }
+
+# 3) 日志里成对出现「plugin disposing」与「桥接实例已创建 boot=…」
+Get-Content "$env:USERPROFILE\.dsh\pocket\bridge.log" -Tail 20
+```
+
+卸载干净的判据：日志有 `plugin disposing`，且 `http://127.0.0.1:47901` 打不通
+（端口只剩 `TIME_WAIT`，属于正常收尾）。
+
+几条行为须知：
+
+- **端口会复用**。上一个实例刚放手的一瞬间端口可能还没完全可用，插件会在顺延之前
+  对首选端口重试 3 次（每次 120 ms），所以反复热重载仍然绑回 47901；只有真被别人
+  占用才会顺延，并在日志里留一条 `port … is owned by another service`。
+- **手机上正在连的会话会短暂断开**（服务端以 `1001 bridge reloading` 关闭 WS/SSE），
+  随后自动重连。中继身份不变时二维码不变，手机不用重新扫码。
+- **只有当 `cloud.json` 里的中继令牌失效时**（例如那台「远程中继」设备被移除过），
+  加载时才会重建身份 —— room/key 跟着变，二维码跟着变，**手机需要重扫一次**。
+  这是有意的 fail-closed 行为，不是每次热重载都会发生。
+- **运行态不丢**：设备、15 天会话、中继身份都在 `~/.dsh/pocket/`，热重载只换进程内实例。
+- 如果**只改配置**（profile 的 `cordis.patch.yml`），本来就热生效，连关开都不用。
+
+回归用例：`test/integration/hot-reload.test.mjs` —— 同一进程内 apply → dispose 三轮，
+断言每轮都起来、`bootId` 互不相同、端口始终复用、dispose 之后端口真的放手，以及
+重复 dispose 幂等。
+
 ---
 
 ## 8. 开发与测试（CI 跑的就是这四条）
 
 ```powershell
 node tools/check-syntax.mjs            # 语法（全仓 .mjs）
-node --test "test/**/*.test.mjs"       # 单测 + 集成 + 中继（约 500 条）
+node --test "test/**/*.test.mjs"       # 单测 + 集成 + 中继（530+ 条）
 node test/e2e/run.mjs                  # 端到端（真 HTTP 打真 server）
 node tools/build-shell.mjs --check     # 外壳产物与源码是否一致
 ```
@@ -276,7 +321,7 @@ node tools/mock-host.mjs               # 假宿主，用虚构数据开发外壳
 
 ## 9. 版本策略（0.x 与 1.0）
 
-**当前是 `0.3.0`，测试版。** 目前没有外部使用者，作者要在本人（真手机、真网络）充分
+**当前是 `0.4.0`，测试版。** 目前没有外部使用者，作者要在本人（真手机、真网络）充分
 测试通过之后，才把版本号提到 `1.0.0` 并打出对应的 tag。在那之前：
 
 - 对外只发 **0.x** 版本与 `v0.x.y` 标签；**不要**发布 `1.0.0` / `v1.0.x` 之类的标签，

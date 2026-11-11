@@ -124,11 +124,13 @@ test('/api/v1/health：200、只暴露公开字段、端口是实际监听端口
   const body = jsonResponse(response, 200, 'GET /api/v1/health');
   assert.equal(body.ok, true);
   assert.deepEqual(Object.keys(body.data).sort(), [
-    'ok', 'port', 'protocol', 'ready', 'requiresLogin', 'started', 'uptimeMs', 'version',
+    'bootId', 'ok', 'port', 'protocol', 'ready', 'requiresLogin', 'started', 'uptimeMs', 'version',
   ]);
   assert.equal(body.data.port, ctx.port);
   assert.equal(body.data.protocol, 1);
   assert.equal(body.data.requiresLogin, true, '手机端唯一的进门方式是账号 + 口令登录');
+  // bootId：每次 apply 换一个，用来确认「关掉再打开插件确实换了实例/新代码」。
+  assert.match(String(body.data.bootId), /^[0-9a-f]{8}$/u, 'bootId 必须是 8 位十六进制');
   // 不要写死版本号：每次发版都得改测试，改漏了就是一条假红。以 package.json 为准，
   // 这样真正要钉的是「health 报的版本 = 包版本」，而不是某个具体数字。
   assert.equal(body.data.version, PKG_VERSION);
