@@ -24,7 +24,7 @@ import { mountDetail } from './views/detail.js';
 import { mountSettings } from './views/settings.js';
 import { mountTasks } from './views/tasks.js';
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.0.1';
 const SHELL = globalThis.__POCKET_SHELL__ ?? null;
 const SESSION_CACHE = 'dsh.pocket.session.v1';
 
@@ -417,8 +417,16 @@ async function appendDetailTail() {
     const added = fresh.filter((message) => !known.has(message.id));
     if (added.length === 0) {
       store.detailAppendFailures = 0;
+      // 服务端对运行中会话的转录有 0.8 秒缓存，而在飞的这一条消息可能正好落在
+      // 缓存窗口里 —— 若之后没有新帧，它就再也补不回来了。对同一个游标最多补拉一次。
+      const running = detail?.task?.status === 'running';
+      if (running && store.detailAppendRetryFor !== cursor) {
+        store.detailAppendRetryFor = cursor;
+        scheduleDetailAppend(900);
+      }
       return;
     }
+    store.detailAppendRetryFor = '';
     detail.messages = [...current, ...added];
     if (typeof data?.total === 'number') detail.total = data.total;
     store.detailAppendFailures = 0;

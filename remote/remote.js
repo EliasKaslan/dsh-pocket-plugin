@@ -64,6 +64,13 @@ const RESTART_COOLDOWN_MS = 15_000;
  * 重新加载页面能保证把 MQTT、WebSocket、定时器全部重来。
  */
 const HARD_RESET_AFTER = 3;
+/**
+ * 但真正的判据是**持续离线时长**，不是失败次数。
+ *
+ * 加了指数退避重试之后，计数会很快涨到阈值，而"网络抖动 45 秒"远不该刷新页面 ——
+ * 刷新会重下外壳与整个列表（143 KB），在手机上表现为"一直在重连 / 很卡"。
+ */
+const HARD_RESET_MIN_DOWN_MS = 180_000;
 const HARD_RESET_MIN_GAP_MS = 120_000;
 /** A request stalled longer than this may be re-sent on the next beat. */
 const BEAT_RESEND_AFTER_MS = 4_000;
@@ -594,6 +601,8 @@ class Relay {
     /** 重建互斥 + 计数：连续失败到阈值就触发硬兜底。 */
     this.restarting = false;
     this.restartCount = 0;
+    /** 连续离线的起点（0 = 当前在线）。硬兜底只看它，不看失败次数。 */
+    this.downSince = 0;
     this.lastRestartAt = 0;
     this.readyAt = 0;
     this.onhardreset = () => {};
@@ -732,6 +741,7 @@ class Relay {
       await this.connect();
       this.readyAt = Date.now();
       this.restartCount = 0;
+      this.downSince = 0;
       // 上面直接把 pcStale 置了 false，true→false 的边沿被吞掉，onpcStale 不再
       // 触发，横幅「电脑端已离线 N 秒…」会永久挂着。显式通知一次已恢复。
       try { this.onpcStale(false, null); } catch { /* 界面回调不该影响重建 */ }
@@ -745,7 +755,9 @@ class Relay {
       // 如果这里不排，自愈链就断在原地 —— 界面停在「中继断开，正在重连…」其实没在连。
       const retryDelay = Math.min(15_000, 1_000 * (2 ** Math.min(this.restartCount, 4)));
       setTimeout(() => { void this.restart('重建失败重试'); }, retryDelay);
-      if (this.restartCount >= HARD_RESET_AFTER) {
+      if (this.downSince === 0) this.downSince = Date.now();
+      if (this.restartCount >= HARD_RESET_AFTER
+        && Date.now() - this.downSince > HARD_RESET_MIN_DOWN_MS) {
         const key = 'dsh.pocket.hardreset';
         let last = 0;
         try { last = Number(globalThis.sessionStorage?.getItem(key) ?? 0) || 0; } catch { last = 0; }
@@ -1523,7 +1535,9 @@ async function main() {
     if (document.visibilityState !== 'visible') return;
     const last = Math.max(relay.pcSeenAt, relay.stats?.lastRxAt ?? 0);
     const idle = last === 0 ? Number.POSITIVE_INFINITY : Date.now() - last;
-    if (!relay.ready || idle > 20_000) void relay.restart('回到前台');
+    // 阈值放宽到 60 秒、且刚重建过就跳过：每次切前台都重连会把界面弄得一直在转圈。
+  const justRestarted = Date.now() - (relay.lastRestartAt ?? 0) < 20_000;
+  if (!justRestarted && (!relay.ready || idle > 60_000)) void relay.restart('回到前台');
   });
 
   await new Promise((resolve) => {
