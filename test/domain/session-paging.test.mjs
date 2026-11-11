@@ -300,8 +300,17 @@ test('手机端：detail 视图有"往上翻加载更早"的触发、锚点与�
   assert.match(source, /loadOlderHere/u, '必须有翻页函数');
   assert.match(source, /LOAD_OLDER_AT_PX/u, '必须按距顶距离触发');
   assert.match(source, /ctx\.loadOlder/u, '必须通过 ctx 调回 app');
-  assert.match(source, /chat\.scrollTop = beforeTop \+ \(chat\.scrollHeight - beforeHeight\)/u,
-    '插入更早消息后必须补滚动位置，否则画面会跳');
+  // 补位置必须在**渲染之后**：paintChat() 只是把渲染排到下一帧，渲染前设
+  // scrollTop 会被随后插入的内容覆盖回顶部（这个坑实测踩过）。
+  assert.match(source, /pendingScrollAnchor = \{ height: beforeHeight, top: beforeTop \}/u,
+    '翻页前要登记锚点');
+  assert.match(source, /chat\.scrollTop = applied\.top \+ \(chat\.scrollHeight - applied\.height\)/u,
+    '按"插入前的高度/位置"补 scrollTop，否则画面会跳');
+  assert.match(source, /pendingScrollAnchor !== null/u, '锚点要在渲染时被消费');
+  const applyAt = source.indexOf('chat.scrollTop = applied.top');
+  const setAt = source.indexOf('chatList.set(entries, messageNode)');
+  assert.ok(applyAt > 0 && setAt > 0 && applyAt > setAt,
+    '补位置必须排在这轮渲染之后（applyAt > setAt）');
   assert.match(source, /chat-list/u, '列表要放进 display:contents 的宿主里');
   assert.match(source, /older-hint/u, '要有顶部提示条');
 });

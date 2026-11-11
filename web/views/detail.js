@@ -215,6 +215,16 @@ export function mountDetail(root, ctx) {
 
   /** 距顶部多近就预取更早的一页。给一屏的高度，滑动时不会等。 */
   const LOAD_OLDER_AT_PX = 320;
+  /** 上一个渲染过的会话 id：换了会话就要重新定位到底部。 */
+  let paintedDetailId = null;
+  /** 首屏渲染完之后补一次"跳到底部"（markdown/图片会改高度，一帧不够）。 */
+  let bottomJumpPending = false;
+  /**
+   * 待应用的滚动锚点（翻页时用）：{ height: 插入前的 scrollHeight, top: 插入前的 scrollTop }。
+   * 必须在**渲染之后**才能用它补位置 —— paintChat() 只是排到下一帧，
+   * 渲染前设 scrollTop 会被随后插入的内容覆盖回顶部。
+   */
+  let pendingScrollAnchor = null;
   let loadingOlder = false;
   let autoFillBudget = 6;
 
@@ -244,8 +254,9 @@ export function mountDetail(root, ctx) {
         return added;
       }
       if (added > 0) {
+        // 先登记锚点，再触发渲染；真正的 scrollTop 修正在 paintChatNow 里做。
+        if (!auto) pendingScrollAnchor = { height: beforeHeight, top: beforeTop };
         paintChat();
-        if (!auto) chat.scrollTop = beforeTop + (chat.scrollHeight - beforeHeight);
       }
       return added;
     } catch (error) {
@@ -391,6 +402,10 @@ export function mountDetail(root, ctx) {
         update(entry);
         return { el, update };
       }
+      case 'loading': {
+        const el = h('div', { class: 'msg msg-loading' }, h('span', { text: '加载中…' }));
+        return { el, update: () => { /* 占位行不会更新 */ } };
+      }
       case 'divider': {
         const el = h('div', { class: 'divider' });
         const update = (next) => {
@@ -424,7 +439,12 @@ export function mountDetail(root, ctx) {
   function paintChatNow() {
     const detail = store.detail;
     if (detail === null || detail === undefined) {
-      chatList.set([], messageNode);
+      // 还没拿到详情：给一个明确的「加载中…」占位，而不是一片空白。
+      // 读失败时不显示它（错误提示由下面的 notice 负责），避免同时出现两个提示。
+      const placeholder = store.detailError
+        ? []
+        : [{ kind: 'loading', key: 'm:loading', message: { text: '加载中…' }, at: 0 }];
+      chatList.set(placeholder, messageNode);
       updateOlderHint();
       return;
     }
@@ -436,6 +456,25 @@ export function mountDetail(root, ctx) {
       entries.unshift({ kind: 'system', key: 'm:truncated', message: { text: '更早的消息已省略。' }, at: 0 });
     }
     chatList.set(entries, messageNode);
+    // 进入（或切换）会话：直接停在最新一条。
+    // 这里要连滚两帧：第一次是插入 DOM 后立刻滚，第二次等 markdown/图片把
+    // 高度撑开后再校正一次，否则长会话会停在中间。
+    if (store.detailId !== paintedDetailId) {
+      paintedDetailId = store.detailId;
+      bottomJumpPending = store.detailId !== null && store.detailId !== undefined;
+    }
+    if (bottomJumpPending) {
+      bottomJumpPending = false;
+      const settle = () => scrollToBottom(true);
+      settle();
+      requestAnimationFrame(() => { settle(); requestAnimationFrame(settle); });
+    }
+    // 翻页补位置：此刻新内容已经在 DOM 里，scrollHeight 是**新**高度。
+    if (pendingScrollAnchor !== null) {
+      const applied = pendingScrollAnchor;
+      pendingScrollAnchor = null;
+      chat.scrollTop = applied.top + (chat.scrollHeight - applied.height);
+    }
     updateOlderHint();
     // 内容还不够一屏、但服务端说还有更早的：自动补齐，别让用户对着一屏空白。
     if (detail.hasMore === true && chat.scrollHeight <= chat.clientHeight + 8) void autoFill();

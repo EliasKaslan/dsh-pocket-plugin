@@ -51,7 +51,7 @@
   --text: #0f172a;
   --text-2: #475569;
   --text-3: #64748b;
-  --accent: #4f6ef2;
+  --accent: #4463ea;   /* 4.60:1 on #f4f6fb（原 #4f6ef2 只有 4.01） */
   --accent-2: #7c3aed;
   --accent-soft: rgba(79, 110, 242, .1);
   --accent-line: rgba(79, 110, 242, .3);
@@ -580,6 +580,8 @@ svg { stroke: currentColor; stroke-width: 1.8; fill: none; stroke-linecap: round
   gap: 8px;
   padding: calc(var(--safe-top) + 6px) 10px 6px 6px;
   flex: none;
+  /* 实底：标题不再被页面渐变或滚动过去的内容冲淡 */
+  background: var(--bg);
 }
 .detail-heading { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .detail-title {
@@ -591,6 +593,8 @@ svg { stroke: currentColor; stroke-width: 1.8; fill: none; stroke-linecap: round
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+  /* 显式取色，不依赖继承（曾经只有继承，任何祖先改色都会让标题变淡） */
+  color: var(--text);
 }
 .detail-sub { display: flex; align-items: center; gap: 8px; }
 .detail-time { font-size: 11.5px; color: var(--text-3); }
@@ -668,6 +672,30 @@ svg { stroke: currentColor; stroke-width: 1.8; fill: none; stroke-linecap: round
   text-align: center;
 }
 .older-hint[hidden] { display: none; }
+
+/* 会话详情首屏加载中的占位行（用户明确要求：加载时界面上要看得到） */
+.msg-loading {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 0 6px;
+  font-size: 13px;
+  color: var(--text-3);
+}
+.msg-loading::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pocket-pulse 1.1s ease-in-out infinite;
+}
+@keyframes pocket-pulse {
+  0%, 100% { opacity: .25; transform: scale(.8); }
+  50% { opacity: 1; transform: scale(1); }
+}
+
 
 .msg { display: flex; flex-direction: column; max-width: 100%; }
 .msg-user { align-items: flex-end; gap: 3px; }

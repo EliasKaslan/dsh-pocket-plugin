@@ -197,6 +197,16 @@ export function visibleTasks() {
     }
     out.push(task);
   }
+  // 列表永远按"最近活动"倒序显示。
+  //
+  // 服务端已经排好序，这里再排一次是因为前端还有别的写入路径：新任务会被
+  // `unshift` 到 `store.order` 前面，实时事件也会改 `updatedAt`。只靠服务端的
+  // 顺序，这些路径会让某一行突然窜到不该在的位置。
+  out.sort((left, right) => {
+    const byUpdate = (right.updatedAt ?? 0) - (left.updatedAt ?? 0);
+    if (byUpdate !== 0) return byUpdate;
+    return String(left.id).localeCompare(String(right.id));
+  });
   return out;
 }
 
