@@ -1,0 +1,77 @@
+name: CI
+
+# 发布前的全部硬门禁。四条命令全部直接调 node，不经过 pnpm/npm run ——
+# 本机与 runner 的执行方式保持一致，脚本别名不会掩盖问题。
+#
+# 一个刻意的偏离，有原因：测试用 glob 传参（"test/unit/*.test.mjs"）而不是
+# 目录名。Node 24 把位置参数当 glob 处理，`node --test test/unit` 会去加载一个
+# 同名模块并以 MODULE_NOT_FOUND 退出；glob 形式在 22 与 24 上都成立，且某个
+# 测试目录暂时为空时不会造成假失败。
+
+on:
+  push:
+    # 只跟分支。不写 branches 的话打 tag 也会触发一次，同一个 commit 会跑两遍
+    # （已经踩过：tag 那次与分支那次结论不一致时，很难判断到底哪个是真的）。
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Node 版本下限（engines 要求 >= 22.15）
+        run: |
+          node -e 'const [a,b]=process.versions.node.split(".").map(Number); if (a<22 || (a===22 && b<15)) { console.error("需要 Node >= 22.15（package.json engines），当前 "+process.versions.node); process.exit(1); } console.log("node "+process.versions.node);'
+
+      # tools/build-shell.mjs 会读 node_modules/mqtt/dist/mqtt.min.js，
+      # 单测里的外壳用例也会真的跑一次构建，所以必须先装依赖。
+      - name: 安装依赖
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: 语法检查
+        run: node tools/check-syntax.mjs
+
+      # 用一条 glob 覆盖全部测试目录。之前这里写死了 unit/ 与 protocol/ 两个目录，
+      # 后来新增的 domain/ integration/ relay/ util/ 四条线在 CI 里会被静默跳过 ——
+      # 本地绿、CI 也绿，但 CI 根本没跑那些测试。glob 必须留在这里而不是拆成多行。
+      - name: 单元 + 协议 + 域 + 集成 + 中继测试
+        run: node --test "test/**/*.test.mjs"
+
+      - name: 浏览器端到端
+        run: node test/e2e/run.mjs
+
+      - name: 外壳产物与源码同步
+        run: node tools/build-shell.mjs --check
+
+      # package.json 的 files[] 是本包真正发布出去的范围；多写一个不存在的
+      # 路径不会报错，只会让发布物缺文件。这里提前拦住。
+      - name: 发布清单完整性（package.json files[]）
+        run: |
+          node -e 'const fs=require("node:fs"); const list=JSON.parse(fs.readFileSync("package.json","utf8")).files || []; const missing=list.filter((p)=>!fs.existsSync(p)); if (missing.length>0) { console.error("package.json files[] 指向不存在的路径："+missing.join(", ")); process.exit(1); } console.log("files[] 全部存在："+list.length+" 项");'

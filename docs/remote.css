@@ -1,0 +1,335 @@
+/* ============================================================
+   DSH Pocket · remote shell chrome
+   ------------------------------------------------------------
+   Only what the shell owns: splash, login gate, manual entry and the
+   offline banner. The application itself is styled by app.css, which is
+   loaded first so these rules win where they overlap.
+
+   Touch targets are >= 44px by design: this page is used one-handed on a
+   phone, often with a password typed in a hurry.
+   ============================================================ */
+
+.pocket-body {
+  background: #070b16;
+  color: #e6ecff;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* The icon sprite is a <symbol> sheet: hide the container itself. */
+.sprite {
+  display: none;
+}
+
+/* ------------------------------- splash -------------------------------- */
+
+.pocket-splash {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: calc(24px + env(safe-area-inset-top, 0px)) 24px calc(24px + env(safe-area-inset-bottom, 0px));
+  background: radial-gradient(120% 80% at 50% 0%, #16224a 0%, #070b16 62%);
+  color: #e6ecff;
+  font: 15px/1.5 "HarmonyOS Sans SC", -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  text-align: center;
+  transition: opacity .32s ease, visibility .32s ease;
+}
+.pocket-splash.is-hidden {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+.pocket-splash-mark {
+  position: relative;
+  width: 74px;
+  height: 74px;
+  border-radius: 22px;
+  background: linear-gradient(135deg, #5b8cff, #8b5cf6);
+  box-shadow: 0 18px 50px rgba(91, 140, 255, .38);
+}
+.pocket-orbit {
+  position: absolute;
+  inset: 12px;
+  border-radius: 50%;
+  border: 3px solid transparent;
+  border-top-color: rgba(255, 255, 255, .95);
+  border-right-color: rgba(255, 255, 255, .45);
+  animation: pocket-spin 1.1s linear infinite;
+}
+@keyframes pocket-spin {
+  to { transform: rotate(360deg); }
+}
+.pocket-splash-title {
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: .2px;
+  max-width: 86vw;
+}
+.pocket-splash-sub {
+  font-size: 13px;
+  color: rgba(230, 236, 255, .62);
+  max-width: 82vw;
+}
+.pocket-splash.is-error .pocket-splash-mark {
+  background: linear-gradient(135deg, #b3261e, #7a1a15);
+  box-shadow: none;
+}
+.pocket-splash.is-error .pocket-orbit {
+  animation: none;
+  border-top-color: rgba(255, 255, 255, .35);
+  border-right-color: transparent;
+}
+.pocket-splash.is-error .pocket-splash-title {
+  color: #ffb4b4;
+}
+.pocket-splash-extra {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: center;
+  margin-top: 6px;
+}
+.pocket-splash-extra:empty {
+  display: none;
+}
+
+/* ----------------------------- gate / cards ----------------------------- */
+
+.pocket-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: calc(20px + env(safe-area-inset-top, 0px)) 18px calc(20px + env(safe-area-inset-bottom, 0px));
+  overflow-y: auto;
+  background: radial-gradient(120% 80% at 50% 0%, #16224a 0%, #070b16 62%);
+  color: #e6ecff;
+  font: 15px/1.6 "HarmonyOS Sans SC", -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  -webkit-overflow-scrolling: touch;
+}
+
+.pocket-card {
+  width: min(420px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 26px 22px 24px;
+  border-radius: 22px;
+  background: #10151f;
+  border: 1px solid rgba(255, 255, 255, .09);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .5);
+}
+
+.pocket-mark {
+  width: 44px;
+  height: 44px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #5b8cff, #8b5cf6);
+  box-shadow: 0 10px 26px rgba(91, 140, 255, .35);
+  margin-bottom: 2px;
+}
+
+.pocket-title {
+  margin: 0;
+  font-size: 22px;
+  line-height: 1.3;
+  font-weight: 700;
+  letter-spacing: .2px;
+}
+
+.pocket-sub {
+  margin: 0 0 6px;
+  font-size: 13px;
+  color: rgba(230, 236, 255, .66);
+}
+
+.pocket-label {
+  font-size: 12px;
+  letter-spacing: .4px;
+  color: rgba(230, 236, 255, .55);
+  margin-top: 2px;
+}
+
+.pocket-input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 48px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, .16);
+  background: rgba(0, 0, 0, .34);
+  color: inherit;
+  /* 16px keeps iOS from zooming the viewport on focus. */
+  font: inherit;
+  font-size: 16px;
+}
+.pocket-input::placeholder {
+  color: rgba(230, 236, 255, .34);
+}
+.pocket-input:focus {
+  outline: none;
+  border-color: #5b8cff;
+  box-shadow: 0 0 0 3px rgba(91, 140, 255, .22);
+}
+
+.pocket-passwrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.pocket-passwrap .pocket-input {
+  padding-right: 78px;
+}
+.pocket-reveal {
+  position: absolute;
+  right: 6px;
+  min-width: 64px;
+  min-height: 44px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, .08);
+  color: rgba(230, 236, 255, .86);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.pocket-reveal:active {
+  background: rgba(255, 255, 255, .16);
+}
+
+.pocket-remember {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  font-size: 14px;
+  color: rgba(230, 236, 255, .8);
+  cursor: pointer;
+}
+.pocket-remember input {
+  width: 22px;
+  height: 22px;
+  margin: 0;
+  accent-color: #5b8cff;
+  flex: 0 0 auto;
+}
+
+.pocket-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: rgba(230, 236, 255, .45);
+  word-break: break-word;
+}
+
+/* 链接不完整时的即时反馈：以前是静默 return，用户只会觉得"点了没反应" */
+.pocket-note-error {
+  color: #ffb4c0;
+}
+
+.pocket-error {
+  margin: 0;
+  min-height: 20px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #ff9a95;
+}
+.pocket-error:empty {
+  display: none;
+}
+
+/* -------------------------------- buttons ------------------------------- */
+
+.pocket-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 50px;
+  padding: 0 20px;
+  border: 0;
+  border-radius: 13px;
+  font: inherit;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform .06s ease, filter .16s ease;
+}
+.pocket-btn:active {
+  transform: scale(.99);
+}
+.pocket-btn[disabled] {
+  opacity: .6;
+  pointer-events: none;
+}
+.pocket-btn-primary {
+  width: 100%;
+  margin-top: 4px;
+  color: #fff;
+  background: linear-gradient(135deg, #5b8cff, #8b5cf6);
+  box-shadow: 0 12px 28px rgba(91, 140, 255, .28);
+}
+.pocket-btn-ghost {
+  min-height: 44px;
+  color: #e6ecff;
+  background: rgba(255, 255, 255, .1);
+  border: 1px solid rgba(255, 255, 255, .16);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+/* ----------------------------- offline banner --------------------------- */
+
+.pocket-banner {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: 0;
+  z-index: 80;
+  padding: 10px 14px calc(10px + env(safe-area-inset-top, 0px));
+  padding-top: calc(10px + env(safe-area-inset-top, 0px));
+  background: #b3261e;
+  color: #fff;
+  font: 600 13px/1.5 "HarmonyOS Sans SC", -apple-system, "PingFang SC", system-ui, sans-serif;
+  text-align: center;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, .3);
+}
+
+/* -------------------------------- a11y ---------------------------------- */
+
+.pocket-btn:focus-visible,
+.pocket-reveal:focus-visible,
+.pocket-remember:focus-within,
+.pocket-input:focus-visible {
+  outline: 2px solid #8db4ff;
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pocket-orbit {
+    animation: none;
+  }
+  .pocket-splash,
+  .pocket-btn {
+    transition: none;
+  }
+}
+
+/* ============================================================
+   浅色主题：外壳的 body 默认色必须跟着切
+   ------------------------------------------------------------
+   .pocket-body 把背景/前景写死成了深色主题值（#070b16 / #e6ecff），
+   而 App 的卡片会跟随主题变白 —— 白卡片上的字继承了近白色，
+   实测 .stat-value 对比度只有 1.18，标题几乎看不见。
+   splash 与登录闸门自带深色渐变底，不受这一条影响。
+   ============================================================ */
+:root[data-theme="light"] .pocket-body {
+  background: #f4f6fb;
+  color: #0f172a;
+}

@@ -1,0 +1,73 @@
+{
+  "name": "dsh-pocket-plugin",
+  "version": "1.0.0",
+  "description": "DSH 随行：用手机在任何网络看与控电脑上的 DeepSeek Harness —— 端到端加密中继、电脑零公网暴露、扫码即用。",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "dsh-bundle",
+    "remote-control",
+    "mobile",
+    "e2ee",
+    "mqtt"
+  ],
+  "type": "module",
+  "main": "lib/index.mjs",
+  "exports": {
+    ".": "./lib/index.mjs",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "dsh-pocket-plugin": "./bin/cli.mjs"
+  },
+  "files": [
+    "lib",
+    "web",
+    "remote",
+    "docs",
+    "tools",
+    "bin",
+    "cordis.patch.yml",
+    "README.md",
+    "INSTALL.md",
+    "SECURITY.md",
+    "THIRD-PARTY-NOTICES.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build:shell": "node tools/build-shell.mjs",
+    "check:shell": "node tools/build-shell.mjs --check",
+    "check:syntax": "node tools/check-syntax.mjs",
+    "dev": "node tools/dev-server.mjs",
+    "mock": "node tools/mock-host.mjs",
+    "auth": "node tools/set-auth.mjs",
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "test:e2e": "node test/e2e/run.mjs",
+    "test:all": "node --test \"test/**/*.test.mjs\" && node test/e2e/run.mjs",
+    "verify": "node tools/check-syntax.mjs && node --test \"test/**/*.test.mjs\" && node test/e2e/run.mjs && node tools/build-shell.mjs --check",
+    "start": "node bin/cli.mjs"
+  },
+  "dependencies": {
+    "mqtt": "5.16.1",
+    "ws": "8.22.0"
+  },
+  "engines": {
+    "node": ">=22.15",
+    "dsh": ">=0.2.2-rc.2"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EliasKaslan/dsh-pocket-plugin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/EliasKaslan/dsh-pocket-plugin/issues"
+  },
+  "homepage": "https://github.com/EliasKaslan/dsh-pocket-plugin#readme"
+}
