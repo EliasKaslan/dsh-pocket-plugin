@@ -1,4 +1,4 @@
-# DSH 随行（dsh-pocket-plugin）· 插件行  ·  v1.0.1
+# DSH 随行（dsh-pocket-plugin）· 插件行  ·  v1.0.2
 #
 # 作为一个 DSH bundle 安装时，这一行由 bundle 自带，无需手写。
 # 用 `dsh plugin add <源>` 安装后，profile 的 package.json 会多一条依赖，

@@ -94,7 +94,7 @@
 
 → **成立**。逐帧、无状态鉴权，重启后仍有效。
 
-**残余**（2026-11-11 审计实测，代码版本 1.0.1）：
+**残余**（2026-11-11 审计实测，代码版本 1.0.2）：
 
 - **重放闸的覆盖范围**：只有会触发动作的 `req` 与 `ws.open` 走 `CloudLink.checkFreshness()`；
   `ws.msg` / `ws.close` 不带 `ts` / `seq`。上行隧道只收 `ping` / `resync` 且隧道 id 随机，
@@ -258,7 +258,7 @@ Get-NetTCPConnection -State Listen |
 
 ## 8. 范围、版本与披露
 
-- 审阅对象：`dsh-pocket-plugin` **1.0.1**；宿主 `@deepseek-ai/dsh-desktop` **0.2.2-rc.2**
+- 审阅对象：`dsh-pocket-plugin` **1.0.2**；宿主 `@deepseek-ai/dsh-desktop` **0.2.2-rc.2**
   （本机安装目录 `D:\tools\dsh\resources\app.asar`）。
 - 方法：源码静态审计 + 本机运行时测量（监听表、进程归属、插件回环接口）。
 - 未覆盖：宿主打包产物的二进制差异；MQTT broker 自身安全；手机端浏览器/系统的实现；

@@ -1,6 +1,6 @@
 {
   "name": "dsh-pocket-plugin",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "DSH 随行：用手机在任何网络看与控电脑上的 DeepSeek Harness —— 端到端加密中继、电脑零公网暴露、扫码即用。",
   "keywords": [
     "dsh",

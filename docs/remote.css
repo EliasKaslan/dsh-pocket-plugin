@@ -1,9 +1,9 @@
 /* ============================================================
    DSH Pocket · remote shell chrome
    ------------------------------------------------------------
-   Only what the shell owns: splash, login gate, manual entry and the
-   offline banner. The application itself is styled by app.css, which is
-   loaded first so these rules win where they overlap.
+   Only what the shell owns: splash, login gate, manual entry, the offline
+   banner and the relay diagnostics card. The application itself is styled by
+   app.css, which is loaded first so these rules win where they overlap.
 
    Touch targets are >= 44px by design: this page is used one-handed on a
    phone, often with a password typed in a hurry.
@@ -299,6 +299,137 @@
   font: 600 13px/1.5 "HarmonyOS Sans SC", -apple-system, "PingFang SC", system-ui, sans-serif;
   text-align: center;
   box-shadow: 0 2px 12px rgba(0, 0, 0, .3);
+}
+
+/* ---------------------------- relay diagnostics -------------------------- */
+
+/*
+ * 连接页的「中继诊断」块（由 `web/views/connect.js` 渲染）。
+ *
+ * 只在这个文件里上样式：诊断块是**外壳专有**内容（局域网布局里没有中继，整块不
+ * 渲染），而它又必须和 splash / 横幅一样在"连不上"的现场可读，所以配色跟外壳走。
+ * 颜色一律用 app.css 的主题变量（`--surface` / `--text-3` …有浅色主题的另一套值），
+ * 只在变量缺失时给兜底值 —— 手机上"看不清"等于没有这个功能。
+ */
+.diag-card {
+  display: flex;
+  flex-direction: column;
+  margin-top: 14px;
+  padding: 14px 15px 16px;
+  border-radius: var(--radius-l, 20px);
+  border: 1px solid var(--line, rgba(255, 255, 255, .075));
+  background: var(--surface, #0e1526);
+  box-shadow: var(--shadow-2, 0 14px 34px -16px rgba(0, 0, 0, .72));
+  text-align: left;
+}
+/* `display: flex` 会盖掉浏览器默认的 [hidden]；没有这条，非中继布局里会露出空块。 */
+.diag-card[hidden] {
+  display: none;
+}
+.diag-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: .2px;
+  color: var(--text, #e9eefb);
+}
+.diag-lead {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-3, #7b88a3);
+}
+.diag-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 12px;
+}
+.diag-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.diag-label {
+  flex: 0 0 68px;
+  color: var(--text-3, #7b88a3);
+}
+.diag-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text, #e9eefb);
+  word-break: break-word;
+}
+.diag-advice {
+  margin: 12px 0 0;
+  padding: 9px 11px;
+  border-radius: 10px;
+  background: var(--warn-soft, rgba(251, 191, 36, .13));
+  color: var(--text-2, #a9b6d0);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.diag-advice:empty {
+  display: none;
+}
+.diag-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 44px; /* 单手点按的下限 */
+  margin-top: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line-strong, rgba(255, 255, 255, .15));
+  background: transparent;
+  color: var(--text, #e9eefb);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+.diag-copy:active {
+  background: rgba(255, 255, 255, .08);
+}
+/* 复制失败时退回的只读文本框（splash 上的「复制诊断信息」按钮用）。
+   手机上「长按选中」比「点一下复制」可靠，所以它必须能选、能滚、字号别太小。 */
+.pocket-diag-raw {
+  box-sizing: border-box;
+  width: 100%;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line-strong, rgba(255, 255, 255, .15));
+  background: rgba(255, 255, 255, .04);
+  color: var(--text, #e9eefb);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+  -webkit-user-select: text;
+  user-select: text;
+}
+.diag-note {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-3, #7b88a3);
+}
+/* 剪贴板不可用时的降级：可长按全选手动复制。 */
+.diag-text {
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line-strong, rgba(255, 255, 255, .15));
+  background: rgba(0, 0, 0, .34);
+  color: inherit;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 /* -------------------------------- a11y ---------------------------------- */

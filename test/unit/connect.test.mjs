@@ -50,7 +50,8 @@ class FakeElement extends FakeNode {
     else this.attrs.delete('hidden');
   }
   append(...children) { this.children.push(...children); }
-  replaceChildren() { this.children = []; }
+  /** 与真 DOM 一致：`replaceChildren(...nodes)` 是"换成这些节点"，不是"清空"。 */
+  replaceChildren(...children) { this.children = children; }
   addEventListener(type, handler) { this.listeners.set(String(type), handler); }
   focus() {}
   remove() {}
@@ -369,6 +370,166 @@ test('连接页里没有「手填地址」那套入口', async () => {
     assert.equal(banned.test(source), false, `connect.js 里还有 ${banned}`);
   }
   assert.match(source, /本页面必须从中继外壳打开/u);
+});
+
+/* ------------------------- 6. 中继诊断块（连不上时要能看） ------------------------- */
+
+/*
+ * 诊断块的存在理由就是"连不上的时候能看"，所以这几条都按**最坏情况**摆桩：
+ * 外壳已经离线、没有任何请求成功过。断因由纯函数 `web/lib/relay-diag.js` 生成
+ * （那里的映射逐条单测覆盖），这里验证的是"它真的被摆到了屏幕上、并且能复制"。
+ */
+const relayDiag = await import('../../web/lib/relay-diag.js');
+
+function withDiag(api) {
+  if (api === undefined) delete globalThis.__POCKET_DIAG__;
+  else globalThis.__POCKET_DIAG__ = api;
+}
+
+/** 真函数 + 一份"离线且刚被重置"的快照：不用桩函数重写映射表。 */
+function offlineDiagApi(extra = {}) {
+  return {
+    snapshot: () => ({
+      brokers: ['wss://broker-cn.emqx.io:8084/mqtt'],
+      online: false,
+      attempts: 3,
+      lastOkAt: Date.now() - 37_000,
+      lastAttemptAt: Date.now() - 1_000,
+      lastFailure: {
+        code: 'ECONNRESET', message: 'read ECONNRESET', connack: null,
+        at: Date.now() - 1_000, attempts: 3, okAt: Date.now() - 37_000,
+      },
+      now: Date.now(),
+      ...extra,
+    }),
+    diagRows: relayDiag.diagRows,
+    buildDiagText: relayDiag.buildDiagText,
+  };
+}
+
+/** 把 `navigator` 换成桩，返回还原函数（Node 里的 navigator 只有 getter）。 */
+function stubNavigator(value) {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  Object.defineProperty(globalThis, 'navigator', { value, configurable: true, writable: true });
+  return () => {
+    if (original === undefined) delete globalThis.navigator;
+    else Object.defineProperty(globalThis, 'navigator', original);
+  };
+}
+
+function diagCardOf(view) {
+  return view.screen.find((el) => String(el.className).includes('diag-card'));
+}
+
+function findByClass(view, needle) {
+  return view.screen.find((el) => String(el.className).includes(needle));
+}
+
+test('中继诊断：离线时照样渲染，并写出中继地址、失败次数、原因与原始 code', () => {
+  withShell({ mode: 'remote', baseUrl: 'https://dsh-remote.local' });
+  withDiag(offlineDiagApi());
+  const view = mountConnect(new FakeElement('div'), mountContext());
+
+  const card = diagCardOf(view);
+  assert.notEqual(card, null, '连接页必须有「中继诊断」块');
+  assert.equal(card.hasAttribute('hidden'), false, '离线时诊断块必须可见 —— 这正是它存在的场景');
+
+  const text = textOf(card);
+  assert.match(text, /中继诊断/u);
+  assert.match(text, /wss:\/\/broker-cn\.emqx\.io:8084\/mqtt/u, '中继地址不是密钥，必须显示');
+  assert.match(text, /3 次/u, '连续失败次数要能读到');
+  assert.match(text, /37 秒前|36 秒前|38 秒前/u, '最后成功时刻（相对时间）要能读到');
+  assert.match(text, /连接被对方重置/u, '必须说出真实断因，而不是一句「连不上」');
+  assert.match(text, /code=ECONNRESET/u, '原始 code 必须留痕（这是唯一可搜索的证据）');
+  assert.match(text, /8084/u, '建议里要说清挡住的是哪个端口');
+  assert.match(text, /复制诊断信息/u);
+
+  view.destroy();
+  withDiag(undefined);
+  withShell(undefined);
+});
+
+test('中继诊断：没有外壳接口时整块隐藏（局域网布局不该出现空的诊断块）', () => {
+  withShell({ mode: 'remote', baseUrl: 'https://dsh-remote.local' });
+  withDiag(undefined);
+  const view = mountConnect(new FakeElement('div'), mountContext());
+  assert.equal(diagCardOf(view).hasAttribute('hidden'), true);
+  view.destroy();
+  withShell(undefined);
+});
+
+test('中继诊断：复制按钮通过 clipboard 写入，且文本里没有设备令牌/房间信息', async () => {
+  withShell({ mode: 'remote', baseUrl: 'https://dsh-remote.local' });
+  // 快照里故意塞了敏感字段：诊断文本必须只取白名单字段。
+  withDiag(offlineDiagApi({ deviceToken: 'dshb_secret_token', room: 'r_secret_room', key: 'k_secret_key' }));
+  const written = [];
+  const restore = stubNavigator({
+    userAgent: 'Mozilla/5.0 (iPhone)',
+    clipboard: { writeText: async (text) => { written.push(text); } },
+  });
+  try {
+    const view = mountConnect(new FakeElement('div'), mountContext());
+    const button = findByClass(view, 'diag-copy');
+    assert.notEqual(button, null, '必须有「复制诊断信息」按钮');
+    button.listeners.get('click')();
+    await tick();
+    await tick();
+
+    assert.equal(written.length, 1, '点击后必须真的调用了 clipboard.writeText');
+    assert.match(written[0], /DSH 随行 · 中继诊断/u);
+    assert.match(written[0], /code=ECONNRESET/u);
+    assert.match(written[0], /wss:\/\/broker-cn\.emqx\.io:8084\/mqtt/u);
+    for (const secret of ['dshb_secret_token', 'r_secret_room', 'k_secret_key']) {
+      assert.equal(written[0].includes(secret), false, `诊断文本里漏出了 ${secret}`);
+    }
+    // 复制成功后不该露出降级文本框
+    assert.equal(findByClass(view, 'diag-text').hasAttribute('hidden'), true);
+    view.destroy();
+  } finally {
+    restore();
+    withDiag(undefined);
+    withShell(undefined);
+  }
+});
+
+test('中继诊断：剪贴板不可用时降级成可长按选中的文本框（手机上必须能复制）', async () => {
+  withShell({ mode: 'remote', baseUrl: 'https://dsh-remote.local' });
+  withDiag(offlineDiagApi());
+  // 真机上的典型形态：非 https / 旧 WebView 里根本没有 navigator.clipboard。
+  const restore = stubNavigator({ userAgent: 'Mozilla/5.0 (Android)' });
+  try {
+    const view = mountConnect(new FakeElement('div'), mountContext());
+    findByClass(view, 'diag-copy').listeners.get('click')();
+    await tick();
+    await tick();
+
+    const area = findByClass(view, 'diag-text');
+    assert.equal(area.hasAttribute('hidden'), false, '复制失败时必须露出可手动复制的文本框');
+    assert.match(area.value, /中继诊断/u, '文本框里必须是完整诊断文本');
+    assert.match(area.value, /code=ECONNRESET/u);
+    assert.match(textOf(view.screen), /长按/u, '要告诉用户该怎么做（长按全选）');
+    view.destroy();
+  } finally {
+    restore();
+    withDiag(undefined);
+    withShell(undefined);
+  }
+});
+
+test('中继诊断：外壳快照抛错也不能把连接页搞崩', () => {
+  withShell({ mode: 'remote', baseUrl: 'https://dsh-remote.local' });
+  withDiag({
+    snapshot: () => { throw new Error('快照炸了'); },
+    diagRows: relayDiag.diagRows,
+    buildDiagText: relayDiag.buildDiagText,
+  });
+  const view = mountConnect(new FakeElement('div'), mountContext());
+  // 连接页主体照常渲染，诊断块保持空白
+  assert.match(textOf(view.screen), /连接你的电脑/u);
+  assert.equal(view.screen.find((el) => el.className === 'diag-row'), null);
+  view.destroy();
+  withDiag(undefined);
+  withShell(undefined);
 });
 
 async function walk(dir) {

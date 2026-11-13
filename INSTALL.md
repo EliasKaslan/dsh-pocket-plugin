@@ -111,6 +111,28 @@ cmd /c mklink /J "%USERPROFILE%\.dsh\profiles\<profile>\node_modules\dsh-pocket-
 | `broker` | `wss://broker-cn.emqx.io:8084/mqtt` | 公共 MQTT broker，只承载密文。可换自建；支持数组（≤ 4 个，按序回退） |
 | `allowAnonymous` | `false` | 免口令模式。仅在你自建私有 broker 时考虑 |
 
+**换 broker 时必须让手机也换**：房间地址（`r`）与 broker 是**绑在一起**的，手机端
+把整条链接（含 `s=<broker>`）记在 `localStorage`。所以改完 `cloud.broker` 要
+**重新扫一次二维码**，否则手机会继续用记着的那台旧 broker，表现为「电脑明明在线、
+手机却一直重连」——两边各自都正常，只是不在同一台服务器上。
+
+**注意运行时切换不会持久化**：连接页 / `POST /api/v1/cloud/broker` 改的只是内存里的值
+（`CloudService.setBroker` 明确不写回 profile 配置）。插件热重载或 DSH 重启后会回到
+`cloud.broker`，而手机手里的链接还指向切换过的那个 → 又是同一个"两边各连一台"的坑。
+**要长期用就写进配置**，不要只用运行时切换。
+
+**排查「WiFi 能连、蜂窝流量连不上」**：先看手机上的断因（横幅括号里的短标签 /
+连接页「中继诊断」/ 致命页的「复制诊断信息」），再按这个顺序试：
+
+1. 断因是「连接被重置」「连接超时」→ 当前网络很可能在干扰 8084 这类非常规端口。
+   最快的验证是换一台 broker 再扫一次码（见第 6 节那一行），能连就说明是端口/路径问题。
+2. 断因是「中继拒绝了连接（返回码 5/3）」→ 公共 broker 对你的出口 IP 限流
+   （蜂窝网络是 CGNAT，一个公网 IP 背后有大量用户），换 broker 或自建。
+3. 断因是「域名解析失败」→ 当前网络的 DNS 解析不了这个域名，换 DNS 或换 broker。
+4. 都不是，或想彻底摆脱公共 broker → 自建 443 中继：反向代理（Caddy/nginx）把
+   `wss://你的域名/mqtt` 转到内网 broker 的 8083，`cloud.broker` 填
+   `wss://你的域名/mqtt`。443 是运营商不会拦的口子，这是唯一稳定的长期解。
+
 ### 4.3 设口令（手机登录用）
 
 - **推荐**：打开连接页 `http://127.0.0.1:<port>/pair`，在「账号 + 口令」卡片里设置/修改
@@ -139,7 +161,7 @@ node tools/build-shell.mjs          # 生成/刷新 docs/
 ```powershell
 # 1. 回环接口起来了，版本对，且要求登录
 Invoke-RestMethod http://127.0.0.1:47901/api/v1/health | ConvertTo-Json -Depth 4
-#   期望：started=true  ready=true  version=1.0.1  requiresLogin=true
+#   期望：started=true  ready=true  version=1.0.2  requiresLogin=true
 
 # 2. 启动日志里有监听与二维码落点
 Get-Content "$env:USERPROFILE\.dsh\pocket\bridge.log" -Tail 12
@@ -185,6 +207,7 @@ node bin/cli.mjs devices     # 列出已登记设备
 | 改了代码但行为没变 | ESM 模块缓存，热重载只重读配置不重载代码 | **冷启动 DSH**。只改配置（`cordis.patch.yml`）可以热重载 |
 | 连接页每 4 秒弹「连接已断开」 | 页面在轮询一个不存在的接口（历史版本会这样） | 当前版本已改为 `/api/v1/devices`；若是旧代码请更新 |
 | 手机一直「正在连接」但列表能刷 | WS 隧道槽位被僵尸连接占满 | 重启中继（DSH 里关掉再开远程访问）；当前版本已有槽位回收 |
+| 手机在蜂窝流量下反复「中继断开，正在重连…」（WiFi 正常） | 运营商/网络设备掐掉了 8084 端口的空闲连接（NAT/DPI），中继本身没挂 | 横幅后面现在会直接写出断因（如「连接被重置」「连接超时」）；连接页的「中继诊断」可看连续失败次数并复制诊断信息。换 WiFi 应急，长期方案是自建 443 中继（见 4.2 节的 `cloud.broker`） |
 | `npm run verify` 报执行策略错误 | 本机 PowerShell 禁止跑 `npm.ps1` | 直接调 node（见第 8 节）；注意此时 PowerShell 仍可能回 `exit 0`，是假绿 |
 
 ### 6.1 已知限制（别当成 bug 去查）
@@ -324,7 +347,7 @@ node tools/mock-host.mjs               # 假宿主，用虚构数据开发外壳
 
 ## 9. 版本策略
 
-**v1.0.0 已于 2026-11-11 发布；v1.0.1 是随后的 bugfix 发布（打包清单、市场索引、
+**v1.0.0 已于 2026-11-11 发布；v1.0.2 是随后的 bugfix 发布（打包清单、市场索引、
 CI 门禁与文档，不改协议）。** 0.x 阶段的充分自测已完成：真手机（HarmonyOS）+
 真网络下的连续进入、断线重连、向上翻页到底、流式增量、多设备并存、热重载与冷启动
 都跑过；本轮修复前的基线是 631 条单测 + 14 条 e2e 全绿（以实际输出为准）。

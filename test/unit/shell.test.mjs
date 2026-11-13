@@ -45,6 +45,8 @@ test('构建产物包含外壳需要的全部文件', async () => {
     'lib/dom.js', 'lib/format.js', 'lib/markdown.js', 'lib/net.js', 'lib/sprite.js', 'lib/ui.js',
     // 外壳自检与解除配对的纯逻辑：必须真的进产物，否则 app.js 一 import 就 404。
     'lib/shell-fresh.js', 'lib/shell-session.js',
+    // 中继断因翻译表：外壳 `remote.js` 按 ./lib/relay-diag.js 引用，缺了就是整屏白。
+    'lib/relay-diag.js',
     'views/tasks.js', 'views/detail.js', 'views/compose.js', 'views/settings.js', 'views/connect.js',
     'icons/icon-192.png', 'icons/icon-512.png',
   ];

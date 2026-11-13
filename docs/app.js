@@ -32,7 +32,7 @@ import { mountTasks } from './views/tasks.js';
 
 // 与 package.json / lib/util.mjs 的 PLUGIN_VERSION 三处必须一致
 // （test/domain/shell-realtime.test.mjs 会核对；漏改会让设置页显示旧版本号）。
-const APP_VERSION = '1.0.1';
+const APP_VERSION = '1.0.2';
 // 设置页要显示「前端版本」。它读的是 store，而 context 上的 appVersion 到不了那里，
 // 所以直接暴露一个全局值——比在 store 里再加一个字段更不容易被后续重构漏掉。
 globalThis.__POCKET_APP_VERSION__ = APP_VERSION;

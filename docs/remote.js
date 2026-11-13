@@ -33,6 +33,23 @@
      彻底作废的办法是电脑端「重置链接」——换房间后旧链接立即失效。
    ============================================================ */
 
+/*
+ * 断因的翻译表（纯函数，见 `web/lib/relay-diag.js`）。
+ *
+ * 源码在 `web/lib/`，构建后落在外壳根目录的 `./lib/relay-diag.js` —— 与下面
+ * `await import('./app.js')` 同一个规则：`web/` 与 `remote/` 的**产物**在同一层，
+ * 所以外壳里写的相对路径按产物布局来。
+ *
+ * 为什么不让连接页自己去 import 它：`web/sw.js` 的 ASSETS 是一份手写清单
+ * （那文件不在本次可改范围内），新加一条相对 import 而清单没跟上，装过 SW 的手机
+ * 首次离线打开就是模块 404、整屏白 —— `test/unit/client-guards.test.mjs` 专门钉着
+ * 这条。所以纯逻辑由外壳 import，UI 通过 `__POCKET_DIAG__` 只读地拿到它。
+ */
+import {
+  buildDiagText, describeAdvice, describeBrokerChoice, describeFailure, describeFailureShort,
+  diagRows, normalizeConnack,
+} from './lib/relay-diag.js';
+
 /* ------------------------------- constants ------------------------------ */
 
 /** Fake origin the shimmed UI believes it is talking to. */
@@ -227,15 +244,63 @@ function hideSplash() {
  * never loads, so it is the only surface we have) and offer a retry plus a
  * manual-entry escape hatch.
  */
+/**
+ * 「复制诊断信息」按钮：任何一条 `showFatal` 都带上它。
+ *
+ * 为什么连致命页也要给：最难受的场景恰恰是**一次都没连上**（这时连连接页都到不了，
+ * 只有 splash），而这一屏过去只给一个「重新加载」。用户能提供的唯一有效信息就是
+ * 截图，而截图里没有 `error.code`。把可粘贴的文本放在这里，用户长按复制一次就能把
+ * 真正的原因带出来 —— 否则永远只能靠猜是 DNS、TLS 还是被掐。
+ *
+ * 复制失败（http 页面 / 旧浏览器没有 clipboard）时退回一个可选中的只读文本框：
+ * 手机上"长按选中"比"点一下"更可靠。
+ */
+function diagCopyButton() {
+  const diag = globalThis.__POCKET_DIAG__;
+  if (diag === undefined || typeof diag.snapshot !== 'function' || typeof diag.buildDiagText !== 'function') return null;
+  const text = () => {
+    try { return diag.buildDiagText(diag.snapshot()); } catch { return '诊断信息读取失败'; }
+  };
+  const button = el('button', {
+    class: 'pocket-btn pocket-btn-ghost',
+    type: 'button',
+    text: '复制诊断信息',
+    onclick: () => {
+      const value = text();
+      const fallback = () => {
+        if (splashExtra === null) return;
+        button.remove();
+        splashExtra.append(el('textarea', {
+          class: 'pocket-diag-raw',
+          readonly: 'readonly',
+          rows: '6',
+          spellcheck: 'false',
+        }));
+        const box = splashExtra.querySelector('.pocket-diag-raw');
+        if (box !== null) { box.value = value; box.focus(); box.select?.(); }
+      };
+      try {
+        const pending = globalThis.navigator?.clipboard?.writeText(value);
+        if (pending === undefined) { fallback(); return; }
+        pending.then(() => { button.textContent = '已复制'; }, fallback);
+      } catch { fallback(); }
+    },
+  });
+  return button;
+}
+
 function showFatal(title, detail) {
   if (splash === null) return;
   splash.classList.remove('is-hidden');
   splash.classList.add('is-error');
   setSplash(title, detail ?? '');
   if (splashExtra === null) return;
-  splashExtra.replaceChildren(
+  const children = [
     el('button', { class: 'pocket-btn pocket-btn-ghost', type: 'button', text: '重新加载', onclick: () => location.reload() }),
-  );
+  ];
+  const copy = diagCopyButton();
+  if (copy !== null) children.push(copy);
+  splashExtra.replaceChildren(...children);
 }
 
 /**
@@ -675,6 +740,26 @@ class Relay {
      * 其实一直是好的。把它并入「活着的下界」，醒来重新起算。
      */
     this.lastWakeAt = 0;
+    /* ---- 可诊断性：下面这些只给界面读，不参与任何连接决策 ---- */
+    /** 最后一次成功拿到 ready 的时刻（0 = 本次打开页面还没成功过）。 */
+    this.lastOkAt = 0;
+    /** 最后一次发起建连尝试的时刻。 */
+    this.lastAttemptAt = 0;
+    /** 连续失败次数（拿到 ready 清零）。只用于诊断展示。 */
+    this.failureStreak = 0;
+    /** 本次尝试里 socket / TLS 层给的错误码；'' = 这次还没拿到。 */
+    this.lastErrorCode = '';
+    /** 本次尝试里最原始的错误信息（截断后展示，非敏感）。 */
+    this.lastErrorMessage = '';
+    /** 本次尝试里的 MQTT connack 返回码（null = 没收到 / 收到 0 表示接受）。 */
+    this.lastConnack = null;
+    /**
+     * 界面直接读的结构：`{ code, message, connack, at, attempts, okAt }`。
+     *
+     * 只放非敏感信息 —— 连接页的「复制诊断信息」会把它原样复制出去（房间密钥、
+     * 设备令牌、链接里的 `r`/`t` 一律不进来，诊断纯函数另有单测钉住）。
+     */
+    this.lastFailure = null;
     this.onhardreset = () => {};
     this.onpc = () => {};
     this.onstate = () => {};
@@ -702,6 +787,48 @@ class Relay {
     return this.seq;
   }
 
+  /**
+   * 记一次「拿到 ready」：连续失败清零，并记下时刻（诊断里显示「最后成功」）。
+   *
+   * 刻意**不**清 `lastFailure`：断过一次之后再连上，"上次为什么断"仍然是最有用的
+   * 线索，界面靠 `online` 区分「现在是好的」和「刚才为什么坏」。
+   */
+  noteRelayOk() {
+    this.lastOkAt = Date.now();
+    this.failureStreak = 0;
+  }
+
+  /**
+   * 把一次尝试的断因记进 `lastFailure`（UI 与「复制诊断信息」只读这一个结构）。
+   *
+   * 三个事件都会进来，字段互相补充（空值不覆盖已有的，因为 `error` 与 `close`
+   * 往往成对到达，先到的那个才有真信息）：
+   *   - `error`：socket / TLS 层的 code（ECONNRESET、ENOTFOUND、ERR_TLS_…）；
+   *   - `connack`：MQTT 返回码（4/5 这类「中继拒绝」只有它知道）；
+   *   - `close`：mqtt.js 的 close **可以没有参数**，所以它只负责"这次尝试确实
+   *     失败了"的记账，没有 code 时补一个 `CLOSE`，让界面至少能说清是"被关闭"
+   *     而不是「未知原因」。
+   *
+   * @param {{code?: string, message?: string, connack?: unknown}} [failure]
+   */
+  noteFailure({ code = '', message = '', connack = null } = {}) {
+    if (typeof code === 'string' && code !== '') this.lastErrorCode = code.slice(0, 80);
+    if (typeof message === 'string' && message !== '') this.lastErrorMessage = message.slice(0, 200);
+    if (connack !== null && connack !== undefined) {
+      // v4 语义叫 returnCode、MQTT 5 叫 reasonCode，两种写法都要认。
+      const reasonCode = normalizeConnack(connack);
+      if (reasonCode !== null) this.lastConnack = reasonCode;
+    }
+    this.lastFailure = {
+      code: this.lastErrorCode,
+      message: this.lastErrorMessage,
+      connack: this.lastConnack,
+      at: Date.now(),
+      attempts: this.failureStreak,
+      okAt: this.lastOkAt,
+    };
+  }
+
   /** Best estimate of the desktop's clock, in ms. */
   serverNow() {
     return Date.now() + this.clockOffset;
@@ -726,7 +853,12 @@ class Relay {
       const client = mqtt.connect(broker, {
         clientId: `pocket_${randomId(6)}`,
         clean: true,
-        keepalive: 40,
+        // 20 s（原来是 40 s）。心跳间隔必须短于运营商 NAT / DPI 的空闲回收窗口：
+        // 40 s 才发一次 PINGREQ，蜂窝链路上这条流有 40 s 的"静默窗口"等着被掐，
+        // 而 MQTT 只有在 1.5 倍 keepalive 无应答时才判死 —— 40 s 意味着最坏 60 s
+        // 才知道链路已经死了。实测「WiFi 正常、蜂窝反复断」正是这个窗口造成的；
+        // 20 s 既显著降低被掐概率，也让死链路早 20 s 被发现。
+        keepalive: 20,
         reconnectPeriod: 3_000,
         // 6 s 足够（实测本地 broker 0.35 s、公共 broker 2–3 s）。原来 12 s 意味着
         // 一次重建在两个 broker 上最多烧掉 26 s，这是「重连很久」的主要来源。
@@ -734,11 +866,29 @@ class Relay {
         protocolVersion: 4,
       });
       this.client = client;
+      // 每一次尝试都从零收集断因：上一轮的错误码不能冒充这一轮（诊断文本会被
+      // 用户当成证据复制出去）。`lastFailure` 是快照对象，不受这里清空影响。
+      this.lastAttemptAt = Date.now();
+      this.lastErrorCode = '';
+      this.lastErrorMessage = '';
+      this.lastConnack = null;
+      /** 同一次尝试只记一次连续失败：mqtt.js 的 `error` 与 `close` 往往成对到达。 */
+      let countedFailure = false;
+      const recordFailure = ({ code = '', message = '', connack = null } = {}) => {
+        if (countedFailure === false) {
+          countedFailure = true;
+          this.failureStreak += 1;
+        }
+        this.noteFailure({ code, message, connack });
+      };
       let settled = false;
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
         console.debug(`[pocket-diag] connectOne TIMEOUT broker=${broker} ready=${this.ready}`);
+        // 超时这条路**没有** error / close 可等（连接卡在半路），必须在这里记一笔，
+        // 否则手机界面上只剩「未知原因」。
+        recordFailure({ code: 'ETIMEDOUT', message: '7 秒内没有收到中继的 connack（连接超时）' });
         try { client.end(true); } catch { /* ignore */ }
         reject(new Error('连接超时'));
       }, 7_000);
@@ -752,6 +902,11 @@ class Relay {
             if (settled) return;
             settled = true;
             clearTimeout(timer);
+            // 连上了但订阅失败：也是这次尝试的断因，别让它只剩一个 CLOSE。
+            recordFailure({
+              code: typeof error?.code === 'string' ? error.code : '',
+              message: String(error?.message ?? error),
+            });
             reject(error);
             return;
           }
@@ -763,6 +918,10 @@ class Relay {
           // 的健康链路在头 2 秒里必判 stale，被自己推倒重建（实测 85 s 建了 4 条隧道）。
           this.readyAt = Date.now();
           this.downSince = 0;
+          // 诊断：记下「最后一次成功」并把连续失败清零。放在 downSince 之后是刻意的
+          // —— 上面 `ready=true → readyAt → downSince` 这段顺序被
+          // `test/domain/relay-restart` 用结构断言钉着（首连自伤那条）。
+          this.noteRelayOk();
           // Every (re)connect announces: the desktop may have restarted and
           // forgotten us. announce() self-throttles to one hello per 10 s.
           this.announce();
@@ -773,13 +932,47 @@ class Relay {
         });
       });
       client.on('message', (_topic, payload) => { void this.onMessage(payload); });
-      client.on('error', (error) => { console.warn('[pocket] mqtt error', error?.message); });
+      client.on('error', (error) => {
+        // 以前这里只 `console.warn`，而手机上没有控制台 —— 真实断因当场销毁，
+        // 用户能看到的只有一句「中继断开，正在重连…」。现在它同时落进
+        // `lastFailure`，横幅与连接页的「中继诊断」都能直接读出来。
+        const code = typeof error?.code === 'string' ? error.code : '';
+        const message = String(error?.message ?? error ?? '');
+        console.debug(`[pocket-diag] connectOne ERROR code=${code} message=${message}`);
+        recordFailure({ code, message });
+        console.warn('[pocket] mqtt error', error?.message);
+      });
+      client.on('connack', (packet) => {
+        // mqtt.js v5 把 connack 作为事件抛出来；返回码字段两代协议不同名
+        // （v4 语义 `returnCode`、MQTT 5 `reasonCode`），交给 normalizeConnack 认。
+        // 这条是「网络明明是通的，但中继不收」（返回码 4/5）唯一的证据来源。
+        const reasonCode = normalizeConnack(packet);
+        console.debug(`[pocket-diag] connectOne CONNACK code=${reasonCode}`);
+        if (reasonCode === null || reasonCode === 0) return; // 0 = 接受，正常路径
+        recordFailure({ message: `中继返回 connack ${reasonCode}`, connack: reasonCode });
+      });
       client.on('close', () => {
         console.debug(`[pocket-diag] connectOne CLOSE same=${this.client === client} ready=${this.ready}`);
         // 旧 client 在重建时会被 end(true)，它触发的 close 不该再改状态。
         if (this.client !== client) return;
         const wasReady = this.ready;
         this.ready = false;
+        // close 事件在 mqtt.js 里**可以不带参数**，所以这条路只能自己兜一句话。
+        // 两种情形分开记：
+        //   - 本来就连通（用户报的正是这条：连着被掐断）→ 不算连续失败，但记原因；
+        //     上一步的 error 若已给了具体 code（ECONNRESET…），绝不拿 CLOSE 覆盖它。
+        //   - 一直没 ready（首次连接就反复失败）→ 记一次连续失败；若 error/connack
+        //     已经记过这一次尝试，就不再重复计数。
+        if (wasReady) {
+          this.failureStreak = 0;
+          this.noteFailure(this.lastErrorCode === '' && this.lastConnack === null
+            ? { code: 'CLOSE', message: '连通的底层连接被关闭（close 事件没有错误码）' }
+            : {});
+        } else if (countedFailure === false) {
+          countedFailure = true;
+          this.failureStreak += 1;
+          this.noteFailure({ code: 'CLOSE', message: '底层连接已关闭（close 事件没有错误码）' });
+        }
         this.onstate('offline');
         this.failAll('中继连接中断');
         // **立刻**安排重连。以前这里什么都不做，全靠 26 s 静默看门狗 + 15 s 冷却，
@@ -864,6 +1057,8 @@ class Relay {
       this.readyAt = Date.now();
       this.restartCount = 0;
       this.downSince = 0;
+      // 诊断：重建成功同样是「一次成功」，连续失败清零（与 connectOne 的 ready 一致）。
+      this.noteRelayOk();
       // 上面直接把 pcStale 置了 false，true→false 的边沿被吞掉，onpcStale 不再
       // 触发，横幅「电脑端已离线 N 秒…」会永久挂着。显式通知一次已恢复。
       try { this.onpcStale(false, null); } catch { /* 界面回调不该影响重建 */ }
@@ -875,7 +1070,12 @@ class Relay {
       try { this.onstate('offline'); } catch { /* ignore */ }
       // 失败后必须排下一次重试：看门狗在 ready=false 时会跳过（避免重建风暴），
       // 如果这里不排，自愈链就断在原地 —— 界面停在「中继断开，正在重连…」其实没在连。
-      const retryDelay = Math.min(15_000, 1_000 * (2 ** Math.min(this.restartCount, 4)));
+      //
+      // 退避语义沿用原来的 1s→2s→4s→8s→16s（上限 15 s），**只**在上面叠 ±20%
+      // 抖动：一群手机被同一个 broker / 同一台运营商设备同时掐断时，没有抖动
+      // 它们会在同一毫秒一起回来，把刚恢复的中继再打趴一次（重连风暴）。
+      const backoff = Math.min(15_000, 1_000 * (2 ** Math.min(this.restartCount, 4)));
+      const retryDelay = Math.round(backoff * (0.8 + Math.random() * 0.4));
       setTimeout(() => { void this.restart('重建失败重试'); }, retryDelay);
       if (this.downSince === 0) this.downSince = Date.now();
       if (this.restartCount >= HARD_RESET_AFTER
@@ -1719,6 +1919,36 @@ async function main() {
   relay.session = await loadAuthSession();
   window.__POCKET_RELAY__ = relay;
 
+  /**
+   * 中继诊断：只读快照 + 纯函数，交给内层 UI（连接页的「中继诊断」块）。
+   *
+   * 为什么走 global 而不是让 `web/views/connect.js` 直接 import：连接页同时被
+   * 打进局域网布局，而 `web/sw.js` 的 ASSETS 是一份手写清单（不在本次可改范围），
+   * 多一条 import 而清单没跟上，装过 SW 的手机首次离线打开就是模块 404 白屏
+   * （`test/unit/client-guards` 钉着这条）。所以纯逻辑由外壳 import，UI 只读这里。
+   *
+   * 快照**只**含非敏感字段：没有房间密钥、没有设备令牌、没有链接里的 `r`/`t`。
+   * 连接页「复制诊断信息」会把 `snapshot()` 的结果直接交给 `buildDiagText()`，
+   * 那之后一个字节都不会再回到这里。
+   */
+  globalThis.__POCKET_DIAG__ = {
+    snapshot: () => ({
+      brokers: relay.brokers,
+      online: relay.ready === true,
+      attempts: relay.failureStreak,
+      lastFailure: relay.lastFailure,
+      lastOkAt: relay.lastOkAt,
+      lastAttemptAt: relay.lastAttemptAt,
+      now: Date.now(),
+    }),
+    describeFailure,
+    describeFailureShort,
+    describeBrokerChoice,
+    describeAdvice,
+    diagRows,
+    buildDiagText,
+  };
+
   // 页面被关掉 / 切到后台时，尽力把隧道关掉，别让电脑端留着僵尸槽位。
   // 手机被强杀时这段不会执行——所以电脑侧还有一层按活动时间的槽位回收。
   const release = () => closeChannels(relay);
@@ -1732,8 +1962,24 @@ async function main() {
   /** 中继层横幅的去抖计时器：短抖动不打扰。 */
   let relayBannerTimer = null;
   let staleText = null;
+  /**
+   * 横幅后半句：真实断因（读 `relay.lastFailure`，渲染时现算）。
+   *
+   * 主句保持用户已经认识的「中继断开，正在重连…」，只在后面补一个**短标签**
+   * （`（连接被重置）`）—— 横幅只有一行，带括号的完整解释在连接页的中继诊断里。
+   * 6 秒去抖照旧：短抖动期间 lastFailure 可能已经有了，但横幅根本不会显示。
+   */
+  const relayReasonSuffix = () => {
+    const failure = relay.lastFailure;
+    if (failure === null || failure === undefined) return '';
+    try {
+      return `（${describeFailureShort(failure)}）`;
+    } catch {
+      return ''; // 诊断永远不该影响主流程
+    }
+  };
   const renderBanner = () => {
-    if (relayOffline) { setBanner('中继断开，正在重连…'); return; }
+    if (relayOffline) { setBanner(`中继断开，正在重连…${relayReasonSuffix()}`); return; }
     setBanner(staleText);
   };
   relay.onstate = (state) => {
@@ -1746,7 +1992,11 @@ async function main() {
       if (relayBannerTimer === null && !wasOffline) {
         relayBannerTimer = setTimeout(() => {
           relayBannerTimer = null;
-          if (relayOffline) { setSplash('中继断开，正在重连…', '网络切换后会自行恢复'); renderBanner(); }
+          if (relayOffline) {
+            // splash 上的标题同样补上断因：连接还没成功过时，这是唯一能看到的屏幕。
+            setSplash(`中继断开，正在重连…${relayReasonSuffix()}`, '网络切换后会自行恢复');
+            renderBanner();
+          }
         }, 6_000);
       }
       return;
@@ -1778,7 +2028,16 @@ async function main() {
     await relay.connect();
   } catch (error) {
     if (earlyForm !== null) { earlyForm.closest('.pocket-login')?.remove() ?? earlyForm.remove(); }
-    showFatal('无法建立中继连接', String(error?.message ?? error));
+    // 别把 `连接超时` 这种壳话当结论：真正有用的是 `connectOne` 抓到的 error.code /
+    // connack（见 `relay.lastFailure`）。这条路径是"一次都没连上"时**唯一**的界面，
+    // 断因在这里丢掉就再也拿不回来了。
+    const raw = String(error?.message ?? error);
+    let because = raw;
+    try {
+      const described = describeFailure(relay.lastFailure);
+      if (typeof described === 'string' && described.length > 0 && described !== raw) because = `${described}（${raw}）`;
+    } catch { /* 翻译表炸了也不能盖掉原始错误 */ }
+    showFatal('无法建立中继连接', because);
     return;
   }
   relay.startStaleWatch();
