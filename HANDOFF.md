@@ -2,11 +2,14 @@
 
 > 面向下一个接手的 agent。读这一份就够，不需要翻对话记录。
 >
-> 最后更新：v1.0.0（2026-11-12）——首个公开发布版本。
+> 最后更新：v1.0.1（2026-11-13）——1.0.0 之后的一次 bugfix 发布（打包清单、市场索引、CI 门禁与文档）。
 >
-> 版本号有**三处手写副本**，改版本必须三处一起改：`package.json` 的 `version`、
-> `lib/util.mjs` 的 `PLUGIN_VERSION`（`/api/v1/health` 返回的是它）、以及
-> `cordis.patch.yml` 顶部的注释。只改 `package.json` 会让 health 一直报旧版本。
+> 版本号有**四处手写副本**，改版本必须四处一起改：`package.json` 的 `version`、
+> `lib/util.mjs` 的 `PLUGIN_VERSION`（`/api/v1/health` 返回的是它）、
+> `cordis.patch.yml` 顶部的注释、以及 `market/index.json` 里登记的 `version`。
+> 只改 `package.json` 会让 health 一直报旧版本，市场登记的版本也会和它不一致。
+> 其中 `package.json` / `PLUGIN_VERSION` / 市场那份已被 `test/protocol/packaging.test.mjs`
+> 自动拦住（CI 会跑）；`cordis.patch.yml` 顶部那行注释只能靠人改。
 
 ---
 
@@ -30,13 +33,15 @@
 
 ```powershell
 cd D:\workspace\261102_mobile_dsh\dsh-pocket
-node tools/check-syntax.mjs                    # 语法（期望：108 个文件通过）
-node --test "test/**/*.test.mjs"               # 单测+集成+中继（期望：587 pass / 0 fail）
-node test/e2e/run.mjs                          # 端到端（期望：11 pass / 0 fail）
-node tools/build-shell.mjs --check             # 外壳产物是否最新（期望：已是最新，28 个文件）
+node tools/check-syntax.mjs                    # 语法（全绿；文件数随新增文件增长，以实际输出为准）
+node --test "test/**/*.test.mjs"               # 单测+集成+中继（全绿；用例数以实际输出为准）
+node test/e2e/run.mjs                          # 端到端（全绿）
+node tools/build-shell.mjs --check             # 外壳产物是否最新（docs/ 与 web/、remote/ 的同步）
 ```
 
-现状：**四条全绿**（2026-11-11 v1.0.0 修复连接问题后复跑：108 / 587 / 11 / 最新）。
+现状：**四条全绿**。具体数字以这四条命令的实际输出为准（不要背数字，本仓新增测试很快）：
+本轮修复（v1.0.1）前的基线是 `113 / 631 / 14 / 29`；本轮新增了
+`test/protocol/packaging.test.mjs`（5 个用例）与市场/清单门禁，所以用例数只会更多。
 
 ---
 
@@ -99,7 +104,7 @@ node tools/build-shell.mjs --check             # 外壳产物是否最新（期�
 
 ### 2.5 安全模型（另一 agent 完成，已合并）
 
-- `SECURITY.md`（8 节）：不监听公网、无端口映射、密钥在 URL fragment、AES-256-GCM + AAD、逐帧鉴权、防重放、Host 闸与 relay nonce。
+- `SECURITY.md`（0–8 节 + 附录 A）：不监听公网、无端口映射、密钥在 URL fragment、AES-256-GCM + AAD、逐帧鉴权、防重放、Host 闸与 relay nonce；宿主层改为**本机实测**（2026-11-13：DSH 的监听全在 `127.0.0.1`），原先那份第三方桌面壳的分析降级为附录 A 的对照材料。
 - 代码侧加固：外壳产物校验收紧、补 WS Origin 校验、修幂等缓存串回包、`mqtt` 锁死精确版本 `5.16.1`。
 - 对应新增用例：`test/relay/replay-cache-key.test.mjs`（2 条）。
 
@@ -137,19 +142,19 @@ node tools/build-shell.mjs --check             # 外壳产物是否最新（期�
 
 - **手机端交互无法自动化**：点击、滚动、息屏恢复、Service Worker 更新，都只能靠真机反馈。
 - 浏览器端验证需要登录口令，无法在 CI 里跑；已验证的方式是本地静态服务 + 真实二维码参数。
-- 也就是说：**"569 条绿"不等于"手机上一遍过"**。每次改动建议附一句"手机上应看到什么"，让用户据此回报。
+- 也就是说：**"631+ 条绿"不等于"手机上一遍过"**。每次改动建议附一句"手机上应看到什么"，让用户据此回报。
 
 ---
 
 
-## 5. 常用操作
+## 4. 常用操作
 
 ```powershell
 # 桌面端版本与实例标识
-Invoke-RestMethod http://127.早期版本:47901/api/v1/health | % { $_.data.version, $_.data.bootId }
+Invoke-RestMethod http://127.0.0.1:47901/api/v1/health | % { $_.data.version, $_.data.bootId }
 
 # 中继状态
-Invoke-RestMethod http://127.早期版本:47901/api/v1/cloud/status | % { $_.data.state, $_.data.stats }
+Invoke-RestMethod http://127.0.0.1:47901/api/v1/cloud/status | % { $_.data.state, $_.data.stats }
 
 # 热重载（改 lib/ 之后）：plugin_manager set_bundle，先 false 再 true
 # 手机端外科刷新：关掉页面重开（Service Worker 有新构建时可能需要两次）

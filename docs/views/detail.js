@@ -92,13 +92,18 @@ export function mountDetail(root, ctx) {
   // 「回到底部」按钮靠 --composer-h 避开输入框。输入框会随换行长高，所以这里
   // 实时量真实高度写进去；不量的话按钮会压在输入框上。
   // （同一处曾经还写过 --vvh，但没有任何样式读它，已删除。）
+  //
+  // 观察器要在 destroy() 里显式摘掉：原来只在下一次 resize 回调里 disconnect，
+  // 而切走视图之后再也收不到回调 —— 观察器连同闭包里的 composer 一起留在内存里，
+  // 每进一次会话详情就多一份。
+  let composerObserver = null;
   if (typeof ResizeObserver === 'function') {
-    const observer = new ResizeObserver(() => {
-      if (composer.isConnected !== true) { observer.disconnect(); return; }
+    composerObserver = new ResizeObserver(() => {
+      if (composer.isConnected !== true) { composerObserver?.disconnect(); return; }
       const height = Math.round(composer.getBoundingClientRect().height);
       if (height > 0) document.documentElement.style.setProperty('--composer-h', `${height}px`);
     });
-    observer.observe(composer);
+    composerObserver.observe(composer);
   }
 
   input.addEventListener('keydown', (event) => {
@@ -543,9 +548,13 @@ export function mountDetail(root, ctx) {
         const card = el.querySelector('.assistant-card');
         const update = (next) => {
           const message = next.message;
-          if (message.text !== lastText) {
-            lastText = message.text;
-            body.replaceChildren(...(message.text.length > 0 ? renderMarkdown(message.text).childNodes : [h('span', { class: 'muted', text: '（没有文本输出）' })]));
+          // `message.text` 在协议里是字符串，但工具步骤 / 历史数据可能缺字段或给 null，
+          // 直接 `.trim()` / `.length` 会在渲染时抛 TypeError —— 整条会话都渲染不出来，
+          // 而且报错点在 update() 里，现场看起来像"列表莫名空白"。
+          const text = String(message.text ?? '');
+          if (text !== lastText) {
+            lastText = text;
+            body.replaceChildren(...(text.length > 0 ? renderMarkdown(text).childNodes : [h('span', { class: 'muted', text: '（没有文本输出）' })]));
           }
           if (message.reasoning !== lastReason) {
             lastReason = message.reasoning;
@@ -553,7 +562,7 @@ export function mountDetail(root, ctx) {
             if (message.reasoning) reasoningBody.textContent = message.reasoning;
           }
           // A step that only produced reasoning does not deserve a full card.
-          card.classList.toggle('compact', message.text.trim().length === 0 && Boolean(message.reasoning));
+          card.classList.toggle('compact', text.trim().length === 0 && Boolean(message.reasoning));
           modelTag.textContent = shortModel(message.model?.model ?? '');
           modelTag.hidden = !message.model?.model;
           el.dataset.at = String(Number(message.at) || 0);
@@ -754,6 +763,8 @@ export function mountDetail(root, ctx) {
     destroy() {
       viewport?.removeEventListener('resize', fitViewport);
       viewport?.removeEventListener('scroll', fitViewport);
+      // 不摘的话，观察器与它闭包里的 composer 会跟着一次会话留一辈子。
+      composerObserver?.disconnect();
       chatList.clear();
     },
   };

@@ -23,7 +23,14 @@
      外壳把它交给 app.js（`__POCKET_SHELL__.deviceToken`）。令牌只写在 app
      自己的 `dsh.pocket.*` / `pocket.*` 键里，为的是刷新页面不用重新登记一台
      设备；它在电脑端「移除设备」后立即作废 —— 外壳会把本地那份一起丢掉，
-     并要求重新用口令登录。链接里的 `r`/`k` 永不入库。
+     并要求重新用口令登录。
+   - 但**链接本身会被明文记住**（见 `storeLink()` / `LINK_KEY`）：为了让 PWA
+     从桌面图标启动（`manifest.start_url` 带不了 hash）与"浏览器退出再进来"还能
+     直接进，外壳把整条 `#r=…&k=…&t=…` 存进本机 localStorage。`k` 就是房间里
+     那把 AES-256-GCM 密钥，所以这是**把解密能力放到本机**：本页所在 origin 上
+     的任何脚本都能读到它。这正是外壳必须与 app 同源托管、且不接任何第三方脚本
+     的原因（见 `remote/index.html` 的 CSP `script-src 'self'`）。
+     彻底作废的办法是电脑端「重置链接」——换房间后旧链接立即失效。
    ============================================================ */
 
 /* ------------------------------- constants ------------------------------ */
@@ -1587,6 +1594,16 @@ function closeChannels(relay) {
  * 只存链接本身（房间、密钥、初始设备凭据），不存登录会话 —— 登录态仍由内层
  * 应用自己保管。桌面端「重置链接」后房间会变，旧值失效时外壳会照常报连不上，
  * 重新扫码即可覆盖。
+ *
+ * **这条取舍必须写在这里，不能只写在文档里**：`k` 是房间的 AES-256-GCM 密钥，
+ * `storeLink()` 把它连同整条明文链接写进本机 localStorage。这样做换来的是
+ * 「PWA 从桌面图标启动 / 浏览器丢掉 hash 之后还能直接进」，而 `manifest.start_url`
+ * 带不了 hash，除此之外没有别的办法。代价是：**本页所在 origin 上的任何脚本
+ * 都能读到这把密钥**（localStorage 没有 origin 内的隔离）。所以边界是硬的：
+ *   - 外壳必须与本页同源托管，不引第三方脚本（CSP `script-src 'self'`）；
+ *   - 能在这台手机上执行脚本的人 = 能解开这个房间的流量的人；密钥泄露的处置
+ *     方式是电脑端「重置链接」换一个房间，而不是删本地文件（删了也只是本机删掉）；
+ *   - 解除配对时一并清掉（见 `forgetSession()`），别把密钥留给下一个用这台手机的人。
  */
 const LINK_KEY = 'dsh.pocket.link.v1';
 
@@ -1607,6 +1624,16 @@ function storeLink(value) {
     if (typeof value !== 'string' || value.length === 0 || value.length > 4096) return;
     globalThis.localStorage?.setItem(LINK_KEY, value);
   } catch { /* 隐私模式：不记住也能用，只是下次要重新扫码 */ }
+}
+
+/**
+ * 忘掉记住的链接（解除配对时用）。
+ *
+ * 只删本机这一份；真正让旧链接作废的是电脑端「重置链接」——房间变了，
+ * 别人手里那条旧链接连房间都进不去。
+ */
+function dropStoredLink() {
+  try { globalThis.localStorage?.removeItem(LINK_KEY); } catch { /* 隐私模式 */ }
 }
 
 async function main() {
@@ -1925,6 +1952,28 @@ async function main() {
           persistDeviceSession(relay.deviceToken, relay.deviceId, { name, room });
           location.reload();
         });
+    },
+    /**
+     * 彻底忘掉这台手机与当前电脑的配对（设置页「换一台电脑」/ 解除配对）。
+     *
+     * 必须由外层调用：app.js 只清得掉自己的 `dsh.pocket.session.v1`，而设备
+     * 令牌的真身在**外壳**这里 —— `persistDeviceSession()` 同时写了
+     * `pocket.session.v1`，`main()` 开头又会 `readDeviceSession()` 把它读回来
+     * 塞进 `relay.deviceToken`。不在这里清，用户确认"已断开"之后一刷新，
+     * `adoptShellSession()` 就把旧令牌重新采纳，等于没解除配对。
+     *
+     * 一起清掉的三样东西，缺一样都能把旧配对"复活"：
+     *   1. 设备令牌（两份键名 + 历史键）—— 否则刷新即复活；
+     *   2. 登录会话（口令换来的凭据）—— 设置页对用户的承诺是"登录信息会被清除"；
+     *   3. 记住的链接（含房间密钥）—— 否则下一个用这台手机的人还能进这个房间。
+     */
+    forgetSession() {
+      clearDeviceSession();
+      clearAuthSession();
+      relay.dropDevice('');
+      dropStoredLink();
+      // 地址栏里那段 `#r=…&k=…` 也一起去掉：留着的话它仍是可分享、可恢复的入口。
+      try { history.replaceState(null, '', location.pathname + location.search); } catch { /* 老浏览器 */ }
     },
   };
 

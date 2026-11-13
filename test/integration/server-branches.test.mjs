@@ -278,7 +278,10 @@ test('handle 的 catch：API 出口回 500 JSON，静态出口回 500 纯文本�
     const body = JSON.parse(response.body);
     assert.equal(body.ok, false);
     assert.equal(body.error.code, 'internal');
-    assert.equal(body.error.message, 'snapshot exploded');
+    // `internal` 是兜底桶，它的 message 是内部报错原文（常含绝对路径），
+    // 不能回给手机：只有 ERROR_STATUS 里的语义 code 才原样回显 message。
+    // 原文仍要进日志（下面那条断言）。
+    assert.equal(body.error.message, '服务内部错误');
     assert.equal(response.headers['cache-control'], 'no-store');
     expectSecurityHeaders(response, 'API 500');
     assert.ok(ctx.logs.some((line) => line.includes('request failed GET /api/v1/tasks')));

@@ -39,9 +39,20 @@ function makeContext() {
   return { core, dataDir, logger, home };
 }
 
+/**
+ * 造一个 CloudService。
+ *
+ * `cloud.enabled` 的默认值已改为**关闭**（与 `cordis.patch.yml` / `INSTALL.md`
+ * 的"默认关闭"一致，见 lib/cloud-service.mjs）：省略该键就是不开。这个文件里的
+ * 用例绝大多数在验证"启用之后"的路径，所以这里给普通对象配置补上
+ * `enabled: true`；要断言真实默认值的用例直接 `new CloudService(...)`
+ * （见"构造：没有 cloud.enabled 时默认关闭"）。
+ */
 function makeService(context, config = {}, { auth, authRequired } = {}) {
+  const plain = config !== null && typeof config === 'object' && !Array.isArray(config);
+  const resolved = plain && !('enabled' in config) ? { enabled: true, ...config } : config;
   const service = new CloudService(context.core, {
-    logger: context.logger, dataDir: context.dataDir, config, auth, authRequired,
+    logger: context.logger, dataDir: context.dataDir, config: resolved, auth, authRequired,
   });
   context.service = service;
   return service;
@@ -92,12 +103,19 @@ after(() => {
 test('构造：broker 归一化（去重 / 跳过非字符串与非法 scheme / 空值回退默认 / 最多 4 个）', () => {
   const context = makeContext();
 
-  const defaults = makeService(context, {});
+  // 默认值用**直接构造**（makeService 会补 enabled: true），否则测不到真默认。
+  // 期望值变更（R8）：以前省略 `cloud.enabled` 等于启用（`!== false`），与
+  // cordis.patch.yml / INSTALL.md 写的"默认关闭"相反 —— 现在省略就是关闭。
+  const defaults = new CloudService(context.core, {
+    logger: context.logger, dataDir: context.dataDir, config: {},
+  });
+  context.service = defaults;
   assert.deepEqual(defaults.config.broker, ['wss://broker-cn.emqx.io:8084/mqtt'], '没有配置时回退 DEFAULT_BROKERS');
-  assert.equal(defaults.config.enabled, true, '默认启用');
+  assert.equal(defaults.config.enabled, false, '默认关闭：省略 cloud.enabled 不许悄悄打开对公网的通路');
   assert.equal(defaults.config.allowAnonymous, false, '匿名模式必须显式开启');
-  assert.equal(defaults.state, 'idle');
+  assert.equal(defaults.state, 'disabled', '默认关闭 ⇒ 构造后就是 disabled');
   assert.equal(defaults.enabled, false);
+  assert.equal(defaults.start(47901), 'disabled', '默认关闭时 start() 必须直接落 disabled');
 
   const list = makeService(context, {
     broker: [
@@ -145,10 +163,14 @@ test('构造：enabled=false 直接落 disabled 状态；非对象 config 当作
   assert.equal(off.state, 'disabled');
   assert.equal(off.config.enabled, false);
 
+  // 非对象 config 当作 `{}`：按新默认值（R8）是**关闭**，不是启用。
+  // 这里直接构造（makeService 的默认参数会把 undefined 变成 {}，测不到 null/undefined 原样）。
   for (const config of [null, undefined, 'nope', 42, []]) {
-    const service = makeService(context, config);
-    assert.equal(service.config.enabled, true, `config=${String(config)} 不该把服务搞崩`);
-    assert.equal(service.state, 'idle');
+    const service = new CloudService(context.core, {
+      logger: context.logger, dataDir: context.dataDir, config,
+    });
+    assert.equal(service.config.enabled, false, `config=${String(config)} 不该把服务搞崩，也不该被当成启用`);
+    assert.equal(service.state, 'disabled');
   }
 });
 

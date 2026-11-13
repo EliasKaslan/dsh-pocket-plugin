@@ -20,7 +20,8 @@ import { zstdCompressSync } from 'node:zlib';
 import { after, test } from 'node:test';
 
 import { reasonText } from '../../lib/messages.mjs';
-import { TaskIndex } from '../../lib/task-index.mjs';
+import { scanSessionFiles } from '../../lib/session-files.mjs';
+import { LIST_PREVIEW_CHARS, TaskIndex } from '../../lib/task-index.mjs';
 
 const tmpRoot = path.join(tmpdir(), `dsh-pocket-task-index-${process.pid}-${Date.now()}`);
 const indexes = [];
@@ -468,12 +469,13 @@ test('applyTail：mtime 未变则跳过读盘；文件为空/zstd 损坏时安�
   await index.applyTail(taskB);
   assert.deepEqual({ title: taskB.title, titleSource: taskB.titleSource }, before);
 
-  // 有内容但没有 zstd 帧（纯 JSONL）→ 也返回 undefined，不抛
+  // 有内容但没有 zstd 帧（纯 JSONL）——未压缩会话就是这种格式，必须被读出来
+  // （过去这里恒返回 undefined，于是这类会话永远没有标题/状态/预览）。
   const plainFile = path.join(home, 'plain.jsonl');
   await writeFile(plainFile, `${JSON.stringify({ type: 'session/title', data: { title: 'x' } })}\n`);
   const taskC = index.upsertRow(row({ id: 'plain', createdAt: 1 }), { file: plainFile, mtimeMs: 1 });
   await index.applyTail(taskC);
-  assert.equal(taskC.title, '');
+  assert.equal(taskC.title, 'x', '纯 JSONL 也是合法日志，标题必须被读出来');
 });
 
 test('applyTail：turn/end 的每种 reason.kind 映射到正确的状态', async () => {
@@ -516,6 +518,68 @@ test('applyTail：reason 不是对象 / 畸形数据不抛，status 落到 idle'
     assert.equal(task.status, 'idle');
     assert.equal(task.turn, 2);
   }
+});
+
+/*
+ * 尾部窗口太窄的后果：真实语料每帧只装 1~3 条事件，旧的 12 帧窗口遇到"收尾之后
+ * 又跑了很多步"的会话就读不到最后一个 `turn/end`，冷会话的 status / turn 号
+ * 停在上一个回合（实测有列表显示已完成、详情却是 none 的会话）。
+ */
+test('applyTail：turn/end 落在老 12 帧窗口之外时，状态与 turn 号仍是最新回合的', async () => {
+  const home = await makeHome();
+  const dir = path.join(home, 'sessions', 'workspace', 'long-turn');
+  await mkdir(dir, { recursive: true });
+  const file = path.join(dir, 'session.jsonl.zstd');
+  const frames = [];
+  const pushFrame = (events) => frames.push(zstdCompressSync(
+    Buffer.from(`${events.map((event) => JSON.stringify(event)).join('\n')}\n`, 'utf8'),
+  ));
+  pushFrame([
+    { type: 'turn/start', seq: 1, data: { turn: 3 } },
+    { type: 'user/message', seq: 2, data: { content: '第三轮' } },
+    { type: 'turn/end', seq: 3, data: { turn: 3, reason: { kind: 'completed' } } },
+  ]);
+  // 收尾之后又追加 20 帧（每帧 1 条）：模拟"下一轮已经跑了很多步但还没收尾"。
+  for (let i = 0; i < 20; i += 1) {
+    pushFrame([{ type: 'tool/result', seq: 4 + i, data: { message: { toolCallId: `c${i}`, content: 'x' } } }]);
+  }
+  await writeFile(file, Buffer.concat(frames));
+
+  const { index } = await makeIndex({ home, services: { sessionQuery: { async listSessions() { return []; } } } });
+  const task = index.upsertRow(row({ id: 'long-turn', createdAt: 1 }), { file, mtimeMs: 1 });
+  await index.applyTail(task);
+  assert.equal(task.status, 'done', '状态必须来自最后一个 turn/end(completed→done)，不是默认 idle');
+  assert.equal(task.turn, 3, 'turn 号不许停在旧值');
+});
+
+/*
+ * 未压缩 / 旧版会话写的是纯文本 `session*.jsonl`。`scanSessionFiles` 一直认它，
+ * 但读取侧过去只在找到 zstd magic 后才解析 —— 这类会话在列表里永远没有状态、
+ * 标题、预览，`applyTail` 静默 return，既无日志也无报错。
+ */
+test('applyTail：未压缩的纯文本 session.jsonl 也能填出标题/状态/正文预览', async () => {
+  const home = await makeHome();
+  const dir = path.join(home, 'sessions', 'workspace', 'plain-log');
+  await mkdir(dir, { recursive: true });
+  const file = path.join(dir, 'session.jsonl');
+  const lines = [
+    { type: 'session/title', seq: 1, data: { title: '纯文本会话标题' } },
+    { type: 'turn/start', seq: 2, data: { turn: 1 } },
+    { type: 'user/message', seq: 3, data: { content: '未压缩日志里的用户消息', source: { kind: 'user' } } },
+    { type: 'assistant/message', seq: 4, data: { message: { content: '未压缩日志里的回答' } } },
+    { type: 'turn/end', seq: 5, data: { turn: 1, reason: { kind: 'completed' } } },
+  ];
+  await writeFile(file, `${lines.map((line) => JSON.stringify(line)).join('\n')}\n`);
+
+  const entry = scanSessionFiles(home).get('plain-log');
+  assert.equal(entry?.file, file, 'scanSessionFiles 一直把纯 JSONL 当合法日志');
+  const { index } = await makeIndex({ home, services: { sessionQuery: { async listSessions() { return []; } } } });
+  const task = index.upsertRow(row({ id: 'plain-log', createdAt: 1 }), entry);
+  await index.applyTail(task);
+  assert.equal(task.title, '纯文本会话标题', '标题必须读得出来');
+  assert.equal(task.status, 'done', '状态必须读得出来');
+  assert.equal(task.turn, 1);
+  assert.equal(task.lastText, '未压缩日志里的回答', '正文预览必须读得出来');
 });
 
 test('loadTails：并发 6 路、跳过 live 与无文件任务、单个失败不拖垮整批', async () => {
@@ -659,6 +723,34 @@ test('handleEvent：session/error 与 error 置错误态并给出可读原因', 
   assert.equal(task.statusReason, '执行出错', '没有 message 时给固定兜底文案');
 });
 
+/*
+ * live 事件是旁路：它不经过 buildTranscript（那里才有 6000 字符/条的单条闸），
+ * 所以不在这里裁，一条 100k 字符的正文（桌面粘贴、模型整篇输出）会原样进中继；
+ * 而中继单消息最多 64 帧 × 64 KiB，超了根本发不出去，手机端只能等超时。
+ */
+test('handleEvent：live 事件正文在 emit 前就被裁到单条上限（中继发不出去的大消息）', async () => {
+  const { index, emitted } = await makeIndex({ services: { sessionQuery: { async listSessions() { return []; } } } });
+  const session = { id: 'live-big', header: { id: 'live-big' } };
+  index.handleEvent(session, { type: 'turn/start', data: { turn: 1 } });
+  const huge = 'x'.repeat(100_000);
+  index.handleEvent(session, { type: 'user/message', data: { content: huge, source: { kind: 'user' } } });
+  index.handleEvent(session, { type: 'assistant/message', data: { message: { content: `y${huge}` } } });
+
+  // turn/start 也会 emit 一条空正文的分隔线，这里只看带正文的那两条。
+  const frames = emitted
+    .filter((frame) => frame.type === 'task.message')
+    .filter((frame) => frame.payload.message.text.length > 0);
+  assert.equal(frames.length, 2);
+  for (const frame of frames) {
+    const text = frame.payload.message.text;
+    assert.ok(text.length < 10_000, `live 正文必须先裁再 emit（中继预算 64 帧×64 KiB），实际 ${text.length}`);
+    assert.match(text, /内容过长，已截断/u, '裁剪必须留下可读的截断说明');
+    assert.ok(text.startsWith('y') || text.startsWith('x'), '保留的是开头（认得是哪条消息）');
+  }
+  // 索引里的预览本来就只有一行/220 字，这条路径不受影响。
+  assert.ok(index.getTask('live-big').lastText.length <= 221);
+});
+
 test('handleEvent：畸形输入（无 id / 非对象事件 / header 缺失）一律静默返回', async () => {
   const { index, emitted } = await makeIndex({ services: { sessionQuery: { async listSessions() { return []; } } } });
   index.handleEvent({}, { type: 'turn/start' });
@@ -776,6 +868,21 @@ test('snapshot：q 在 title/cwd/lastText 三个字段里做大小写无关的�
   assert.deepEqual(index.snapshot({ q: 'websocket' }).tasks.map((task) => task.id), ['idle-1']);
   assert.deepEqual(index.snapshot({ q: '  不存在的词  ' }).tasks, []);
   assert.equal(index.snapshot({ q: 42 }).tasks.length, 5, '非字符串 q 被忽略');
+});
+
+test('snapshot：lastText 预览按码点截断，emoji 不会被切成孤立代理项', async () => {
+  const { index } = await makeIndex({ services: { sessionQuery: { async listSessions() { return []; } } } });
+  const task = index.upsertRow(row({ id: 'emoji-1', createdAt: 1 }));
+  // 95 个 'a' + 一个 emoji：第 96 个码元正好是 emoji 的高代理项（代理对中间）。
+  task.lastText = `${'a'.repeat(95)}😀尾巴`;
+  const listed = index.publicTask(task);
+  assert.ok(listed.lastText.length <= LIST_PREVIEW_CHARS + 1, '预览长度上限不变');
+  assert.equal(listed.lastText, `${'a'.repeat(95)}…`, '切点落在代理对中间时退一位，而不是留半个 emoji');
+  assert.equal(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/u.test(listed.lastText), false, '不许出现孤立高代理项（手机端是 �）');
+
+  // 预览本来就没超长时保持原样，不额外动刀。
+  task.lastText = '短的 😀 预览';
+  assert.equal(index.publicTask(task).lastText, '短的 😀 预览');
 });
 
 test('snapshot：limit/offset 的边界（0、负数、非数字、超 500）', async () => {
@@ -905,7 +1012,10 @@ test('detail：非 live 任务走 readSurface；surface 抛错但有文件时降
   assert.deepEqual(detail.messages.map((message) => message.text), ['尾巴里的用户消息', '尾巴里的回答']);
   assert.ok(logger.lines.some((line) => line.includes('tail read failed')) === false);
 
-  // 没有文件时把原始错误抛出去
+  // 没有文件可降级时也**不许**把整页打成 500：日志被清理 / 换过 DSH_HOME /
+  // cwd 目录名不匹配 / 会话目录是符号链接（Dirent.isDirectory() 对 symlink 为
+  // false）都可能让 `scanSessionFiles` mapping 缺失，此时抛错会让手机端整页打不开，
+  // 连标题、子任务、待答卡片一起消失。
   const bare = await makeIndex({
     services: {
       sessionQuery: {
@@ -915,7 +1025,19 @@ test('detail：非 live 任务走 readSurface；surface 抛错但有文件时降
     },
   });
   bare.index.upsertRow(row({ id: 'cold-2', createdAt: 1 }));
-  await assert.rejects(bare.index.detail('cold-2'), /no fallback for me/u);
+  const empty = await bare.index.detail('cold-2');
+  assert.equal(empty.degraded, true, '无文件可降级时必须显式标记 degraded');
+  assert.deepEqual(empty.messages, [], '正文为空，但页面结构仍然完整');
+  assert.equal(empty.hasMore, false);
+  assert.equal(empty.cursorLost, false);
+  assert.equal(empty.task.id, 'cold-2', '标题等元信息照常给手机');
+  assert.equal(empty.task.title.length > 0, true);
+
+  // 降级告警只打一次：手机在流式期间每 220ms 轮询一次详情，逐条告警会刷满日志。
+  bare.index.upsertRow(row({ id: 'cold-3', createdAt: 2 }));
+  assert.equal((await bare.index.detail('cold-3')).degraded, true);
+  assert.equal(bare.logger.lines.filter((line) => line.includes('degrades to empty')).length, 1,
+    '降级告警必须只打一次');
 });
 
 test('detail：转录缓存超过 8 条时淘汰最久没用的', async () => {
@@ -938,6 +1060,45 @@ test('detail：转录缓存超过 8 条时淘汰最久没用的', async () => {
 
   await index.detail('cache-0');
   assert.equal(calls, 10, '被淘汰的任务必须重新读 surface');
+});
+
+/*
+ * 只有条数闸挡不住体积：单条 6000 字上限 × 单份最多 5000 条 × 8 份 ≈ 理论 240 MB
+ * 常驻。所以缓存同时守字节预算，超预算按最久未用淘汰（Map 插入顺序就是 LRU 顺序）。
+ * 这里用 `config.transcriptCacheBytes` 把预算调到几 KB，在几十条消息的规模上验证。
+ */
+test('detail：转录缓存还有字节预算，超预算时淘汰最久没用的那份', async () => {
+  const makeEvents = (tag) => [
+    { seq: 1, type: 'user/message', data: { content: `${tag}${'u'.repeat(600)}`, source: { kind: 'user' } } },
+    { seq: 2, type: 'assistant/message', data: { message: { content: 'a'.repeat(600) } } },
+  ];
+  let calls = 0;
+  const { index } = await makeIndex({
+    // 每份转录约 2 ×（600 字 × 2 字节 + 64 B 开销）≈ 2.5 KB，预算 6 KB 只够留两份。
+    config: { transcriptCacheBytes: 6_000 },
+    services: {
+      sessionQuery: {
+        async listSessions() { return []; },
+        async readSurface(id) { calls += 1; return { events: makeEvents(id), capturedThroughSeq: calls }; },
+      },
+    },
+  });
+  for (const id of ['byte-a', 'byte-b']) {
+    index.upsertRow(row({ id, createdAt: 1 }));
+    await index.detail(id);
+  }
+  assert.deepEqual([...index.transcripts.keys()], ['byte-a', 'byte-b'], '没超预算时两份都留着');
+  assert.ok(index.transcriptBytes > 0, '字节用量必须被记着');
+
+  // 命中 A 的缓存 → A 被挪到 LRU 队尾；再建 C 时被淘汰的必须是 B。
+  await index.detail('byte-a');
+  assert.equal(calls, 2, '命中缓存不该重读 surface');
+  index.upsertRow(row({ id: 'byte-c', createdAt: 3 }));
+  await index.detail('byte-c');
+
+  assert.deepEqual([...index.transcripts.keys()], ['byte-a', 'byte-c'], '超预算时必须淘汰最久没用的那份');
+  assert.equal(index.transcripts.has('byte-b'), false);
+  assert.ok(index.transcriptBytes <= 6_000, `字节预算必须被守住，实际 ${index.transcriptBytes}`);
 });
 
 test('detail：children 只含索引里真实存在的子任务', async () => {
@@ -1379,16 +1540,15 @@ test('createTask：followup 失败 → 任务置 error、抛出原始错误、�
   assert.equal(retried.reused, false);
   assert.equal(retried.task.id, 'session-ok');
 
-  // 现状：幂等键记的是「请求时生成的 sessionId」，而任务落在 `handle.agent.header.id` 下。
-  // 宿主若返回不同的 id（这里就是），`tasks.has(hit)` 永远查不到 → 重放会再打一次
-  // agents.create，而不是回 reused。见报告。
-  const generated = index.byClientId.get('retry-me');
-  assert.equal(typeof generated, 'string');
-  assert.match(generated, /^session-[0-9a-f-]{36}$/u);
-  assert.notEqual(generated, 'session-ok');
+  // 幂等键必须记**真实会话 id**：这里宿主回填的 header.id 是 'session-ok'，与请求里
+  // 生成的 `session-<uuid>` 不同。记请求值时 `tasks.has(hit)` 永远查不到，重放会再打
+  // 一次 agents.create，把上一份 prompt 晾在旧会话里。
+  const stored = index.byClientId.get('retry-me');
+  assert.equal(stored, 'session-ok', '幂等键必须记真实会话 id（handle.agent.header.id），不是请求生成的 sessionId');
   const replay = await index.createTask({ prompt: '再重放', cwd: tmpRoot, clientTaskId: 'retry-me' });
-  assert.equal(replay.reused, false, '（缺陷）本该命中幂等键，实际又建了一次 agent');
-  assert.equal(createCalls, 2, '（缺陷证据）agents.create 被调用了两次');
+  assert.equal(replay.reused, true, '同一 clientTaskId 必须命中已有会话');
+  assert.equal(replay.task.id, 'session-ok');
+  assert.equal(createCalls, 1, '命中的重放不许再建 agent');
 });
 
 test('createTask：agent factory 未注册时短暂重试，成功一次即停', async () => {

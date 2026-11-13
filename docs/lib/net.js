@@ -60,17 +60,30 @@ export function createApi({ getBase, getToken, onUnauthorized }) {
       response = await fetch(base + path, { method, headers, body, cache: 'no-store', signal: controller.signal });
     } catch (error) {
       clearTimeout(timer);
+      options.signal?.removeEventListener?.('abort', abort);
       if (options.signal?.aborted === true) throw new ApiError('已取消', { code: 'aborted' });
       if (error?.name === 'AbortError') throw new ApiError('请求超时，电脑端可能正忙', { code: 'timeout' });
       throw new ApiError('连不上电脑，请检查网络与插件状态', { code: 'network' });
     }
-    clearTimeout(timer);
+    // 注意：计时器**不能**在这里清。`fetch()` 只要拿到响应头就 resolve，而中继
+    // 半边挂住时（头已回、body 永不进流）`response.text()` 会一直 pending；
+    // 计时器一清就没有任何东西能打断它 —— 请求永久挂着，`sending` /
+    // `detailLoadingOlder` 卡死到用户手工刷新。所以超时一直保留到 body 读完，
+    // 统一在 finally 里清。
 
     let text;
     try {
       text = await response.text();
-    } catch {
+    } catch (error) {
+      if (controller.signal.aborted === true && options.signal?.aborted !== true) {
+        throw new ApiError('请求超时，电脑端可能正忙', { code: 'timeout' });
+      }
+      if (options.signal?.aborted === true) throw new ApiError('已取消', { code: 'aborted' });
       throw new ApiError('读取响应失败', { status: response.status, code: 'read' });
+    } finally {
+      clearTimeout(timer);
+      // 外部 signal 上的监听也要摘：它活得比这次请求久，攒多了是泄漏。
+      options.signal?.removeEventListener?.('abort', abort);
     }
 
     let payload = null;
@@ -102,6 +115,13 @@ export function createApi({ getBase, getToken, onUnauthorized }) {
 
 const RECONNECT_BASE = 700;
 const RECONNECT_MAX = 15_000;
+/**
+ * 后台（`document.hidden`）时的重连间隔：一次就够，不做指数增长。
+ *
+ * 比 RECONNECT_MAX 长得多是故意的：后台的重试只是"别彻底失联"，真正的恢复
+ * 时机是回前台（`visibilitychange` → `kick()`）。
+ */
+const HIDDEN_RETRY = 60_000;
 const PING_EVERY = 20_000;
 const DEAD_AFTER = 75_000;
 /**
@@ -120,6 +140,27 @@ const DEAD_AFTER = 75_000;
  * `ws close code=1000`，间隔稳定在 9~12 s），用户看到的就是"经常断连"。
  */
 const CONNECT_TIMEOUT = 45_000;
+
+/**
+ * 页面在后台时，只保留一次长延迟重试。
+ *
+ * 为什么不能照常退避：手机切后台/锁屏后定时器只是**变慢，不是停**，退避仍然
+ * 每 15 秒拉起一次连接；醒来时可能已经白白重建了几十条隧道（中继侧 slots
+ * 一涨，用户看到的就是"很卡 / 连不上"）。后台没有人在看，一条长延迟足够通知
+ * 自己"还活着"，回前台由 `visibilitychange` 的 `kick()` 立刻接管（web/app.js）。
+ *
+ * 抽成纯函数是为了能被单测直接钉住：指数退避 + 封顶、以及 hidden 分支。
+ *
+ * @param {number} failures 连续失败次数
+ * @param {{hidden?: boolean, random?: () => number}} [options]
+ * @returns {number} 毫秒
+ */
+export function reconnectDelay(failures, { hidden = false, random = Math.random } = {}) {
+  if (hidden === true) return HIDDEN_RETRY;
+  const attempt = Math.min(Math.max(0, Number(failures) || 0), 5);
+  // + 随机抖动：多台设备同时掉线时别在同一毫秒一起重连。
+  return Math.min(RECONNECT_MAX, RECONNECT_BASE * 2 ** attempt) + Math.floor(random() * 250);
+}
 
 /**
  * Owns a single logical subscription to the host's event stream.
@@ -390,9 +431,11 @@ export class Realtime {
   scheduleReconnect() {
     if (this.stopped) { console.debug('[pocket-diag] scheduleReconnect skipped: stopped'); return; }
     if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
-    const attempt = Math.min(this.failures, 5);
-    const delay = Math.min(RECONNECT_MAX, RECONNECT_BASE * 2 ** attempt) + Math.floor(Math.random() * 250);
-    console.debug(`[pocket-diag] reconnect scheduled in ${delay}ms attempt=${this.failures}`);
+    // 后台时的重连策略见 reconnectDelay()：只留一次长延迟，回前台交给 kick()。
+    const hidden = typeof document !== 'undefined'
+      && (document.hidden === true || document.visibilityState === 'hidden');
+    const delay = reconnectDelay(this.failures, { hidden });
+    console.debug(`[pocket-diag] reconnect scheduled in ${delay}ms attempt=${this.failures}${hidden ? ' (hidden)' : ''}`);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       if (!this.stopped) void this.connect();

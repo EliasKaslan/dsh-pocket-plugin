@@ -6,7 +6,7 @@
 
 1. **随本仓库分发的代码**（vendored 源文件、提交进仓库的构建产物）——必须复现其版权行，下面逐条给出。
 2. **只作为 npm 依赖安装的组件**——不随本包的 tarball 分发，由包管理器按各自包内 `LICENSE` 安装。这里的义务由 `node_modules/<pkg>/LICENSE` 满足，本文件只做索引，不复述含个人署名与联系方式的原文。
-3. **传递依赖**（`mqtt` 自己的依赖树）——同样由包管理器解析安装，许可证以各包内 `LICENSE` 为准。本文件只列**直接依赖**与被 vendored/提交进仓库的代码，不逐一枚举传递依赖；需要完整清单时，安装后遍历 `node_modules` 即可（pnpm 布局下在 `node_modules/.pnpm`）。
+3. **传递依赖**（`mqtt` 自己的依赖树）——同样由包管理器解析安装，许可证以各包内 `LICENSE` 为准。本文件只列**直接依赖**与被 vendored/提交进仓库的代码，不逐一枚举传递依赖；需要完整清单时，安装后遍历 `node_modules` 即可。
 
 ## 清单
 
@@ -24,10 +24,10 @@
 ### 1. `mqtt`（MQTT.js）— MIT
 
 - 上游：<https://github.com/mqttjs/MQTT.js>
-- 版本由 `pnpm-lock.yaml` 锁定为 `5.16.1`，`package.json` 里写的是**精确版本** `5.16.1`（不是 `^`）：这个依赖有被提交进仓库的构建产物，范围漂移会让 `docs/mqtt.min.js` 的字节失去确定性。
+- 版本由 `package-lock.json` 锁定为 `5.16.1`，`package.json` 里写的是**精确版本** `5.16.1`（不是 `^`）：这个依赖有被提交进仓库的构建产物，范围漂移会让 `docs/mqtt.min.js` 的字节失去确定性。
 - 版权行（上游 `LICENSE.md`）：`Copyright (c) 2015-2016 MQTT.js contributors`。
-- **有一份被提交进仓库的构建产物**：`docs/mqtt.min.js`。它是 `node_modules/mqtt/dist/mqtt.min.js` 的逐字节复制（`tools/build-shell.mjs` 里的 `MQTT_DIST` 与 `entries.set('mqtt.min.js', mqtt)`），随手机端外壳一起静态托管。因此这一份**是**本仓库在分发 `mqtt` 的代码，MIT 的署名要求由本文件满足。
-- 升级方式：改 `package.json` 的版本范围 → `pnpm install` → `node tools/build-shell.mjs` 重新生成 `docs/`（`node tools/build-shell.mjs --check` 会在 CI 里发现产物没更新）。
+- **有一份被提交进仓库的构建产物**：`docs/mqtt.min.js`。它**逐字节等于** `node_modules/mqtt/dist/mqtt.min.js`（2026-11-13 复核：两个文件的 sha256 都是 `75873d04a6400bbbac093b3602caf06f44ed92ee032925e1f4f21c03eba05a4e`，`tools/build-shell.mjs` 的 `MQTT_DIST_SHA256` 钉的就是这个值，`--check` 会校验），随手机端外壳一起静态托管。因此这一份**是**本仓库在分发 `mqtt` 的代码，MIT 的署名要求由本文件满足。
+- 升级方式：改 `package.json` 的版本范围 → `npm ci`（或 `npm install`）→ `node tools/build-shell.mjs` 重新生成 `docs/`（`node tools/build-shell.mjs --check` 会在 CI 里发现产物没更新）。
 
 ### 2. `ws`（WebSocket client & server）— MIT
 
@@ -39,7 +39,10 @@
 
 - 上游：<https://github.com/kazuhikoarase/qrcode-generator>（单文件构建 `qrcode.mjs`）
 - 版权行（文件头，`lib/vendor/qrcode.mjs:1-15`）：`Copyright (c) 2009 Kazuhiko Arase`。
-- **未做任何修改**：逐字节复制上游单文件构建，只在尾部保留/添加 `export const qrcode` 与 `export default qrcode` 两个导出。详见 `lib/vendor/README.md`。
+- **未做任何修改**：与本仓 `lib/vendor/qrcode.mjs` 逐字节相同（2026-11-13 复核：上游
+  `js/dist/qrcode.mjs` 与本文件的 sha256 都是 `ea91d7118a5395289170da848b7c6758b996163bfbccf312591ab65a4911b7c0`，
+  51907 字节）。文件里的导出都是上游单文件构建自带的：`export const qrcode`（第 27 行）、
+  `export default qrcode`、`export const stringToBytes`。本插件只 `import qrcode from './vendor/qrcode.mjs'`（默认导出）。
 - 只用到编码器 API：`qrcode(typeNumber, errorCorrectionLevel)`、`addData`、`make`、`getModuleCount`、`isDark`。
 - 为什么 vendor 而不装依赖：只需要一个二维码编码器，为约 50 KB 的稳定 MIT 代码引入一棵新的依赖树不划算；同时锁定字节，保证配对二维码不会因为上游悄悄变化而变。
 - 升级方式：用上游新文件替换 `qrcode.mjs`，保留尾部的两个导出，再跑 `node --check lib/vendor/qrcode.mjs`。插件里没有任何代码改它的行为。

@@ -1,18 +1,24 @@
 name: CI
 
-# 发布前的全部硬门禁。四条命令全部直接调 node，不经过 pnpm/npm run ——
+# 发布前的全部硬门禁。四条命令全部直接调 node，不经过 npm/pnpm run ——
 # 本机与 runner 的执行方式保持一致，脚本别名不会掩盖问题。
 #
 # 一个刻意的偏离，有原因：测试用 glob 传参（"test/unit/*.test.mjs"）而不是
 # 目录名。Node 24 把位置参数当 glob 处理，`node --test test/unit` 会去加载一个
 # 同名模块并以 MODULE_NOT_FOUND 退出；glob 形式在 22 与 24 上都成立，且某个
 # 测试目录暂时为空时不会造成假失败。
+#
+# 每条门禁都对应一类真实事故，注释里写清是哪一类。本文件里不许出现
+# `continue-on-error` 或任何"允许失败"的写法：一处假绿比没有门禁更贵。
 
 on:
   push:
-    # 只跟分支。不写 branches 的话打 tag 也会触发一次，同一个 commit 会跑两遍
-    # （已经踩过：tag 那次与分支那次结论不一致时，很难判断到底哪个是真的）。
+    # 分支与 tag 都要跑。market/index.json 的 source.commit 登记的是 tag 上的
+    # commit，只跟 main 的话，给某个旧 commit 补打 tag 就等于"未过 CI 的发布"。
+    # 一次发布里 main 的 push 与 tag 的 push 是两个独立事件、各跑一遍；
+    # concurrency 按 ${{ github.ref }} 分组，两者不会互相取消。
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -45,15 +51,29 @@ jobs:
         run: |
           node -e 'const [a,b]=process.versions.node.split(".").map(Number); if (a<22 || (a===22 && b<15)) { console.error("需要 Node >= 22.15（package.json engines），当前 "+process.versions.node); process.exit(1); } console.log("node "+process.versions.node);'
 
+      # 发布元数据门禁。一条命令覆盖三类事故（判断逻辑与出处见
+      # test/protocol/packaging.test.mjs 的文件头注释）：
+      #   1) cordis.patch.yml / lib/index.mjs / package.json 的插件名不一致
+      #      → 宿主按包名解析不到插件，表现是"装上了但没加载"；
+      #   2) market/index.json 不是合法 format:1（例如语言键写成 `zh-CN`）
+      #      → 宿主整份索引拒收（MarketIndexError: must be keyed by a lowercase
+      #        language id），插件在市场里根本不出现；
+      #   3) package.json、lib/util.mjs 的 PLUGIN_VERSION、market/index.json
+      #      三处版本副本不一致 → 市场登记的版本与 /api/v1/health 报的版本对不上。
+      # 放在装依赖之前：这几条只读文件，不需要 node_modules，红了能最快给出原因。
+      - name: 发布元数据一致性（插件名 / 版本号 / 市场索引 format:1）
+        run: node --test test/protocol/packaging.test.mjs
+
+      # 锁文件必须真的生效。旧写法是
+      #   if [ -f package-lock.json ]; then npm ci; else npm install; fi
+      # 而仓库当时只有 pnpm-lock.yaml，于是 CI 恒走 `npm install`、提交的锁文件
+      # 从未被读过 —— 依赖可以在本地绿、在 runner 上漂，门禁形同虚设。
+      # 现在仓库只有一份 package-lock.json，直接 `npm ci`：锁文件与 package.json
+      # 不一致时它以保证失败退出，**不要**为了绕过不一致退回 `npm install`。
       # tools/build-shell.mjs 会读 node_modules/mqtt/dist/mqtt.min.js，
       # 单测里的外壳用例也会真的跑一次构建，所以必须先装依赖。
-      - name: 安装依赖
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci --no-audit --no-fund
-          else
-            npm install --no-audit --no-fund
-          fi
+      - name: 安装依赖（npm ci：锁文件与 package.json 必须一致）
+        run: npm ci --no-audit --no-fund
 
       - name: 语法检查
         run: node tools/check-syntax.mjs

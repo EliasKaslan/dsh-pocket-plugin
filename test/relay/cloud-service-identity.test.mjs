@@ -35,9 +35,18 @@ function makeCore() {
   return { core, dataDir, logger };
 }
 
+/**
+ * 造一个 CloudService。
+ *
+ * `cloud.enabled` 的默认值已改为**关闭**（R8：与 cordis.patch.yml / INSTALL.md
+ * 的"默认关闭"一致）。这个文件测的是身份生命周期，用例都假设服务是启用的，
+ * 所以给普通对象配置补上 `enabled: true`；断言默认值的用例在 lifecycle 那个文件里。
+ */
 function makeService({ core, dataDir, logger }, config = {}, { auth, authRequired } = {}) {
+  const plain = config !== null && typeof config === 'object' && !Array.isArray(config);
+  const resolved = plain && !('enabled' in config) ? { enabled: true, ...config } : config;
   return new CloudService(core, {
-    logger, dataDir, config, auth, authRequired,
+    logger, dataDir, config: resolved, auth, authRequired,
   });
 }
 

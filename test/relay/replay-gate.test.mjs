@@ -5,6 +5,13 @@
  * 必须同时满足：`seq` 在同一 `sid`+类型内严格递增、`ts` 在 STALE_WINDOW_MS 内、
  * `sid` 形状合法；任何一条不满足都要回 `{t:'reject', code:'<对应原因>'}` 且**不执行**
  * 请求。这里是端到端地测：帧真的被封成密文喂进 `onFrame()`，不是直接调纯函数。
+ *
+ * 期望值变更（R1）：`seq` 水位自愈**不再下调水位**。旧实现自愈时
+ * `lastSeq.set(key, { seq })`，等于给重放发通行证 —— 先重放一条 seq≤64 的旧帧把
+ * 水位拉到低位，再按升序重放整段录制窗口，已执行过的帧会被二次执行（写操作尤甚）。
+ * 现在的语义是「自愈只放行这一帧：水位保持不动，且同一个 seq 只放行一次」，
+ * 所以下面的断言从 `水位 === 8` 改成了 `水位 === 9`（并未弱化：新增了
+ * 「同一个自愈 seq 第二次到达必须被拒」的断言，见 replay-watermark.test.mjs）。
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -95,10 +102,17 @@ test('seq 不递增（归零 / 负数 / 小数 / 缺失）→ 全部拒绝；新
     assert.equal(link.stats.stale, 4);
 
     // 契约变更：**新鲜**的低 seq 视为客户端计数器重置，自愈放行（否则旧外壳永久卡死）。
+    // 但自愈**不下调水位**（R1，见文件头）：水位仍然是 9，只放行 seq=8 这一帧。
     const beforeHeal = stub.calls.length;
     feed(link, req({ id: 'heal-low-seq', seq: 8, ts: now }));
     assert.ok(stub.calls.length > beforeHeal, '新鲜低 seq 应被放行');
-    assert.equal(link.lastSeq.get(`req:${SID}`)?.seq, 8, '水位应重置到 8');
+    assert.equal(link.lastSeq.get(`req:${SID}`)?.seq, 9, '自愈放行不得下调水位（仍是 9）');
+
+    // 同一个自愈 seq 第二次到达：这是重放，不是"又一次计数器重置"。
+    sent.length = 0;
+    feed(link, req({ id: 'heal-low-seq-again', seq: 8, ts: now }));
+    assert.equal(stub.calls.length, beforeHeal + 1, '同一个自愈 seq 不许执行第二遍');
+    assert.equal(rejectFrames(link, sent)[0]?.code, 'replay');
   } finally {
     stub.restore();
   }
@@ -253,9 +267,10 @@ test('新鲜帧 + 大幅回退 seq ⇒ 水位自愈；即时重放与陈旧帧�
   const now = Date.now();
   // 把水位打到 100
   assert.equal(link.checkFreshness('req', { seq: 100, ts: now, sid }).ok, true);
-  // 计数器被重置（seq 回到 5）且时间戳新鲜 ⇒ 自愈放行，水位重置到 5
+  // 计数器被重置（seq 回到 5）且时间戳新鲜 ⇒ 自愈放行，但**水位保持 100**（R1）
   assert.equal(link.checkFreshness('req', { seq: 5, ts: now, sid }).ok, true, '大幅回退 + 新鲜帧应自愈');
-  assert.equal(link.checkFreshness('req', { seq: 6, ts: now, sid }).ok, true, '自愈后应能继续递增');
+  assert.equal(link.lastSeq.get(`req:${sid}`)?.seq, 100, '自愈不许下调水位');
+  assert.equal(link.checkFreshness('req', { seq: 6, ts: now, sid }).ok, true, '重置后的新 seq 序列应能继续通过');
   // 同一 seq 的即时重放仍然拒绝（这才是重放防护要挡的）
   assert.equal(link.checkFreshness('req', { seq: 6, ts: now, sid }).code, 'replay', '同一 seq 仍判重放');
   // 陈旧帧仍然拒绝

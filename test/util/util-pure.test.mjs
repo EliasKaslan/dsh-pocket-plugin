@@ -17,7 +17,7 @@ import {
   b64url, clamp, contentType, durationText, escapeHtml, fromB64url, hostHeaderName,
   isLoopback, isLoopbackHostname, isPlainObject, isValidIp, normalizeIp,
   nowMs, oneLine, randomBytes32, randomHex, randomId, randomToken,
-  redactBroker, redactSecret, redactUrl, relativeTime, safeEqual, safeJoin, sha256, truncate,
+  redactBroker, redactSecret, redactUrl, relativeTime, safeEqual, safeJoin, sha256, sliceCodePoints, truncate,
 } from '../../lib/util.mjs';
 
 const PKG = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
@@ -163,6 +163,51 @@ test('clamp / truncate / oneLine：非数字、负数、超长、Unicode 空白'
   assert.equal(oneLine('a\u00a0b', 10), 'a b', 'NBSP 也算空白');
   assert.equal(oneLine(123), '');
   assert.equal(oneLine('a'.repeat(500), 240).length, 240, '默认上限 240，日志行才不会失控');
+});
+
+/** 有没有孤立代理项：手机端渲染出来就是 `�`。 */
+const hasLoneSurrogate = (text) => /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(text);
+
+/*
+ * 按 UTF-16 码元截断会切坏 emoji：`truncate('a😀b', 3)` 过去返回 `'a\ud83d…'`，
+ * 末尾是孤立的高代理项，手机端显示 `a�…`。这些函数在列表热路径上（每条会话都
+ * 过一遍），所以修法是"切点前一个码元是高代理项就退一位"的 O(1) 判断。
+ */
+test('truncate / oneLine：按码点切，emoji / ZWJ 组合 / 中日韩都不许切成孤立代理项', () => {
+  // 切点正好落在代理对中间（3 个码元 = 'a' + emoji 的高半）。
+  assert.equal(truncate('a😀b', 3), 'a…', 'emoji 被截断时退一位，不许留半个');
+  assert.equal(oneLine('a😀b', 3), 'a…');
+
+  const family = '👨\u200d👩\u200d👧\u200d👦';
+  assert.equal(hasLoneSurrogate(truncate(`x${family}y`, 5)), false, 'ZWJ 组合 emoji 被切坏');
+  assert.equal(hasLoneSurrogate(oneLine(`x${family}y`, 2)), false, 'ZWJ 组合 emoji 被切坏（oneLine）');
+
+  // 中日韩在 BMP 内，切点不涉代理对：只按码元数裁。
+  assert.equal(truncate('中文测试文本', 4), '中文测…');
+  assert.equal(truncate('中文测试', 4), '中文测试', '正好等长时不裁');
+
+  // 输入本身就带孤立代理项（历史坏数据）：不许抛，也不许再多造一个。
+  const broken = `ab${String.fromCharCode(0xd83d)}`;
+  assert.equal(typeof truncate(broken, 3), 'string');
+
+  // 结果长度永远 ≤ max（码元数），否则手机端的行预算会被打破。
+  for (const max of [1, 2, 3, 5, 96, 240]) {
+    for (const text of ['😀😀😀😀', '中😀文😀', family, `a${family}`, 'a😀b']) {
+      const out = truncate(text, max);
+      assert.ok(out.length <= Math.max(1, max), `truncate(${JSON.stringify(text)}, ${max}) 超长：${out.length}`);
+      assert.equal(hasLoneSurrogate(out), false, `truncate(${JSON.stringify(text)}, ${max}) 产出孤立代理项：${JSON.stringify(out)}`);
+    }
+  }
+});
+
+test('sliceCodePoints：只切码元（不加省略号、不做单行化），切点安全', () => {
+  assert.equal(sliceCodePoints('abc', 10), 'abc', '不超长时原样返回');
+  assert.equal(sliceCodePoints('a😀b', 2), 'a', '切点落在代理对中间 → 退一位');
+  assert.equal(sliceCodePoints('a😀b', 3), 'a😀', '切点在代理对之后 → 照常切');
+  assert.equal(sliceCodePoints(12345, 3), '', '非字符串视为空');
+  assert.equal(sliceCodePoints('abc', 0), '');
+  assert.equal(sliceCodePoints('abc', -1), '');
+  assert.equal(sliceCodePoints('😀', 1), '', '整个字符串只有半个字符时返回空，而不是半个代理项');
 });
 
 test('isPlainObject：数组/ null 不算，Object.create(null) 与 Map 算（只拦数组与 null）', () => {

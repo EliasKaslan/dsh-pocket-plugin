@@ -6,11 +6,35 @@
  * injection bugs instead of trying to escape them one by one.
  */
 
+/**
+ * 规整属性，并补上 HTML 里最容易漏的那个默认值：`<button>` 的 `type`。
+ *
+ * 为什么放在这里而不是逐个调用点补：`button` 不写 `type` 时浏览器默认当
+ * `submit` 处理。本页虽然没有 `<form>`，但弹层/设置页里的按钮一旦被塞进表单
+ * （或者将来有人加了表单），点一下就会触发提交并**跳走整页** —— 而这类漏写
+ * 在 review 里几乎看不见（`h('button', { class: …, on: … })` 看起来很完整）。
+ * 统一在工厂函数里兜底，新代码想漏也漏不掉。
+ *
+ * @param {string} tag
+ * @param {Record<string, unknown>|null|undefined} attrs
+ * @returns {Record<string, unknown>|null}
+ */
+export function elementAttrs(tag, attrs) {
+  const source = attrs !== null && typeof attrs === 'object' ? attrs : null;
+  if (String(tag).toLowerCase() !== 'button') return source;
+  const type = source?.type;
+  // 显式给了就想清楚过（`type` 只有 submit/reset/button 三种），不动它。
+  // 条件式写出来的 `type: cond ? 'submit' : undefined` 也算没给 —— 照补默认值。
+  if (typeof type === 'string' && type.length > 0) return source;
+  return { ...(source ?? {}), type: 'button' };
+}
+
 /** Create an element. `attrs` understands class, text, dataset, style, on*. */
 export function h(tag, attrs, ...children) {
   const el = document.createElement(tag);
-  if (attrs !== null && typeof attrs === 'object') {
-    for (const [key, value] of Object.entries(attrs)) {
+  const normalized = elementAttrs(tag, attrs);
+  if (normalized !== null) {
+    for (const [key, value] of Object.entries(normalized)) {
       if (value === null || value === undefined || value === false) continue;
       if (key === 'class') el.className = String(value);
       else if (key === 'text') el.textContent = String(value);

@@ -589,20 +589,91 @@ test('两个实例共享文件：令牌与登出都能互相看见（check 内�
   assert.equal(b.check(token), null, '登出也要能被另一个实例看到');
 });
 
-test('会话文件写不进去时 login 直接抛异常（不再返回 ok:false）', () => {
+test('会话文件写不进去时 login/renew/check 都不抛：内存照常生效，只丢持久化', () => {
   const dir = scratch();
-  // 把 sessions 的父路径占成一个普通文件，atomicWriteJson 必然失败。
+  // 把 sessions 的父路径占成一个普通文件：atomicWriteJson 的 openSync 必然失败，
+  // 等价于只读目录 / 磁盘满 / Windows 上 rename 的 EPERM。
   const blocker = path.join(dir, 'blocked');
   writeFileSync(blocker, 'x', 'utf8');
+  const logs = [];
   const auth = new Auth({
     credentialsFile: credentialsFile(dir),
     sessionsFile: path.join(blocker, 'sessions.json'),
     required: true,
+    logger: {
+      info: () => {},
+      warn: (...args) => logs.push(args.join(' ')),
+      error: () => {},
+    },
+  });
+
+  // login 不能抛：调用方（handleLogin / handleAuthCheck / authorized）都是按
+  // 「不会抛」写的，一抛就会被 MQTT 回调的 catch 吞成 stats.errors++ 并丢帧，
+  // 手机上表现为「登录没反应 / 所有消息都丢了」，看起来像鉴权失败。
+  let login;
+  assert.doesNotThrow(() => { login = auth.login({ user: 'alice', password: PASSWORD }); });
+  assert.equal(login.ok, true, '落盘失败不能让登录失败');
+  assert.equal(auth.sessions.size, 1, '内存里的会话必须已经登记');
+  assert.ok(logs.some((line) => line.includes('写入磁盘失败')), '失败必须留一条 warn，否则永远查不到');
+
+  // check + 滑动续期同样不能抛，且续期必须真的写进内存（磁盘丢了，登录不能丢）。
+  const session = [...auth.sessions.values()][0];
+  const before = session.expiresAt;
+  session.renewedAt = 0; // 强制下一次 check 触发续期
+  let seen;
+  assert.doesNotThrow(() => { seen = auth.check(login.token); });
+  assert.notEqual(seen, null, 'check 必须照常放行');
+  assert.ok(session.expiresAt > before, '续期必须落在内存里');
+
+  // 告警节流：持续故障不该每次心跳都刷一行日志。
+  const warned = logs.filter((line) => line.includes('写入磁盘失败')).length;
+  session.renewedAt = 0;
+  assert.equal(auth.renew(session), true);
+  assert.equal(
+    logs.filter((line) => line.includes('写入磁盘失败')).length,
+    warned,
+    '短时间内的重复失败必须被节流',
+  );
+});
+
+/* ---------------------------------------------------------------- authorize ---- */
+
+test('authorize：required 但凭据缺失时 fail-closed；闸门正常时按令牌判定', () => {
+  const dir = scratch();
+  const broken = new Auth({
+    credentialsFile: path.join(dir, 'missing-auth.json'),
+    sessionsFile: path.join(dir, 'sessions.json'),
+    required: true,
     logger: { info() {}, warn() {}, error() {} },
   });
-  assert.throws(() => auth.login({ user: 'alice', password: PASSWORD }), (error) => {
-    assert.ok(['ENOTDIR', 'ENOENT', 'EEXIST', 'EACCES', 'EPERM'].includes(error.code), `意外的错误码：${error.code}`);
-    return true;
+  assert.equal(broken.required, true);
+  assert.equal(broken.enabled, false);
+  // 老实现走到这里返回 {required:false, ok:true}：配置要求口令、闸门却坏了，
+  // 中继会当成「不需要口令」直接放行 —— 正是本文件开头契约禁止的 fail-open。
+  assert.throws(
+    () => broken.authorize('any-token'),
+    (error) => error.code === 'auth_missing_credentials',
+  );
+  // 语义与 assertUsable() 一致：调用方只需要处理一种「闸门坏了」的形态。
+  assert.throws(() => broken.assertUsable(), (error) => error.code === 'auth_missing_credentials');
+
+  const enabled = makeAuth(dir).auth;
+  const { token } = enabled.login({ user: 'alice', password: PASSWORD });
+  const good = enabled.authorize(token);
+  assert.equal(good.required, true);
+  assert.equal(good.ok, true);
+  assert.equal(good.session?.phone, '手机');
+
+  const bad = enabled.authorize('not-a-token');
+  assert.equal(bad.required, true);
+  assert.equal(bad.ok, false);
+  assert.equal(bad.session, null);
+
+  const off = new Auth({
+    credentialsFile: credentialsFile(dir),
+    sessionsFile: path.join(dir, 'off-sessions.json'),
+    required: false,
+    logger: { info() {}, warn() {}, error() {} },
   });
-  assert.equal(auth.sessions.size, 1, '内存里的会话已经加上，但磁盘没写成功 —— 进程重启即丢');
+  assert.deepEqual(off.authorize('anything'), { required: false, ok: true, session: null });
 });

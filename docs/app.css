@@ -215,6 +215,13 @@ a { color: var(--accent); text-decoration: none; }
 }
 .icon-btn:active { background: var(--surface-2); transform: scale(.94); }
 .icon-btn.sm { width: 32px; height: 32px; border-radius: 9px; }
+
+/* 触控目标下限 44×44（iOS HIG 与 Material 都是这个数）。
+   视觉尺寸保持不变，用一层透明的 ::after 把命中区撑到 44px —— 手机上 28~32px
+   的按钮实测很难点中（单手、走路、戴手套时尤其明显）。::after 属于按钮自身，
+   落点仍然是这个元素，不会挡住旁边的控件。 */
+.icon-btn.sm { position: relative; }
+.icon-btn.sm::after { content: ''; position: absolute; inset: -6px; border-radius: inherit; }
 svg { stroke: currentColor; stroke-width: 1.8; fill: none; stroke-linecap: round; stroke-linejoin: round; }
 .sprite symbol, .sprite path { stroke: none; }
 
@@ -319,7 +326,12 @@ svg { stroke: currentColor; stroke-width: 1.8; fill: none; stroke-linecap: round
   border: 0;
   background: none;
   color: var(--text);
-  font-size: 14px;
+  /* 必须是 16px：iPhone Safari 在聚焦「字号 < 16px」的输入框时会自动放大整页，
+     放大后固定底栏与 --composer-h / --kb 的定位全部错位（键盘顶起来的输入框
+     压在屏幕外）。禁用缩放（maximum-scale=1 / user-scalable=no）能绕过，但那会
+     破坏可访问性 —— 正确的解法是让字号本身不小于 16px。
+     同一条约束还有 .composer-input 与 .q-custom，改一处就一起改。 */
+  font-size: 16px;
   outline: none;
 }
 .search-input::placeholder { color: var(--text-3); }
@@ -889,7 +901,9 @@ svg { stroke: currentColor; stroke-width: 1.8; fill: none; stroke-linecap: round
   background: none;
   color: var(--text);
   font: inherit;
-  font-size: 15px;
+  /* 16px 是硬下限（iOS 聚焦更小字号会放大整页，把 composer 顶飞）；
+     视觉尺寸靠行高/padding 维持，不用 transform: scale 之类的障眼法。 */
+  font-size: 16px;
   line-height: 1.45;
   resize: none;
   outline: none;
@@ -1014,7 +1028,9 @@ svg { stroke: currentColor; stroke-width: 1.8; fill: none; stroke-linecap: round
   background: none;
   color: var(--text);
   font: inherit;
-  font-size: 15.5px;
+  /* 16px 下限，理由同 .composer-input：这是新建任务的主输入框，
+     少于 16px 时 iPhone 一聚焦就放大整页。 */
+  font-size: 16px;
   line-height: 1.55;
   resize: none;
   outline: none;
@@ -1179,6 +1195,10 @@ svg { stroke: currentColor; stroke-width: 1.8; fill: none; stroke-linecap: round
   transition: background .16s, color .16s;
 }
 .segment-item.active { background: var(--surface-3); color: var(--text); font-weight: 600; }
+/* 命中区撑到 44px 高（视觉仍是 28px 的小胶囊）：见 .icon-btn.sm 上方的说明。
+   横向不扩，否则相邻两段的命中区会互相重叠、点哪个由绘制顺序决定。 */
+.segment-item { position: relative; }
+.segment-item::after { content: ''; position: absolute; inset: -8px 0; }
 
 .switch {
   margin-left: auto;
@@ -1191,6 +1211,8 @@ svg { stroke: currentColor; stroke-width: 1.8; fill: none; stroke-linecap: round
   flex: none;
   transition: background .18s;
 }
+/* 46×28 → 命中区 46×44，视觉尺寸不动。 */
+.switch::after { content: ''; position: absolute; inset: -8px 0; border-radius: 999px; }
 .switch-knob {
   position: absolute;
   top: 2px;
@@ -1590,7 +1612,8 @@ svg { stroke: currentColor; stroke-width: 1.8; fill: none; stroke-linecap: round
   border-radius: var(--radius-s);
   background: var(--surface);
   color: var(--text);
-  font-size: 13.5px;
+  /* 16px 下限：这是真输入框，iOS 聚焦 < 16px 时会把整页放大。 */
+  font-size: 16px;
 }
 .q-custom::placeholder { color: var(--text-3); }
 .q-custom:focus { outline: none; border-color: var(--accent); }
@@ -1623,8 +1646,10 @@ svg { stroke: currentColor; stroke-width: 1.8; fill: none; stroke-linecap: round
   gap: 5px;
   padding: 2px 8px;
   border-radius: 999px;
-  // 白字压 accent（深色主题 #6d8bff）只有 3.09:1，11px 不算大字，不达 AA。
-  // 改用 accent 字 + accent-soft 底：深浅两个主题都能过 4.5:1。
+  /* 白字压 accent（深色主题 #6d8bff）只有 3.09:1，11px 不算大字，不达 AA。
+     改用 accent 字 + accent-soft 底：深浅两个主题都能过 4.5:1。
+     注意：这里必须是 CSS 注释。写成 `//` 时 CSS 会把它和下一行的 background 当成
+     同一条非法声明整段丢弃 —— 徽标就没有底色了，而且没有任何报错。 */
   background: var(--accent-soft);
   color: var(--accent);
   font-size: 11px;

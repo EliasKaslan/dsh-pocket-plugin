@@ -15,6 +15,10 @@ import { ApiError, Realtime, createApi } from './lib/net.js';
 // 性能探针：必须在渲染代码之前加载，否则前几帧量不到。
 import './lib/perf.js';
 import { relTime } from './lib/format.js';
+// 外壳自检的判据（纯函数，单测直接 import；这段逻辑以前内联在这里并被 catch 吞掉过）。
+import { parseShellBuild, shellCacheBuilds, staleShellBuilds } from './lib/shell-fresh.js';
+// 解除配对要清的外壳侧键名。
+import { unpairStorageKeys } from './lib/shell-session.js';
 import { toast } from './lib/ui.js';
 import {
   LIMITS, applyTheme, baseUrl, isRelayShell, loadCache, loadPrefs, loadSession,
@@ -26,7 +30,9 @@ import { mountDetail } from './views/detail.js';
 import { mountSettings } from './views/settings.js';
 import { mountTasks } from './views/tasks.js';
 
-const APP_VERSION = '1.0.0';
+// 与 package.json / lib/util.mjs 的 PLUGIN_VERSION 三处必须一致
+// （test/domain/shell-realtime.test.mjs 会核对；漏改会让设置页显示旧版本号）。
+const APP_VERSION = '1.0.1';
 // 设置页要显示「前端版本」。它读的是 store，而 context 上的 appVersion 到不了那里，
 // 所以直接暴露一个全局值——比在 store 里再加一个字段更不容易被后续重构漏掉。
 globalThis.__POCKET_APP_VERSION__ = APP_VERSION;
@@ -702,7 +708,25 @@ function makeContext() {
         if (result !== 'granted') { savePrefs({ notify: false }); toast('没有拿到通知授权', { tone: 'danger' }); view?.paint(); }
       } catch { /* ignore */ }
     },
-    unpair() { signOut({ forget: true }); },
+    /**
+     * 解除配对（设置页「换一台电脑」）：必须连**外壳**那份凭据一起清。
+     *
+     * 外壳把设备令牌写在 `pocket.session.v1`（见 `remote/remote.js` 的
+     * `persistDeviceSession()`），还记着一条含房间密钥的链接；只清 app 自己的
+     * `dsh.pocket.session.v1` 的话，刷新后 `adoptShellSession()` 会把旧令牌重新
+     * 采纳 —— 用户以为断开了，实际仍然能操作电脑。
+     *
+     * `shell.forgetSession()` 是外壳侧的正式入口；老外壳没有这个函数时，
+     * 按 `unpairStorageKeys()` 的清单直接删（同一份清单，单测钉住）。
+     */
+    unpair() {
+      const shell = globalThis.__POCKET_SHELL__;
+      try {
+        if (typeof shell?.forgetSession === 'function') shell.forgetSession();
+        for (const key of unpairStorageKeys()) globalThis.localStorage?.removeItem(key);
+      } catch { /* 隐私模式 / 没有 localStorage：下面的 signOut 仍会把会话置空 */ }
+      signOut({ forget: true });
+    },
     /** 回到口令闸门：清掉登录会话与设备令牌，由中继外壳重新弹登录页。 */
     relogin() {
       const shell = globalThis.__POCKET_SHELL__;
@@ -845,17 +869,18 @@ async function checkShellFresh() {
   try {
     if (typeof caches === 'undefined') return;
     const keys = await caches.keys();
-    // 新旧两个缓存可能同时存在（新 SW 先预缓存、旧 SW 后才 activate 删除）：
-    // 随手 find 一个可能拿到旧的，误报「界面是旧版本」。改为比对全部缓存。
-    const mines = keys.filter((k) => k.startsWith('pocket-shell-'));
-    if (mines.length === 0) return;
-    const mineBuild = mine.slice('pocket-shell-'.length);
+    // 判据在 web/lib/shell-fresh.js 里（可被 Node 直接 import 的单测覆盖）：
+    // 这里曾经有一个不存在的变量 `mine`，被下面的 catch 静默吞掉，自检每次都在
+    // 第一行死掉 —— 横幅与 hardRefreshShell() 全成了不可达代码。
+    // 自检不看缓存名的话就是白发一次请求：没装过外壳时直接返回。
+    if (shellCacheBuilds(keys).length === 0) return;
     const res = await fetch(swUrlOf(), { cache: 'no-store' });
     if (!res.ok) return;
-    const text = await res.text();
-    const liveBuild = /const BUILD = '([^']+)'/u.exec(text)?.[1];
-    if (liveBuild === undefined) return;
-    const stale = mines.map((k) => k.slice('pocket-shell-'.length)).filter((b) => b !== liveBuild);
+    const liveBuild = parseShellBuild(await res.text());
+    if (liveBuild === null) return;
+    // 新旧两个缓存可能同时存在（新 SW 先预缓存、旧 SW 后才 activate 删除）：
+    // 随手 find 一个可能拿到旧的，误报「界面是旧版本」。改为比对全部缓存。
+    const stale = staleShellBuilds(keys, liveBuild);
     if (stale.length === 0) return;
     showStaleShellBanner(stale[0], liveBuild);
   } catch { /* 自检失败不影响使用 */ }

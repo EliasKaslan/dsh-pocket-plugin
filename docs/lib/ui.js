@@ -34,6 +34,32 @@ export function hideToast() {
 
 let openLayer = null;
 
+/**
+ * 我们**自己**排了几次 `history.back()`，还没收到对应的 popstate。
+ *
+ * 为什么需要记账：弹层压进历史的那一条记录删不掉，只能靠 `history.back()` 退回去；
+ * 而 back() 是异步的，它的 popstate 很可能在**下一个弹层打开之后**才落地。那时
+ * 新弹层已经接管了返回键，会把这次"自己排的退栈"当成用户按了返回，把自己关掉 ——
+ * 表现为对话框一闪而过（`openMenu()` → 选中「中断这个任务」→ `cancelTask()`
+ * 弹确认框，正是这条路径）。
+ */
+let pendingSelfPops = 0;
+/** 全局 popstate 监听是否已装（只装一次，装了就不摘）。 */
+let watchingPopstate = false;
+
+/**
+ * 返回键的唯一入口。
+ *
+ * 两件事：① 先消化我们自己排的 back() 回声；② 其余才是用户按了返回 / 手势返回，
+ * 转交给当前弹层。
+ */
+function onPopstate() {
+  if (pendingSelfPops > 0) { pendingSelfPops -= 1; return; }
+  const close = openLayer;
+  if (close === null) return;
+  close({ byPop: true });
+}
+
 function lockScroll(lock) {
   document.documentElement.classList.toggle('has-layer', lock);
 }
@@ -43,20 +69,35 @@ function lockScroll(lock) {
  * `build(close)` returns the panel element.
  */
 export function layer(build, { onClose = null } = {}) {
-  closeLayer();
+  // 已经有一个弹层：这次是**换层**，复用同一条历史记录，别再压一条。
+  // 先 close 再 push 会撞上 close 里那次异步 `history.back()`，把新压的记录顶掉。
+  const reuseEntry = openLayer !== null;
+  closeLayer({ keepHistory: reuseEntry });
   const root = $('#modal-root');
   if (root === null) return () => {};
 
   const backdrop = h('div', { class: 'layer-backdrop' });
   const panel = h('div', { class: 'layer-panel' });
-  const close = () => {
+  /**
+   * @param {{byPop?: boolean, keepHistory?: boolean}} [options]
+   *   byPop: 这次关闭是浏览器返回键触发的（历史已经退过了）；
+   *   keepHistory: 历史里那条弹层记录要留给下一个弹层复用。
+   */
+  const close = ({ byPop = false, keepHistory = false } = {}) => {
     document.removeEventListener('keydown', onKey, true);
     root.removeEventListener('click', onBackdrop);
-    window.removeEventListener('popstate', close);
     empty(root);
     root.classList.remove('active');
     lockScroll(false);
     openLayer = null;
+    // 幽灵历史条目的修复：只有「代码关掉」时才需要退栈 —— 用户按返回关掉的那次，
+    // 浏览器已经把记录退掉了（byPop）。不退这一下，历史里就留一条幽灵记录：
+    // 用户再按返回什么都不会发生（没有 popstate 监听、hash 也没变），看起来像
+    // 返回键坏了；弹几次就攒几条，要按同样多次返回才退得出去。
+    if (!byPop && !keepHistory && history.state?.layer === true) {
+      pendingSelfPops += 1;
+      history.back();
+    }
     if (onClose !== null) onClose();
   };
   const onKey = (event) => {
@@ -78,9 +119,12 @@ export function layer(build, { onClose = null } = {}) {
   build(panel, close);
   document.addEventListener('keydown', onKey, true);
   backdrop.addEventListener('click', onBackdrop);
+  if (!watchingPopstate) {
+    window.addEventListener('popstate', onPopstate);
+    watchingPopstate = true;
+  }
   // Android hardware back closes the layer instead of leaving the page.
-  history.pushState({ layer: true }, '');
-  window.addEventListener('popstate', close, { once: true });
+  if (!reuseEntry) history.pushState({ layer: true }, '');
   lockScroll(true);
   openLayer = close;
   requestAnimationFrame(() => {
@@ -90,8 +134,8 @@ export function layer(build, { onClose = null } = {}) {
   return close;
 }
 
-export function closeLayer() {
-  if (openLayer !== null) openLayer();
+export function closeLayer(options) {
+  if (openLayer !== null) openLayer(options);
 }
 
 /* ---------------- confirm dialog ---------------- */

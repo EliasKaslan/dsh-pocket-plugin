@@ -2,7 +2,7 @@
 
 **用手机在任何网络下，看你电脑上正在跑的 DeepSeek Harness。** 电脑不需要公网 IP、不开放任何入站端口，也不做内网穿透或端口映射。
 
-> ✅ **v1.0.0 正式版。** 已在真手机、真网络下完成连续进入、断线重连、向上翻页、流式输出等场景的自测。
+> ✅ **v1.0.1。** 首个公开发布版 v1.0.0 已在真手机、真网络下完成连续进入、断线重连、向上翻页、流式输出等场景的自测；1.0.1 是随后的 bugfix 发布。
 
 v1.0.1 · 正式版 · MIT
 
@@ -119,8 +119,9 @@ C:\Users\<你>\dsh-pocket-qr.png        # Windows
 
 实测通过的项：
 
-- 7 个宿主服务全部绑定成功：`sessionQuery`、`agents`、`sessions`、`agentPresets`、
-  `agentDefaultModel`、`workspaceRegistry`、`sessionPersistence`
+- 8 个宿主服务全部绑定成功：`sessionQuery`、`agents`、`sessions`、`userQuestions`、
+  `agentPresets`、`agentDefaultModel`、`workspaceRegistry`、`sessionPersistence`
+  （`lib/index.mjs` 的 `bind()` 共 8 次调用；运行日志里 `service bound: <name>` 也是 8 条）
 - 从 `~/.dsh/sessions` 读取会话索引成功（数量随会话增长）
 - 会话详情读取（`sessionQuery.readSurface`）正常
 - 加密中继上线（`cloud link online`）
@@ -134,6 +135,7 @@ C:\Users\<你>\dsh-pocket-qr.png        # Windows
 | `sessionQuery`（含 `readSurface`） | 读取会话详情与正文 |
 | `agents` | 任务状态、在跑/已停 |
 | `sessions` | 按 id 取会话 |
+| `userQuestions` | `ask_user_question` 的答卷通道（手机端 `tasks.answer` 走它） |
 | `agentPresets` | 新建任务时可选预设 |
 | `agentDefaultModel` | 展示与默认模型 |
 | `workspaceRegistry` | 工作目录选择 |
@@ -150,6 +152,11 @@ DSH `0.2.2-rc.1`、`0.2.2-alpha.3`、`0.2.2-alpha.2` 三段升级指南共 31 �
 因此从这些版本升级到 `0.2.2-rc.2` 不需要改动本插件。
 
 **未验证**：早于 `0.2.2-rc.2` 的版本未做系统验证；`engines.dsh` 只声明已验证的下界。
+
+`engines.dsh` 在两处形态不同是故意的：`package.json` 只声明已验证的下界
+（`>=0.2.2-rc.2`），`market/index.json` 需要带上界（`>=0.2.2-rc.2 <0.3.0-0`），
+让市场按区间过滤兼容版本。**两处的下界必须一致**——放宽成 `>=0.2.2-rc.1` 会把插件
+推给未验证的宿主，`test/protocol/packaging.test.mjs` 会拦住这种改动。
 
 ### 5.3 升级后异常，先看这三行日志
 

@@ -110,7 +110,13 @@ test('同一个 sid 内 seq 必须严格递增；换 sid 可以从小 seq 重新
   // 契约变更（v1.1.11）：新鲜的低 seq 视为客户端计数器重置 ⇒ 自愈放行（否则旧外壳永久卡死）。
   // 同 seq 的即时重放仍然拒绝（上一行），重放防护没有被削弱。
   assert.equal(link.checkFreshness('req', { seq: 6, ts: now, sid: 'aaaaaaaa' }).ok, true, '新鲜回退 seq 自愈');
-  assert.equal(link.checkFreshness('req', { seq: 7, ts: now, sid: 'aaaaaaaa' }).ok, true, '自愈后从新水位继续递增');
+  // 再变更（1.0.1 安全修复）：自愈**不再下调水位**。旧实现把水位从 7 拉到 6，于是已经执行过的
+  // seq=7 可以再来一次——攻击者只要先重放一条 seq≤64 的旧帧把水位压低，就能按升序重放整段录制
+  // 窗口，无需密钥。现在水位单调不减，且每个低 seq 只自愈放行一次。
+  assert.equal(link.checkFreshness('req', { seq: 6, ts: now, sid: 'aaaaaaaa' }).code, 'replay', '同一个低 seq 只自愈一次');
+  assert.equal(link.checkFreshness('req', { seq: 7, ts: now, sid: 'aaaaaaaa' }).code, 'replay', '水位没被下调：已执行的 seq=7 不能再执行一次');
+  // "自愈"要保住的其实是这件事：计数器继续往前递增不能被卡死。
+  assert.equal(link.checkFreshness('req', { seq: 8, ts: now, sid: 'aaaaaaaa' }).ok, true, '高于水位的新 seq 照常放行');
   // 重新加载页面 = 新 sid，seq 从 1 开始是合法的。
   assert.equal(link.checkFreshness('req', { seq: 1, ts: now, sid: 'bbbbbbbb' }).ok, true);
   // 不同类型的帧各自一条 seq 序列。

@@ -106,7 +106,7 @@ cmd /c mklink /J "%USERPROFILE%\.dsh\profiles\<profile>\node_modules\dsh-pocket-
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `enabled` | 随 bundle 为 `false` | 中继总开关。**默认关闭，要显式开** |
+| `enabled` | `false` | 中继总开关。**必须显式写 `true` 才开启**：省略该键不等于开启（实现是 `cloud.enabled === true`），这是有意的 fail-closed |
 | `appBase` | `''` | 手机端静态外壳地址（`docs/` 部署到哪）。**空 = 起不来**，这是有意的：外壳是一段会在你手机上跑的代码 |
 | `broker` | `wss://broker-cn.emqx.io:8084/mqtt` | 公共 MQTT broker，只承载密文。可换自建；支持数组（≤ 4 个，按序回退） |
 | `allowAnonymous` | `false` | 免口令模式。仅在你自建私有 broker 时考虑 |
@@ -139,7 +139,7 @@ node tools/build-shell.mjs          # 生成/刷新 docs/
 ```powershell
 # 1. 回环接口起来了，版本对，且要求登录
 Invoke-RestMethod http://127.0.0.1:47901/api/v1/health | ConvertTo-Json -Depth 4
-#   期望：started=true  ready=true  version=1.0.0  requiresLogin=true
+#   期望：started=true  ready=true  version=1.0.1  requiresLogin=true
 
 # 2. 启动日志里有监听与二维码落点
 Get-Content "$env:USERPROFILE\.dsh\pocket\bridge.log" -Tail 12
@@ -180,7 +180,7 @@ node bin/cli.mjs devices     # 列出已登记设备
 |---|---|---|
 | 日志没有 `plugin loading` | 没登记进 `dsh.profile.bundles`，或包名解析不到 | 回第 2/3 节；确认 `node_modules/dsh-pocket-plugin/package.json` 存在 |
 | `health` 502/连不上 | 端口被别的程序占了 | 看日志 `port <n> is owned by another service`；插件会自动顺延一个端口 |
-| 没有二维码文件 | 三种 fail-closed：`cloud.enabled=false` / `cloud.appBase` 为空 / 没设口令 | 页面 `/pair` 会写明具体是哪一种，按提示补 |
+| 没有二维码文件 | 三种 fail-closed：`cloud.enabled` 不是显式 `true` / `cloud.appBase` 为空 / 没设口令 | 页面 `/pair` 会写明具体是哪一种，按提示补 |
 | 手机扫码后白屏 / 404 | `cloud.appBase` 指错，或 `docs/` 没部署 | 浏览器直接打开 `appBase` 应看到「DSH 随行」启动页 |
 | 改了代码但行为没变 | ESM 模块缓存，热重载只重读配置不重载代码 | **冷启动 DSH**。只改配置（`cordis.patch.yml`）可以热重载 |
 | 连接页每 4 秒弹「连接已断开」 | 页面在轮询一个不存在的接口（历史版本会这样） | 当前版本已改为 `/api/v1/devices`；若是旧代码请更新 |
@@ -256,8 +256,8 @@ plugin_manager(action: "remove_bundle", target: "dsh-pocket-plugin")
 ### 7.1 热加载 / 热卸载（**不需要重启 DSH**）
 
 改完插件代码想让它生效，不必重启 DSH：**把这个 bundle 关掉再打开**即可。DSH 重新
-apply 时会**重新加载模块**，所以磁盘上的新代码会生效（实测：内存里跑着 1.0.0 时，
-关掉再打开之后 `health.version` 直接变成磁盘上的 0.3.0）。
+apply 时会**重新加载模块**，所以磁盘上的新代码会生效（包括 `lib/util.mjs` 的
+`PLUGIN_VERSION`：它与 `package.json` 的 `version` 一致时，`health.version` 报的就是发布版本）。
 
 两种操作方式：
 
@@ -304,7 +304,7 @@ Get-Content "$env:USERPROFILE\.dsh\pocket\bridge.log" -Tail 20
 
 ```powershell
 node tools/check-syntax.mjs            # 语法（全仓 .mjs）
-node --test "test/**/*.test.mjs"       # 单测 + 集成 + 中继（530+ 条）
+node --test "test/**/*.test.mjs"       # 单测 + 集成 + 中继（631+ 条；以实际输出为准）
 node test/e2e/run.mjs                  # 端到端（真 HTTP 打真 server）
 node tools/build-shell.mjs --check     # 外壳产物与源码是否一致
 ```
@@ -324,9 +324,10 @@ node tools/mock-host.mjs               # 假宿主，用虚构数据开发外壳
 
 ## 9. 版本策略
 
-**v1.0.0 已于 2026-11-11 发布。** 0.x 阶段的充分自测已完成：真手机（HarmonyOS）+
+**v1.0.0 已于 2026-11-11 发布；v1.0.1 是随后的 bugfix 发布（打包清单、市场索引、
+CI 门禁与文档，不改协议）。** 0.x 阶段的充分自测已完成：真手机（HarmonyOS）+
 真网络下的连续进入、断线重连、向上翻页到底、流式增量、多设备并存、热重载与冷启动
-都跑过；569 条单测 + 11 条 e2e 全绿。
+都跑过；本轮修复前的基线是 631 条单测 + 14 条 e2e 全绿（以实际输出为准）。
 
 1.0 之后的规则：
 

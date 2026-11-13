@@ -2,23 +2,30 @@
   "format": 1,
   "title": {
     "en": "DSH Pocket Plugin Index",
-    "zh-CN": "DSH 随行插件索引"
+    "zh-cn": "DSH 随行插件索引"
   },
   "plugins": [
     {
       "name": "dsh-pocket-plugin",
+      "title": {
+        "en": "DSH Pocket",
+        "zh-cn": "DSH 随行"
+      },
+      "description": {
+        "en": "Watch and drive your desktop DeepSeek Harness from a phone on any network: end-to-end encrypted relay, nothing exposed to the public internet, no pairing code.",
+        "zh-cn": "用手机在任何网络看与控电脑上的 DeepSeek Harness：端到端加密中继、电脑零公网暴露、登录一次即用。"
+      },
       "versions": [
         {
-          "version": "1.0.0",
-          "publishTimestamp": 1794485340,
-          "description": "用手机在任何网络看与控电脑上的 DeepSeek Harness（端到端加密中继，电脑零公网暴露）",
+          "version": "1.0.1",
+          "publishTimestamp": 1794556800,
           "source": {
             "type": "git",
             "url": "https://github.com/EliasKaslan/dsh-pocket-plugin.git",
             "commit": "746062fc35c8bdef3d940126e0d79edd57244b3e"
           },
           "engines": {
-            "dsh": ">=0.2.2-rc.1 <0.3.0-0"
+            "dsh": ">=0.2.2-rc.2 <0.3.0-0"
           }
         }
       ]

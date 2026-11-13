@@ -8,6 +8,12 @@
  *  3. `scheduleRetry` 固定 2500ms —— 插件重载后电脑端 ~4 s 就回来了，手机多半刚好错过。
  *
  * 这里用 `checkLink(now)` 注入假时钟（生产里由 3 s 的 interval 调用），绝不真等。
+ *
+ * 期望值变更（本轮）：
+ *  - R4：`scheduleRetry` 的慢档从「固定 2500ms」改成「逐次翻倍、60s 封顶」，
+ *    所以 failures=2 那一档的断言从 2500 改成 5000；
+ *  - R7：`hello` 的即时 beat 应答改为与 sayHello 同档限流（否则重放 hello 就能
+ *    放大上行），所以 10s 内的第二条 hello 不再回 beat。
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -105,7 +111,7 @@ test('publishSealed：只有 qos1 ACK 成功才刷新 lastTxAckAt', () => {
   assert.ok(logger.lines.some((line) => line.includes('publish failed')));
 });
 
-test('scheduleRetry：首次 400ms(+0~150ms 抖动)，连续失败回到 2500ms 档位', () => {
+test('scheduleRetry：首次 400ms(+0~150ms 抖动)，之后逐次翻倍到 60s 上界', () => {
   const { link } = makeLink();
   const delays = [];
   const realSetTimeout = globalThis.setTimeout;
@@ -124,15 +130,18 @@ test('scheduleRetry：首次 400ms(+0~150ms 抖动)，连续失败回到 2500ms 
     link.scheduleRetry();
     assert.equal(delays[1], 2_500);
 
+    // 期望值变更（R4）：以前 failures=2 仍然是固定 2500ms —— 退避**不增长**，
+    // broker 收下 CONNECT 又立刻关掉时就是永久 ~2 次/秒的重连风暴。
+    // 现在按 RETRY_MS * 2^(failures-1) 递增（上界见 RETRY_MAX_MS=60s）。
     link.stats.failures = 2;
     link.scheduleRetry();
-    assert.equal(delays[2], 2_500);
+    assert.equal(delays[2], 5_000, '连续失败必须翻倍，不能停在 2500ms 档');
 
     // 快慢只认「连续失败次数」：closes 只增不减，拿它当依据就永远走慢档。
     link.stats.closes = 5_000;
     link.stats.failures = 0;
     link.scheduleRetry();
-    assert.ok(delays[3] < 1_000, 'closes 与快慢无关');
+    assert.ok(delays.at(-1) < 1_000, 'closes 与快慢无关');
   } finally {
     globalThis.setTimeout = realSetTimeout;
     globalThis.clearTimeout = realClearTimeout;
@@ -144,16 +153,21 @@ test('收到 hello 立刻回一条 beat：不等 8s 周期的定时器，且 pee
   const { link, sent } = makeLink();
   link.sockets.set('11111111', { readyState: 1, send() {}, close() {} });
 
-  feed(link, { t: 'hello', name: 'Pixel 9', ver: 2 });
+  const hello = { t: 'hello', name: 'Pixel 9', ver: 2, ts: Date.now() };
+  feed(link, hello);
   const answers = decodeAll(link, sent);
   assert.deepEqual(answers.map((message) => message.t), ['hello', 'beat']);
   assert.equal(answers[1].ver, CLOUD_PROTOCOL);
   assert.equal(answers[1].peers, 1);
   assert.ok(answers[1].ts > 0);
 
-  // 10s 限流只压 hello 回声，不该压掉即时 beat 的意义（横幅消失速度）。
-  feed(link, { t: 'hello', name: 'Pixel 9', ver: 2 });
-  assert.deepEqual(decodeAll(link, sent).slice(2).map((message) => message.t), ['beat']);
+  // 期望值变更（R7）：以前 10s 限流只压 hello 回声，逐帧 hello 都回一条 beat ——
+  // 于是重放一条捕获的 hello 密文就能把上行放大成 N 倍。现在 beat 应答与
+  // sayHello 同档限流（HELLO_MIN_GAP_MS），10s 内的重复 hello 一条应答都不发。
+  const before = sent.length;
+  feed(link, hello);
+  assert.deepEqual(decodeAll(link, sent).slice(before).map((message) => message.t), [],
+    '10s 内的重复 hello 不许再回 beat（重放放大面）');
 });
 
 /**

@@ -433,6 +433,32 @@ test('外壳接线：提问的工具消息触发一次整页静默刷新（不�
   assert.ok(branch.includes('scheduleDetailAppend'), '流式增量分支必须只追增量');
 });
 
+test('questionCalls 满 200 个会话时，先淘汰没在等答复的会话，而不是按插入顺序', () => {
+  const { index } = makeIndex({ userQuestions: { answer: async () => true } });
+  // 第一个会话：宿主已经确认在等人回答（`{pending:true}` 的 tool result → continued）。
+  // 这张卡片必须活下来 —— 一淘汰，用户在手机上就再也看不到这个问题。
+  const confirmed = 'session-confirmed';
+  emit(index, confirmed, callEvent('cp', [{ id: 'q1', question: '继续吗？' }]));
+  emit(index, confirmed, resultEvent('cp', JSON.stringify({ pending: true, callId: 'cp' })));
+  assert.equal(index.questionCalls.get(confirmed).get('cp').state, 'continued');
+
+  // 第二个会话：还在跑（turn/start）但只看到 tool/call —— 阻塞式提问永远不进投影，
+  // 它的行一直是 unknown，可卡片还挂着，同样不能按插入顺序淘汰掉。
+  const blocking = 'session-blocking';
+  emit(index, blocking, { type: 'turn/start', data: { turn: 1 } });
+  emit(index, blocking, callEvent('cb', [{ id: 'q1', question: '?' }]));
+  assert.equal(index.getTask(blocking).status, 'running');
+
+  // 之后再来 200 个已经不在跑、只有 tool/call（state=unknown）的会话，把表撑过上限。
+  for (let i = 1; i <= 200; i += 1) {
+    emit(index, `session-${i}`, callEvent(`c${i}`, [{ id: 'q1', question: '?' }]));
+  }
+  assert.equal(index.questionCalls.size, 200, '会话上限仍然是 200');
+  assert.equal(index.questionCalls.has(confirmed), true, '宿主确认待答的卡片不许被淘汰（旧实现按插入顺序会把它丢掉）');
+  assert.equal(index.questionCalls.has(blocking), true, '还在跑的会话的待答卡片不许被淘汰');
+  assert.equal(index.questionCalls.has('session-1'), false, '被淘汰的是最早那个没在等答复的会话');
+});
+
 test('列表行带 awaiting：有挂起提问的会话可被置顶/高亮', () => {
   const { index } = makeIndex({ userQuestions: { answer: async () => true } });
   const id = seedTask(index, 'awaiting-1');

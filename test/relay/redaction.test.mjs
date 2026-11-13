@@ -129,3 +129,33 @@ test('发送失败的错误只留信息、不留钥匙；lastError 可安全展�
   // 发送失败时没有任何一帧落袋，也不会把密文/明文写进日志。
   assert.equal(sent.length, 0);
 });
+
+/**
+ * R3：拒绝日志的模板串曾经引号错位 ——
+ *
+ *     `... method=${String(message.method ?? ').slice(0, 8) || "GET"} path=${String(message.path ?? ').slice(0, 80) || "-"}`
+ *
+ * `?? '` 之后的引号与 `path=` 之后的引号闭合成一个字符串字面量，把
+ * `).slice(0, 8) || "GET"} path=${String(message.path ?? ` 整段吞了进去：拒绝日志
+ * 丢掉 path，method 缺失时还会把源码碎片打出来。`node --check` 对"语法合法、
+ * 语义错位"不报错，所以只能断言日志内容来钉住它 —— 修复回退时这条必红。
+ */
+test('R3：被拒绝的目标必须把 method 与 path 打进日志（模板串不能再吞字段）', async () => {
+  const logger = makeLogger();
+  const { link } = makeLink({ logger });
+
+  await link.handleRequest({ id: 'denied-devices', method: 'DELETE', path: '/api/v1/devices/dev_1' });
+  // 旧外壳可能不带 method：默认 GET，且绝不能把源码碎片打进日志。
+  await link.handleRequest({ id: 'denied-other', path: '/nope/at/all' });
+
+  const lines = logger.lines.filter((line) => line.includes('relay target refused'));
+  assert.equal(lines.length, 2, `两条被拒请求都要留痕（实际 ${lines.length}）`);
+  assert.match(lines[0], /code=devices/u);
+  assert.match(lines[0], /method=DELETE/u);
+  assert.match(lines[0], /path=\/api\/v1\/devices\/dev_1/u, '拒绝日志必须带真实 path');
+  assert.match(lines[1], /method=GET/u, '缺 method 时默认 GET');
+  assert.match(lines[1], /path=\/nope\/at\/all/u);
+  for (const line of lines) {
+    assert.doesNotMatch(line, /\.slice\(|String\(message|path=\$\{/u, `日志里出现了源码碎片：${line}`);
+  }
+});
