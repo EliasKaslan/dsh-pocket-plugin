@@ -99,6 +99,13 @@ test('a login that expires before MQTT is ready is never submitted', async () =>
 });
 
 test('the WebSocket shim preserves send order across Blob, text and close', async (t) => {
+  // Node 22 has EventTarget and MessageEvent but lacks the browser CloseEvent.
+  if (typeof globalThis.CloseEvent === 'undefined') {
+    globalThis.CloseEvent = class extends Event {
+      constructor(type, init) { super(type); Object.assign(this, init); }
+    };
+    t.after(() => { delete globalThis.CloseEvent; });
+  }
   const originalWindow = globalThis.window;
   globalThis.window = { WebSocket: globalThis.WebSocket };
   t.after(() => { if (originalWindow === undefined) delete globalThis.window; else globalThis.window = originalWindow; });
