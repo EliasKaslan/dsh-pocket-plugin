@@ -40,7 +40,7 @@ test('connectOne：error / connack / close 三个事件的断因都要落进 las
     false,
     'error 不许再只写成一句 console.warn',
   );
-  assert.match(source, /client\.on\('connack', \(packet\) => \{/u, 'connack 返回码必须被捕获（4/5 是"中继拒绝"的唯一证据）');
+  assert.match(source, /client\.on\('packetreceive', \(packet\) => \{/u, 'connack 返回码必须被捕获（4/5 是"中继拒绝"的唯一证据）');
   assert.match(source, /normalizeConnack\(packet\)/u, '返回码要兼容 returnCode / reasonCode 两种字段名');
 
   // 三个事件都走同一条记账路径

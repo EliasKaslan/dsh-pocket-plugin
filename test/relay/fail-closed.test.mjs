@@ -120,6 +120,8 @@ test('登录预算耗尽 → 回 locked，且不调用 scrypt 校验', () => {
   assert.ok(reply.retryAfterSec > 0 && reply.retryAfterSec <= 60);
 });
 
+const deviceCore = { provisionDevice: () => ({ token: 'device-token', device: { id: 'phone' } }) };
+
 test('登录成功回令牌、失败回原因；令牌与口令都不落日志', () => {
   const token = 'dshb_issued_token_abcdef0123456789';
   const auth = fakeAuth({
@@ -127,7 +129,7 @@ test('登录成功回令牌、失败回原因；令牌与口令都不落日志',
       ? { ok: true, token, expiresAt: 123, user: 'owner' }
       : { ok: false, reason: 'bad_credentials', retryAfterSec: 0 }),
   });
-  const { link, sent, logger } = makeLink({ auth, allowAnonymous: false });
+  const { link, sent, logger } = makeLink({ auth, allowAnonymous: false, core: deviceCore });
 
   link.handleLogin({ user: 'owner', password: 'correct horse', phone: 'Pixel', remember: true });
   assert.deepEqual(auth.calls.login[0], {
@@ -165,7 +167,7 @@ test('logout 与 auth 检查的响应字段跟着配置走', () => {
     check: (token) => (token === 'ok' ? { phone: 'Pixel', expiresAt: 999 } : null),
     logout: (token) => token === 'ok',
   });
-  const { link, sent } = makeLink({ auth, allowAnonymous: false });
+  const { link, sent } = makeLink({ auth, allowAnonymous: false, core: deviceCore });
 
   link.handleLogout({ token: 'ok' });
   assert.deepEqual(decodeLast(link, sent), { t: 'logout', ok: true });
@@ -185,7 +187,7 @@ test('logout 与 auth 检查的响应字段跟着配置走', () => {
   assert.equal(decodeLast(link, sent).ok, false);
 
   // 匿名模式：不需要登录，ok 直接为 true、required 为 false。
-  const anon = makeLink({ auth: null, allowAnonymous: true });
+  const anon = makeLink({ auth: null, allowAnonymous: true, core: deviceCore });
   anon.link.handleAuthCheck({});
   const publicReply = decodeLast(anon.link, anon.sent);
   assert.equal(publicReply.required, false);

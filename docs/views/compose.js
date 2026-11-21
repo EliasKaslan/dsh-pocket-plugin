@@ -1,6 +1,5 @@
 /** New task screen: prompt, quick starts, working directory, preset. */
-import { $, debounce, h, icon } from '../lib/dom.js';
-import { oneLine } from '../lib/format.js';
+import { h, icon } from '../lib/dom.js';
 import { actionSheet, haptic, toast } from '../lib/ui.js';
 import { LIMITS, store } from '../store.js';
 
@@ -57,7 +56,7 @@ export function mountCompose(root, ctx) {
   for (const item of QUICK) {
     quickRow.append(h('button', {
       class: 'quick-chip', type: 'button',
-      on: { click: () => { haptic(); prompt.value = item.text; prompt.focus(); prompt.setSelectionRange(prompt.value.length, prompt.value.length); syncCounter(); } },
+      on: { click: () => { haptic(); store.draft.text = prompt.value = item.text; prompt.focus(); prompt.setSelectionRange(prompt.value.length, prompt.value.length); syncCounter(); } },
     }, icon(item.icon, { size: 16 }), h('span', { text: item.label })));
   }
 
@@ -68,8 +67,7 @@ export function mountCompose(root, ctx) {
     submit.disabled = prompt.value.trim().length === 0 || store.draft.cwd.length === 0;
   }
 
-  prompt.addEventListener('input', debounce(() => { store.draft.text = prompt.value; syncCounter(); }, 120));
-  prompt.addEventListener('input', syncCounter);
+  prompt.addEventListener('input', () => { store.draft.text = prompt.value; syncCounter(); });
 
   function paintFields() {
     cwdValue.textContent = store.draft.cwd || '选择目录';
@@ -117,7 +115,11 @@ export function mountCompose(root, ctx) {
     submit.querySelector('span').textContent = '正在下发…';
     // Reuse the same clientTaskId across retries so a flaky link cannot create
     // two tasks for one tap.
-    if (!store.draft.clientTaskId) store.draft.clientTaskId = `ct_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+    const draftKey = JSON.stringify([text, store.draft.cwd, store.draft.preset]);
+    if (store.draft.clientTaskKey !== draftKey || !store.draft.clientTaskId) {
+      store.draft.clientTaskKey = draftKey;
+      store.draft.clientTaskId = `ct_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+    }
     try {
       const data = await ctx.api('/api/v1/tasks', {
         method: 'POST',
@@ -134,6 +136,7 @@ export function mountCompose(root, ctx) {
       prompt.value = '';
       store.draft.text = '';
       store.draft.clientTaskId = '';
+      store.draft.clientTaskKey = '';
       ctx.savedCwd(store.draft.cwd);
       if (task?.id) ctx.navigate(`/task/${encodeURIComponent(task.id)}`);
       else ctx.navigate('/tasks');
@@ -150,9 +153,8 @@ export function mountCompose(root, ctx) {
   return {
     screen,
     paint() {
-      // 输入框正在被编辑时绝不回写：input 有 120ms 防抖，用旧的 draft 覆盖会把
-    // 刚敲进去还没落盘的字符吞掉，并让光标跳到末尾（用户看到的是「真丢字」）。
-    if (document.activeElement !== prompt && prompt.value !== store.draft.text) prompt.value = store.draft.text;
+      // Preserve the active selection when other parts of the view repaint.
+      if (document.activeElement !== prompt && prompt.value !== store.draft.text) prompt.value = store.draft.text;
       syncCounter();
       paintFields();
     },

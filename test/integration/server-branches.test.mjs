@@ -543,3 +543,25 @@ function silentLogger() {
   const push = (level) => (...args) => lines.push(`${level} ${args.join(' ')}`);
   return { lines, info: push('info'), warn: push('warn'), error: push('error') };
 }
+
+test('the real-time client receives replay in sequence after the server hello', async () => {
+  const { Realtime } = await import('../../web/lib/net.js');
+  const ctx = await startBridge();
+  try {
+    const device = ctx.mint().device;
+    const before = ctx.core.seq;
+    const queued = ['one', 'two', 'three'].map((tag) => ctx.core.emit('fixture.event', { tag }));
+    const { ticket } = ctx.core.createWsTicket(device);
+    const ws = await wsHandshake(ctx.port, '/ws?ticket=' + ticket + '&since=' + before);
+    assert.equal(ws.status, 101);
+    try {
+      const observed = [];
+      const client = new Realtime({ onFrame: (frame) => observed.push(frame) });
+      const deadline = Date.now() + 2000;
+      while (ws.messages.length < 4 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+      for (const message of ws.messages) client.dispatch(message);
+      assert.equal(observed[0].seq, before);
+      assert.deepEqual(observed.slice(1).map((frame) => frame.seq), queued.map((frame) => frame.seq));
+    } finally { ws.socket.terminate(); }
+  } finally { await ctx.close(); }
+});

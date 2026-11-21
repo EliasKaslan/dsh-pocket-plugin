@@ -157,8 +157,8 @@ test('登录成功 + 带已吊销令牌 → revoked=true，绝不补发（移除
 
   const again = login(link, sent, { deviceToken: first.deviceToken });
 
-  assert.equal(again.ok, true, '口令本身是对的，登录仍然成功');
-  assert.equal(again.token, SESSION);
+  assert.equal(again.ok, false);
+  assert.equal(again.token, undefined);
   assert.equal(again.deviceToken, null, '已吊销令牌绝不能补发新的');
   assert.equal(again.deviceId, null);
   assert.equal(again.revoked, true, '必须明确告诉手机「你被移除了」');
@@ -176,7 +176,7 @@ test('登录成功 + 带伪造/未知令牌 → 同样 revoked=true，一个设�
 
   const reply = login(link, sent, { deviceToken: forged });
 
-  assert.equal(reply.ok, true);
+  assert.equal(reply.ok, false);
   assert.equal(reply.deviceToken, null);
   assert.equal(reply.deviceId, null);
   assert.equal(reply.revoked, true, '不认识的令牌按「已被移除」处理');
@@ -289,7 +289,7 @@ test('auth ok + 带已吊销令牌 → revoked=true、不补发', () => {
   });
   const reply = decodeLast(link, sent);
 
-  assert.equal(reply.ok, true);
+  assert.equal(reply.ok, false);
   assert.equal(reply.deviceToken, null);
   assert.equal(reply.deviceId, null);
   assert.equal(reply.revoked, true);
@@ -407,7 +407,8 @@ test('没有 core 时降级：不发令牌，但应答照常发出（绝不能�
   assert.equal(link.core, null, '未注入 core');
 
   const reply = login(link, sent);
-  assert.equal(reply.ok, true, '口令对就必须回 ok，否则手机只能等超时');
+  assert.equal(reply.ok, false);
+  assert.equal(reply.reason, 'device-unavailable');
   assert.equal(reply.deviceToken, null);
   // 这是接线错误，不是「设备数满」也不是「被移除」：两个标记都不许亮。
   assert.equal('deviceLimit' in reply, false);

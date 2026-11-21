@@ -52,7 +52,7 @@ function fill(link, { method, path, entries, chars }) {
   try {
     for (let index = 0; index < entries; index += 1) {
       const id = `${method.toLowerCase()}-${index}`;
-      const key = `${method} ${path}#${id}`;
+      const key = CloudLink.requestKey(method, path, id);
       link.respond(id, responseOf(id, chars), key, { method });
     }
   } finally {
@@ -69,7 +69,7 @@ test('超预算淘汰后，写请求重放仍然命中"已执行"：不重跑、
   assert.ok(link.recentBytes <= BYTES_BUDGET, `字节预算必须守住（实际 ${Math.round(link.recentBytes / MIB)} MiB）`);
   assert.ok(link.recent.size < 5, '超预算必须淘汰（条数闸 128 挡不住体积）');
 
-  const oldestKey = `POST ${path}#post-0`;
+  const oldestKey = CloudLink.requestKey('POST', path, 'post-0');
   assert.equal(link.recent.has(oldestKey), false, '最旧的那条响应体应已被预算挤掉');
   assert.equal(link.executed.has(oldestKey), true, '"已执行"账本不许跟着响应体一起消失');
 
@@ -99,18 +99,18 @@ test('非写响应优先被淘汰：写请求的响应体留在缓存里，重�
   const previous = link.state;
   link.state = 'idle';
   try {
-    link.respond('post-0', responseOf('post-0', 3.6 * MIB), `POST ${postPath}#post-0`, { method: 'POST' });
+    link.respond('post-0', responseOf('post-0', 3.6 * MIB), CloudLink.requestKey('POST', postPath, 'post-0'), { method: 'POST' });
     for (let index = 0; index < 4; index += 1) {
       const id = `get-${index}`;
-      link.respond(id, responseOf(id, 3.6 * MIB), `GET ${getPath}#${id}`, { method: 'GET' });
+      link.respond(id, responseOf(id, 3.6 * MIB), CloudLink.requestKey('GET', getPath, id), { method: 'GET' });
     }
   } finally {
     link.state = previous;
   }
 
   assert.ok(link.recentBytes <= BYTES_BUDGET, '淘汰之后必须回到预算之内');
-  assert.equal(link.recent.has(`POST ${postPath}#post-0`), true, '写响应必须优先保留（它是最贵的证据）');
-  assert.equal(link.recent.has(`GET ${getPath}#get-0`), false, '最旧的**非写**响应应当先被淘汰');
+  assert.equal(link.recent.has(CloudLink.requestKey('POST', postPath, 'post-0')), true, '写响应必须优先保留（它是最贵的证据）');
+  assert.equal(link.recent.has(CloudLink.requestKey('GET', getPath, 'get-0')), false, '最旧的**非写**响应应当先被淘汰');
 });
 
 test('真实请求路径：写方法记进"已执行"，读方法不记', async () => {
@@ -121,8 +121,8 @@ test('真实请求路径：写方法记进"已执行"，读方法不记', async 
     await link.handleRequest({ id: 'r1', method: 'GET', path: '/api/v1/health' });
 
     assert.equal(stub.calls.length, 2);
-    assert.equal(link.executed.has('POST /api/v1/tasks/task_abc/prompt#w1'), true, '写请求必须留下已执行记录');
-    assert.equal(link.executed.has('GET /api/v1/health#r1'), false, '读请求不需要已执行记录');
+    assert.equal(link.executed.has(CloudLink.requestKey('POST', '/api/v1/tasks/task_abc/prompt', 'w1')), true, '写请求必须留下已执行记录');
+    assert.equal(link.executed.has(CloudLink.requestKey('GET', '/api/v1/health', 'r1')), false, '读请求不需要已执行记录');
 
     // 正常重试（响应体还在）走缓存，不重复执行。
     sent.length = 0;
@@ -146,7 +146,12 @@ test('"已执行"账本有上限：写请求刷屏也不会无限增长', async 
       link.recentBytes = 0;
     }
     assert.ok(link.executed.size <= 512, `已执行账本必须有上限（实际 ${link.executed.size}）`);
-    assert.equal(link.executed.has('POST /api/v1/tasks/task_abc/prompt#w599'), true, '最新那条必须还在');
+    assert.equal(link.executed.has(CloudLink.requestKey('POST', '/api/v1/tasks/task_abc/prompt', 'w0')), true);
+    assert.equal(stub.calls.length, 512);
+    assert.equal(link.executed.has(CloudLink.requestKey('POST', '/api/v1/tasks/task_abc/prompt', 'w599')), false);
+    link.sweepExecuted(Date.now() + 24 * 3600_000);
+    await link.handleRequest({ id: 'next', method: 'POST', path: '/api/v1/tasks/task_abc/prompt' });
+    assert.equal(stub.calls.length, 513);
   } finally {
     stub.restore();
   }

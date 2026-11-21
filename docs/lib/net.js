@@ -45,10 +45,8 @@ export function createApi({ getBase, getToken, onUnauthorized }) {
     }
 
     const headers = { accept: 'application/json' };
-    if (options.auth !== false) {
-      const token = getToken();
-      if (typeof token === 'string' && token.length > 0) headers.authorization = `Bearer ${token}`;
-    }
+    const requestToken = options.auth === false ? null : getToken();
+    if (requestToken) headers.authorization = `Bearer ${requestToken}`;
     let body;
     if (options.body !== undefined) {
       headers['content-type'] = 'application/json';
@@ -98,7 +96,7 @@ export function createApi({ getBase, getToken, onUnauthorized }) {
     }
     if (payload.ok === false) {
       const error = payload.error ?? {};
-      if (response.status === 401) onUnauthorized(error.message ?? '登录已失效');
+      if (response.status === 401 && requestToken && getToken() === requestToken) onUnauthorized(error.message ?? '登录已失效');
       throw new ApiError(error.message ?? `请求失败（HTTP ${response.status}）`, {
         status: response.status,
         code: error.code ?? 'failed',
@@ -106,7 +104,7 @@ export function createApi({ getBase, getToken, onUnauthorized }) {
       });
     }
     if (!response.ok) {
-      if (response.status === 401) onUnauthorized('登录已失效');
+      if (response.status === 401 && requestToken && getToken() === requestToken) onUnauthorized('登录已失效');
       throw new ApiError(`请求失败（HTTP ${response.status}）`, { status: response.status, code: 'http', body: payload });
     }
     return payload.data ?? payload;
@@ -187,6 +185,8 @@ export class Realtime {
     this.onError = onError ?? (() => {});
     this.state = 'offline';
     this.lastSeq = 0;
+    this.bootId = '';
+    this.generation = 0;
     this.failures = 0;
     this.socket = null;
     this.source = null;
@@ -230,15 +230,13 @@ export class Realtime {
     if (this.stopped) return;
     if (this.state === 'online' && force !== true) return;
     if (this.state === 'connecting' && !force) return;
-        // force：连同底层中继一起重建。只重开 WS 隧道救不了"MQTT 已死"的状态，
-        // 那正是"点重连没反应"的原因。
-        if (force) {
-          try { globalThis.__POCKET_RELAY_RESTART__?.('用户点重连'); } catch { /* 没有外壳 */ }
-        }
+    if (force) {
+      try { globalThis.__POCKET_RELAY_RESTART__?.('用户点重连'); } catch { /* 没有外壳 */ }
+    }
     if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.failures = 0;
-    void this.connect();
+    void this.connect({ force });
   }
 
   /**
@@ -252,6 +250,7 @@ export class Realtime {
   }
 
   teardown() {
+    this.generation += 1;
     if (this.connectTimer !== null) clearTimeout(this.connectTimer);
     this.connectTimer = null;
     if (this.pingTimer !== null) clearInterval(this.pingTimer);
@@ -293,10 +292,11 @@ export class Realtime {
     // 只有真的没连上（或显式 force）才允许进来拆。
     if (options?.force !== true) {
       if (this.state === 'online' && this.socket?.readyState === WebSocket.OPEN) return;
-      if (this.state === 'connecting' && this.socket !== null) return;
+      if (this.state === 'connecting') return;
     }
     console.debug(`[pocket-diag] connect start failures=${this.failures} state=${this.state}`);
     this.teardown();
+    const generation = this.generation;
     this.setState('connecting');
     // 两次 WebSocket 失败通常意味着有代理吃掉了 upgrade；这时退回 SSE 轮询。
     // 但**中继外壳里不存在这种场景**：中继承载不了长连接流，退回 SSE 只会永久
@@ -307,12 +307,12 @@ export class Realtime {
     }
     try {
       const ticket = await this.api('/api/v1/ws-ticket', { method: 'POST' });
-      if (this.stopped) return;
+      if (this.stopped || this.generation !== generation) return;
       if (typeof ticket?.ticket !== 'string' || ticket.ticket.length === 0) {
         throw new ApiError('无法获取实时连接票据');
       }
       const base = normalizeBase(this.getBase()).replace(/^http/iu, 'ws');
-      const since = this.lastSeq > 0 ? `&since=${this.lastSeq}` : '';
+      const since = this.bootId || this.lastSeq > 0 ? `&since=${this.lastSeq}&boot=${encodeURIComponent(this.bootId)}` : '';
       const socket = new WebSocket(`${base}/ws?ticket=${encodeURIComponent(ticket.ticket)}${since}`);
       this.socket = socket;
       // 连接超时：到点还没 open 就当作一次失败重来，绝不让状态吊在 connecting。
@@ -328,6 +328,7 @@ export class Realtime {
         this.scheduleReconnect();
       }, CONNECT_TIMEOUT);
       socket.onopen = () => {
+        if (this.socket !== socket || this.stopped) return;
         if (this.connectTimer !== null) clearTimeout(this.connectTimer);
         this.connectTimer = null;
         this.failures = 0;
@@ -336,6 +337,7 @@ export class Realtime {
         this.startPing();
       };
       socket.onmessage = (event) => {
+        if (this.socket !== socket || this.stopped) return;
         let frame;
         try { frame = JSON.parse(event.data); } catch { return; }
         this.dispatch(frame);
@@ -353,7 +355,7 @@ export class Realtime {
         this.scheduleReconnect();
       };
     } catch (error) {
-      if (this.stopped) return;
+      if (this.stopped || this.generation !== generation) return;
       if (error?.status === 401) { this.setState('offline'); return; }
       this.failures += 1;
       this.setState('offline');
@@ -364,7 +366,7 @@ export class Realtime {
   openSse() {
     if (typeof EventSource !== 'function') { this.scheduleReconnect(); return; }
     const base = normalizeBase(this.getBase());
-    const since = this.lastSeq > 0 ? `&since=${this.lastSeq}` : '';
+    const since = this.bootId || this.lastSeq > 0 ? `&since=${this.lastSeq}&boot=${encodeURIComponent(this.bootId)}` : '';
     const url = `${base}/api/v1/events?token=${encodeURIComponent(this.getToken() ?? '')}${since}`;
     try {
       const source = new EventSource(url);
@@ -372,13 +374,15 @@ export class Realtime {
       const types = ['hello', 'summary', 'task.updated', 'task.created', 'task.removed', 'task.message', 'bridge.status', 'devices.changed', 'pong'];
       for (const type of types) {
         source.addEventListener(type, (event) => {
+          if (this.source !== source || this.stopped) return;
           let frame;
           try { frame = JSON.parse(event.data); } catch { return; }
           this.dispatch({ ...frame, type: frame.type ?? type });
         });
       }
-      source.onopen = () => { this.setState('online'); };
+      source.onopen = () => { if (this.source === source && !this.stopped) this.setState('online'); };
       source.onerror = () => {
+        if (this.source !== source || this.stopped) return;
         this.setState('offline');
         if (source.readyState === EventSource.CLOSED) {
           this.source = null;
@@ -398,6 +402,7 @@ export class Realtime {
     if (frame.type === 'pong') { this.lastPong = Date.now(); return; }
     if (frame.type === 'hello') {
       if (Number.isFinite(frame.seq)) this.lastSeq = Number(frame.seq);
+      this.bootId = frame.payload?.bootId ?? '';
       this.lastPong = Date.now();
       this.setState('online');
       this.onFrame(frame, { resync: true });

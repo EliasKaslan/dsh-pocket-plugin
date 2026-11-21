@@ -45,7 +45,7 @@
       name.textContent = device.name || '未命名设备';
       const meta = document.createElement('div');
       meta.className = 'device-meta';
-      const isRelay = device.platform === 'relay';
+      const isRelay = device.localRelay === true;
       const parts = [];
       parts.push(isRelay ? '中继通道' : (device.platform || 'unknown'));
       if (device.appVersion && !isRelay) parts.push(`v${device.appVersion}`);

@@ -1414,17 +1414,14 @@ test('trimClientIds：超过 500 时先删最旧的「已提交」键，PENDING 
 
   // 全部是 PENDING 时无法淘汰 → 直接返回，不无限循环
   const pendingOnly = await makeIndex({ services: { sessionQuery: { async listSessions() { return []; } } } });
-  for (let i = 0; i < 510; i += 1) pendingOnly.index.reserveClientId(`p-${i}`);
-  assert.equal(pendingOnly.index.byClientId.size, 510, 'PENDING 键一个都不能丢（否则幂等被击穿）');
-
-  // 混入一个已提交键 → 它优先被淘汰，PENDING 依然保留
-  pendingOnly.index.rememberClientId('done-key', 'session-x');
-  assert.equal(pendingOnly.index.byClientId.size, 510);
-  assert.equal(pendingOnly.index.byClientId.has('done-key'), false);
-  const stillPending = pendingOnly.index.byClientId.get('p-0');
-  assert.equal(typeof stillPending, 'symbol');
-  assert.equal(stillPending.description, 'pending-create');
-  assert.equal(pendingOnly.index.byClientId.get('p-509'), pendingOnly.index.byClientId.get('p-0'), '同一个 PENDING 哨兵');
+  for (let i = 0; i < 500; i += 1) assert.equal(pendingOnly.index.reserveClientId('p-' + i), true);
+  assert.equal(pendingOnly.index.reserveClientId('extra'), false);
+  assert.equal(pendingOnly.index.byClientId.size, 500);
+  await assert.rejects(pendingOnly.index.createTask({ prompt: 'test', clientTaskId: 'extra' }), { code: 'unavailable' });
+  assert.equal(pendingOnly.index.byClientId.get('p-0').description, 'pending-create');
+  pendingOnly.index.rememberClientId('p-1', 'session-x');
+  assert.equal(pendingOnly.index.reserveClientId('extra'), true);
+  assert.equal(pendingOnly.index.byClientId.get('p-0'), pendingOnly.index.byClientId.get('extra'));
 });
 
 test('createTask：空 prompt / 超长 prompt / 无 agents 服务都给出稳定 code', async () => {
@@ -1505,50 +1502,34 @@ test('createTask：同一 clientTaskId 在飞行中 → create_in_flight', async
   });
 });
 
-test('createTask：followup 失败 → 任务置 error、抛出原始错误、幂等键被清除（可重试）', async () => {
-  const agents = {
-    get() { return undefined; },
-    async create() {
-      return {
-        agent: {
-          header: { id: 'session-fail', createdAt: 1 },
-          async followup() { throw new Error('transport closed'); },
-        },
-      };
+test('createTask reuses the created session and initial message ID after a delivery failure', async () => {
+  let creates = 0;
+  const messages = [];
+  const agent = {
+    header: { id: 'session-fail', createdAt: 1 },
+    async followup(message) {
+      messages.push(message);
+      if (messages.length === 1) throw new Error('transport closed');
     },
   };
   const { index } = await makeIndex({
     config: { allowedRoots: [tmpRoot] },
-    services: { agents, sessionQuery: { async listSessions() { return []; } } },
+    services: {
+      agents: { get: () => agent, async create() { creates++; return { agent }; } },
+      sessionQuery: { async listSessions() { return []; } },
+    },
   });
-  await assert.rejects(
-    index.createTask({ prompt: '发送失败的任务', cwd: tmpRoot, clientTaskId: 'retry-me' }),
-    /transport closed/u,
-  );
-  assert.equal(index.byClientId.has('retry-me'), false, '失败后必须释放幂等键，否则重试永远打不进去');
-  const task = index.getTask('session-fail');
-  assert.equal(task.status, 'error');
-  assert.equal(task.statusReason, 'transport closed');
-
-  // 修复后同一 key 可以重新创建
-  let createCalls = 0;
-  agents.create = async () => {
-    createCalls += 1;
-    return { agent: { header: { id: 'session-ok', createdAt: 2 }, async followup() {} } };
-  };
-  const retried = await index.createTask({ prompt: '重试', cwd: tmpRoot, clientTaskId: 'retry-me' });
-  assert.equal(retried.reused, false);
-  assert.equal(retried.task.id, 'session-ok');
-
-  // 幂等键必须记**真实会话 id**：这里宿主回填的 header.id 是 'session-ok'，与请求里
-  // 生成的 `session-<uuid>` 不同。记请求值时 `tasks.has(hit)` 永远查不到，重放会再打
-  // 一次 agents.create，把上一份 prompt 晾在旧会话里。
-  const stored = index.byClientId.get('retry-me');
-  assert.equal(stored, 'session-ok', '幂等键必须记真实会话 id（handle.agent.header.id），不是请求生成的 sessionId');
-  const replay = await index.createTask({ prompt: '再重放', cwd: tmpRoot, clientTaskId: 'retry-me' });
-  assert.equal(replay.reused, true, '同一 clientTaskId 必须命中已有会话');
-  assert.equal(replay.task.id, 'session-ok');
-  assert.equal(createCalls, 1, '命中的重放不许再建 agent');
+  const input = { prompt: '发送失败的任务', cwd: tmpRoot, clientTaskId: 'retry-me' };
+  await assert.rejects(index.createTask(input), /transport closed/u);
+  assert.equal(index.getTask('session-fail').status, 'error');
+  const retry = await index.createTask(input);
+  assert.equal(retry.task.id, 'session-fail');
+  assert.equal(retry.task.status, 'running');
+  assert.equal(retry.reused, true);
+  assert.equal((await index.createTask(input)).task.id, retry.task.id);
+  assert.equal(creates, 1);
+  assert.equal(messages.length, 2);
+  assert.deepEqual(messages[0], messages[1]);
 });
 
 test('createTask：agent factory 未注册时短暂重试，成功一次即停', async () => {
@@ -1625,7 +1606,7 @@ test('promptTask：空/超长/未知任务全部拒绝；已知任务送到 live
   assert.equal(task.lastText, '追加一句');
 });
 
-test('cancelTask：agent 缺失 → not_running；cancel 抛错也要留 warn 并落 cancelled', async () => {
+test('cancelTask：agent 缺失 → not_running；宿主中断失败时保留原状态', async () => {
   const throwing = await makeIndex({
     services: { agents: { get() { return undefined; } }, sessionQuery: { async listSessions() { return []; } } },
   });
@@ -1638,9 +1619,11 @@ test('cancelTask：agent 缺失 → not_running；cancel 抛错也要留 warn �
     },
   });
   index.upsertRow(row({ id: 'c1', createdAt: 1 }));
-  const task = await index.cancelTask('c1');
-  assert.equal(task.status, 'cancelled');
-  assert.equal(task.statusReason, '已中断');
+  const before = index.getTask('c1').status;
+  await assert.rejects(index.cancelTask('c1'), { code: 'cancel_failed' });
+  assert.equal(index.getTask('c1').status, before);
+  index.services.agents.get = () => ({});
+  await assert.rejects(index.cancelTask('c1'), { code: 'unsupported' });
   assert.ok(logger.lines.some((line) => line.includes('agent cancel failed c1')));
 
   // 有 agent 但没有对应任务：仍返回一个合法视图

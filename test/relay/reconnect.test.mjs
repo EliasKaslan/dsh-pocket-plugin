@@ -263,3 +263,44 @@ test('口令错误时不登记任何设备，也不发令牌', () => {
   assert.equal(reply.deviceToken, undefined);
   assert.equal(world.core.devicesView().length, 0);
 });
+
+test('removal invalidates the bound session, cached login reply and buffered socket data', () => {
+  const world = makeWorld();
+  const { link, sent, core, auth } = world;
+  const loginFrame = { t: 'login', id: 'a'.repeat(24), user: USER, password: PASSWORD, installId: 'phone-a' };
+  link.handleControl(loginFrame);
+  const granted = decodeLast(link, sent);
+  assert.equal(granted.ok, true);
+  assert.ok(auth.check(granted.token).deviceHash);
+  const socket = { close() {} };
+  link.sockets.set('11112222', socket);
+  link.socketSessions.set(socket, granted.token);
+  link.queueSocketFrame('11112222', { data: 'pending event', bin: false });
+  assert.equal(core.revokeDevice(granted.deviceId), true);
+  sent.length = 0;
+  link.flushSocket('11112222');
+  assert.equal(sent.length, 0);
+  link.sweepSockets();
+  assert.equal(link.sockets.size, 0);
+  assert.equal(link.authorized('req', { token: granted.token }), false);
+  const check = authProbe(world, { token: granted.token, installId: 'phone-a' });
+  assert.equal(check.ok, false);
+  assert.equal(check.revoked, true);
+  link.handleControl(loginFrame);
+  const repeat = decodeLast(link, sent);
+  assert.equal(repeat.ok, false);
+  assert.equal(repeat.id, loginFrame.id);
+  assert.equal(repeat.revoked, true);
+  assert.equal(auth.sessions.size, 1);
+  assert.equal(core.devicesView().length, 0);
+});
+
+test('a bound session needs its original device credential to resume a pairing', () => {
+  const world = makeWorld();
+  const grant = login(world, { installId: 'original-phone' });
+  const check = authProbe(world, { token: grant.token, installId: 'other-phone' });
+  assert.equal(check.ok, false);
+  assert.equal(check.deviceToken, null);
+  assert.equal(world.core.devicesView().length, 1);
+  assert.equal(authProbe(world, { token: grant.token, deviceToken: grant.deviceToken }).ok, true);
+});

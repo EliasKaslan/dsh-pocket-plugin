@@ -10,7 +10,7 @@
  *    的职责（连身份文件一起删）。
  */
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { after, test } from 'node:test';
 
@@ -225,17 +225,17 @@ test('重置链接：身份文件被删除、旧令牌作废、下次生成全�
   assert.notEqual(next.key, first.key);
 });
 
-test('身份写入失败只报错、不抛（磁盘/权限问题不能拖垮插件）', () => {
+test('身份保存失败时保留本地插件、报告远程错误并清除临时设备', () => {
   const context = makeCore();
-  mkdirSync(context.dataDir, { recursive: true });
-  // 让目标路径是个目录：rename 一定失败。
   mkdirSync(identityFile(context.dataDir), { recursive: true });
-  const service = makeService(context, { appBase: APP_BASE });
-
-  let identity;
-  assert.doesNotThrow(() => { identity = service.ensureIdentity(); });
-  assert.equal(Buffer.from(identity.key, 'base64url').length, 32);
-  assert.ok(context.logger.lines.some((line) => line.includes('身份写入失败')), '写失败必须留 error 日志');
+  const service = makeService(context, { appBase: APP_BASE }, { auth: fakeAuth() });
+  assert.equal(service.start(47901), 'error');
+  assert.equal(service.status().url, '');
+  assert.equal(service.link, undefined);
+  assert.equal(service.identity, undefined);
+  assert.equal(readdirSync(context.dataDir).some((name) => name.endsWith('.tmp')), false);
+  assert.equal(context.core.devicesView().length, 0);
+  assert.ok(context.logger.lines.some((line) => line.includes('身份写入失败')));
 });
 
 test('discardIdentity：撤掉旧设备并清空内存身份；没有身份时也不抛', () => {
@@ -250,7 +250,7 @@ test('discardIdentity：撤掉旧设备并清空内存身份；没有身份时�
   assert.doesNotThrow(() => service.discardIdentity());
 });
 
-test('已知问题（见报告）：40 字符合法的 base64url 但解不出 32 字节的 key 会被沿用，start() 抛错', () => {
+test('损坏的密钥在读取身份时被识别并重新生成', () => {
   const context = makeCore();
   const minted = context.core.mintDevice({ name: '远程中继' });
   mkdirSync(context.dataDir, { recursive: true });
@@ -261,9 +261,8 @@ test('已知问题（见报告）：40 字符合法的 base64url 但解不出 32
   }), 'utf8');
 
   const service = makeService(context, { appBase: APP_BASE }, { auth: fakeAuth() });
-  const loaded = service.loadIdentity();
-  assert.equal(loaded.key, bogusKey, '当前实现会原样接受这个 key（这就是问题所在）');
-  // 它不会「静默沿用成可用身份」：真正建链时会被 CloudLink 的 32 字节校验拦住。
-  assert.throws(() => service.start(47901), /key must decode to 32 bytes/u,
-    '当前行为是抛错（调用方 index.mjs 用 try/catch 兜住，但 cloud-service 文档承诺 start() 不抛）');
+  assert.equal(service.loadIdentity(), undefined);
+  const replacement = service.ensureIdentity();
+  assert.equal(Buffer.from(replacement.key, 'base64url').length, 32);
+  assert.deepEqual(service.loadIdentity(), replacement);
 });

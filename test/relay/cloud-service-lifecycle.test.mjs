@@ -12,7 +12,7 @@
  * 而且指向本机 closed 端口。
  */
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { after, test } from 'node:test';
 
@@ -605,12 +605,13 @@ test('loadIdentity：token 太短 / deviceId 为空 → 视为损坏，重新生
   assert.equal(identity.token.length >= 20, true);
 });
 
-test('saveIdentity：写失败（目标路径是目录）只记录 error 日志，身份仍然可用', () => {
+test('saveIdentity：目标不可写时报告错误，身份文件恢复后可以重新建立', () => {
   const context = makeContext();
   mkdirSync(path.join(context.dataDir, 'cloud.json'), { recursive: true });
   const service = makeService(context, { appBase: APP_BASE });
-  const identity = service.ensureIdentity();
-  assert.equal(Buffer.from(identity.key, 'base64url').length, 32);
+  assert.throws(() => service.ensureIdentity());
   assert.ok(context.logger.lines.some((line) => line.includes('远程链接身份写入失败')));
-  assert.deepEqual(service.identity, identity);
+  assert.equal(service.identity, undefined);
+  rmSync(path.join(context.dataDir, 'cloud.json'), { recursive: true });
+  assert.deepEqual(service.ensureIdentity(), service.loadIdentity());
 });

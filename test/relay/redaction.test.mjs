@@ -58,7 +58,8 @@ test('二维码链接：秘密只在 # 之后（fragment 不会发给任何服�
   const parsed = new URL(url);
   assert.equal(parsed.search, '', '查询串会随请求发到服务器，秘密不能放这里');
   assert.equal(parsed.pathname, '/app');
-  assert.ok(parsed.hash.includes(`t=${TOKEN}`), '令牌应放在 fragment');
+  assert.equal(new URLSearchParams(parsed.hash.slice(1)).get('t'), '1');
+  assert.ok(!url.includes(TOKEN), '本机中继令牌必须留在电脑端');
   assert.ok(!url.split('#')[0].includes(TOKEN), 'fragment 之前不能出现令牌');
   assert.ok(!url.split('#')[0].includes(link.key));
 });

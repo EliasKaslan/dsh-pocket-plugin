@@ -13,12 +13,12 @@
  * 数据目录默认 `$DSH_HOME/pocket`（DSH_HOME 未设置时用 `~/.dsh`），
  * 插件配置里写了 `dataDir` 的用 `--data <目录>` 指过去。
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 
-import { hashPassword } from '../lib/auth.mjs';
+import { clearSessions, validateCredentials, writeCredentials, PASSWORD_MIN_LENGTH } from '../lib/credentials.mjs';
 
 const args = process.argv.slice(2);
 const flag = (name) => args.includes(`--${name}`);
@@ -32,7 +32,7 @@ const DATA_DIR = path.resolve(argOf('data', path.join(DSH_HOME, 'pocket')));
 const CREDENTIALS = path.join(DATA_DIR, 'auth.json');
 const SESSIONS = path.join(DATA_DIR, 'sessions.json');
 
-const MIN_LENGTH = 8;
+const MIN_LENGTH = PASSWORD_MIN_LENGTH;
 
 function readJson(file) {
   try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return null; }
@@ -108,30 +108,18 @@ if (typeof password === 'string' && password.length > 0) {
   }
 }
 
-if (password.length < MIN_LENGTH) {
-  console.error(`口令至少 ${MIN_LENGTH} 位`);
+const check = validateCredentials({ user, password });
+if (!check.ok) {
+  console.error(check.reason);
   process.exit(2);
 }
-
-// 全空格或全是同一个字符的口令挡一下：这类口令在公网入口上等于没有。
 if (new Set(password).size < 3) {
   console.error('口令太简单（至少要有 3 种不同字符）');
   process.exit(2);
 }
 
-const record = {
-  user: user.trim(),
-  password: hashPassword(password),
-  updatedAt: Date.now(),
-};
-
-mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-writeFileSync(`${CREDENTIALS}.tmp`, JSON.stringify(record, null, 2), { encoding: 'utf8', mode: 0o600 });
-try { chmodSync(`${CREDENTIALS}.tmp`, 0o600); } catch { /* Windows 上是 no-op */ }
-renameSync(`${CREDENTIALS}.tmp`, CREDENTIALS);
-// 改口令 = 旧会话全部作废，避免旧手机拿着旧令牌继续访问。
-rmSync(SESSIONS, { force: true });
-
-console.log(`已设置：${record.user}（scrypt / N=${record.password.N}，明文未落盘）`);
+const record = writeCredentials(CREDENTIALS, { user, password });
+clearSessions(SESSIONS);
+console.log(`已设置：${record.user}（scrypt，明文未落盘）`);
 console.log('所有已登录的手机会被要求重新登录。');
 console.log('下一步：确认插件配置里 authRequired: true，然后重启 DSH（插件代码改动需要冷启动）。');

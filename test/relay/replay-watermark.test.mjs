@@ -12,11 +12,11 @@
  *
  * 现在的语义：
  *  1. 水位**单调不减**：自愈只放行这一帧，`entry.seq` 不动（只刷新 `at` 保活）；
- *  2. 每个被自愈放行的 seq 记进 `healedSeq`，同一 (type, sid, seq) 第二次到达
+ *  2. 每个被自愈放行的 seq 记进 `seenLowSeq`，同一 (type, sid, seq) 第二次到达
  *     直接 `{ ok:false, code:'replay' }`；
  *  3. 计数器被重置的客户端从 1 开始发（seq=1,2,3… ≤64）依旧全部放行 —— 这是
  *     当初加自愈的原因，不能修回去；
- *  4. `sweepSeq()` 一并清理 `healedSeq`，不会只增不减。
+ *  4. `sweepSeq()` 一并清理 `seenLowSeq`，不会只增不减。
  *
  * 残留（有意保留，不能靠单测消除）：每个 key 仍有 seq ≤ 64 的"宽限"，其中每个
  * **不同** seq 都能被放行一次 —— 因为"重置计数器的客户端"和"重放旧帧的人"在
@@ -48,10 +48,7 @@ function req(overrides = {}) {
 /** 直接把水位推到 `seq`（走真实 checkFreshness，不手改内部状态）。 */
 function raiseWatermark(link, seq, sid = SID, type = 'req') {
   const now = Date.now();
-  for (let value = 1; value <= seq; value += 1) {
-    const result = link.checkFreshness(type, { seq: value, ts: now, sid });
-    assert.equal(result.ok, true, `推进水位时 seq=${value} 不该被拒`);
-  }
+  assert.equal(link.checkFreshness(type, { seq, ts: now, sid }).ok, true);
 }
 
 test('水位不可下调：自愈放行后 entry.seq 保持原值', () => {
@@ -152,8 +149,8 @@ test('自愈的水位是"每 key 独立"的：别的 sid / 别的 type 不受影
   raiseWatermark(link, 30, 'aaaa1111', 'ws.msg');
 
   assert.equal(link.checkFreshness('req', { seq: 5, ts: now, sid: SID }).ok, true);
-  assert.equal(link.healedSeq.get(`req:${SID}`)?.has(5), true);
-  assert.equal(link.healedSeq.has('ws.msg:aaaa1111'), false, '别的 key 不该被写入自愈记录');
+  assert.equal(link.seenLowSeq.get(`req:${SID}`)?.has(5), true);
+  assert.equal(link.seenLowSeq.get('ws.msg:aaaa1111')?.has(5), false, '别的 key 不该被写入自愈记录');
   assert.equal(link.checkFreshness('ws.msg', { seq: 5, ts: now, sid: 'aaaa1111' }).ok, true, '另一个 key 的 seq=5 是首次自愈');
 });
 
@@ -163,28 +160,28 @@ test('sweepSeq 一并清理自愈记录（TTL 与硬上限）', () => {
 
   // 正常 key：水位与自愈记录都留着。
   link.lastSeq.set(`req:${SID}`, { seq: 200, at: now });
-  link.healedSeq.set(`req:${SID}`, new Set([3, 4]));
+  link.seenLowSeq.set(`req:${SID}`, new Set([3, 4]));
   // 过期 key：水位被 TTL 清掉后，自愈记录不能变成孤儿。
   link.lastSeq.set('req:dead0001', { seq: 200, at: now - 11 * 60 * 1000 });
-  link.healedSeq.set('req:dead0001', new Set([8]));
+  link.seenLowSeq.set('req:dead0001', new Set([8]));
 
   link.sweepSeq(now);
 
   assert.equal(link.lastSeq.has('req:dead0001'), false);
-  assert.equal(link.healedSeq.has('req:dead0001'), false, '水位没了，自愈记录必须一起清');
-  assert.equal(link.healedSeq.get(`req:${SID}`)?.size, 2, '还在 TTL 内的自愈记录不许被误删');
+  assert.equal(link.seenLowSeq.has('req:dead0001'), false, '水位没了，自愈记录必须一起清');
+  assert.equal(link.seenLowSeq.get(`req:${SID}`)?.size, 2, '还在 TTL 内的自愈记录不许被误删');
 
   // 硬上限：海量新 sid 不许把两张表撑爆（SEQ_TABLE_MAX = 64）。
   for (let index = 0; index < 200; index += 1) {
     const key = `req:${index.toString(16).padStart(8, '0')}`;
     link.lastSeq.set(key, { seq: 100, at: now });
-    link.healedSeq.set(key, new Set([1]));
+    link.seenLowSeq.set(key, new Set([1]));
   }
   link.sweepSeq(now);
   assert.ok(link.lastSeq.size <= 64, `水位表必须有硬上限（实际 ${link.lastSeq.size}）`);
-  assert.ok(link.healedSeq.size <= 64, `自愈记录表必须有硬上限（实际 ${link.healedSeq.size}）`);
+  assert.ok(link.seenLowSeq.size <= 64, `自愈记录表必须有硬上限（实际 ${link.seenLowSeq.size}）`);
   // 自愈记录不许留下没有水位的孤儿 key。
-  for (const key of link.healedSeq.keys()) {
+  for (const key of link.seenLowSeq.keys()) {
     assert.equal(link.lastSeq.has(key), true, `孤儿自愈记录 ${key} 必须被清掉`);
   }
 });
@@ -203,5 +200,25 @@ test('自愈只看 REHEAL_FRESH_MS 内的新鲜帧：陈旧低 seq 不触发自�
   const expired = link.checkFreshness('req', { seq: 4, ts: now - STALE_WINDOW_MS - 1, sid: SID });
   assert.equal(expired.ok, false);
   assert.equal(expired.code, 'bad-ts');
-  assert.equal(link.healedSeq.has(`req:${SID}`), false, '被拒的帧不许留下自愈记录');
+  assert.equal(link.seenLowSeq.has(`req:${SID}`), false, '被拒的帧不许留下自愈记录');
+});
+
+test('a low sequence number accepted in order stays consumed as the high-water mark advances', () => {
+  const { link } = makeLink();
+  const frame = { sid: SID, ts: Date.now(), seq: 4 };
+  assert.equal(link.checkFreshness('req', frame).ok, true);
+  assert.equal(link.checkFreshness('req', { ...frame, seq: 70 }).ok, true);
+  assert.equal(link.checkFreshness('req', frame).code, 'replay');
+});
+
+test('full sequence table retains active pages and frees inactive slots', () => {
+  const { link } = makeLink();
+  const ts = Date.now();
+  for (let i = 0; i < 64; i++) {
+    assert.equal(link.checkFreshness('req', { sid: i.toString(16).padStart(8, '0'), ts, seq: 1 }).ok, true);
+  }
+  assert.equal(link.checkFreshness('req', { sid: SID, ts, seq: 1 }).code, 'busy');
+  assert.equal(link.checkFreshness('req', { sid: '00000000', ts, seq: 1 }).code, 'replay');
+  link.lastSeq.get('req:00000001').at = 0;
+  assert.equal(link.checkFreshness('req', { sid: SID, ts, seq: 1 }).ok, true);
 });

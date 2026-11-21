@@ -420,8 +420,7 @@ test('buildTranscript：max 只保留最后 N 条', () => {
   assert.equal(messages.length, 10);
   assert.equal(messages[0].text, '第20条');
   assert.equal(messages.at(-1).text, '第29条');
-  // max=0 走的是 slice(-0) === slice(0)，等于“不裁”，不是“清空”。钉住现状，缺陷见报告。
-  assert.equal(buildTranscript(events, { max: 0 }).length, 30, 'max=0 实际等于不限制');
+  assert.equal(buildTranscript(events, { max: 0 }).length, 0);
   assert.equal(buildTranscript(events, { max: Number.NaN }).length, 30, 'NaN 不参与比较 → 不裁');
 });
 
@@ -445,18 +444,16 @@ test('buildTranscript：includeInjected 打开后注入消息才会出现', () =
   assert.deepEqual(buildTranscript(events, { includeInjected: true }).map((message) => message.text), ['真人', '注入']);
 });
 
-test('buildTranscript：没有 callId 的工具调用与结果会互相错配（现状记录）', () => {
-  // toolIndex 用 undefined 当键（messages.mjs:240），两条缺 callId 的调用互相覆盖，
-  // 结果最终折进**最后**一条调用。这里钉住现状，缺陷见报告。
+test('buildTranscript：缺少 callId 的结果保留为独立消息', () => {
   const messages = buildTranscript([
     { type: 'tool/call', seq: 1, data: { name: 'a' } },
     { type: 'tool/call', seq: 2, data: { name: 'b' } },
     { type: 'tool/result', seq: 3, data: { message: { content: '结果' } } },
   ]);
-  assert.equal(messages.length, 2, '只有一条调用被填上结果');
-  assert.equal(messages[0].tool.result, undefined, 'seq=1 的调用拿不到结果');
-  assert.equal(messages[1].tool.result, '结果', '结果被折进 seq=2（最后一次写入 undefined 键的调用）');
-  assert.equal(messages[1].tool.status, 'done');
+  assert.equal(messages.length, 3);
+  assert.equal(messages[0].tool.result, undefined);
+  assert.equal(messages[1].tool.result, undefined);
+  assert.equal(messages[2].text, '结果');
 });
 
 test('buildTranscript：Unicode 文本与 emoji 原样进入气泡', () => {

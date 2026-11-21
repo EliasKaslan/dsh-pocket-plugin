@@ -42,8 +42,8 @@ test('手动页：空/不完整链接要给出明确反馈，不许静默 return
   assert.match(source, /这段链接不完整/u, '缺参数要有专门的提示');
   // 以前的核心 bug：空框直接 return
   assert.ok(!/if \(value\.length === 0\) return;/.test(source), '不许再静默返回');
-  // 完整性校验要同时看 r/k/t
-  assert.match(source, /!parsed\.get\('r'\) \|\| !parsed\.get\('k'\) \|\| !parsed\.get\('t'\)/u);
+  // 当前配对需要房间和密钥；旧链接的 t 字段允许保留。
+  assert.match(source, /!parsed\.get\('r'\) \|\| !parsed\.get\('k'\)/u);
 });
 
 test('手动页：输入框会预填上次的链接（可直接点连接）', () => {

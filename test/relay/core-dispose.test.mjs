@@ -80,3 +80,20 @@ test('正常启动（没有 dispose）：照旧 started=true，监听器不被�
   assert.equal(closes, 1, 'dispose 之后才关');
   tmp.cleanup();
 });
+
+test('historical sessions load when sessionQuery arrives during fallback startup', async () => {
+  const { core, tmp } = makeCore();
+  try {
+    const start = core.start();
+    let loads = 0;
+    core.bindService('sessionQuery', { async listSessions() { loads++; return []; } });
+    await start;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(loads, 1);
+    assert.equal(core.index.loadError, undefined);
+    assert.ok(core.index.loadedAt > 0);
+  } finally {
+    core.dispose();
+    tmp.cleanup();
+  }
+});

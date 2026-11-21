@@ -83,7 +83,7 @@ export const store = {
 
   workspaces: [],
   presets: [],
-  draft: { text: '', cwd: '', preset: '', clientTaskId: '' },
+  draft: { text: '', cwd: '', preset: '', clientTaskId: '', clientTaskKey: '' },
   sending: false,
   creating: false,
 
@@ -166,6 +166,7 @@ export function sessionFromShell(prior = store.session) {
   const base = shellBase.length > 0 ? shellBase : (prior?.baseUrl ?? '');
   return normalizeSession({
     token,
+    scope: shell.scope,
     baseUrl: base,
     deviceId: shell?.deviceId || prior?.deviceId || '',
     deviceName: prior?.deviceName ?? '',
@@ -257,6 +258,7 @@ function normalizeSession(value) {
   return {
     token: value.token,
     baseUrl: typeof value.baseUrl === 'string' ? value.baseUrl : '',
+    scope: typeof value.scope === 'string' ? value.scope : '',
     deviceId: String(value.deviceId ?? value.device?.id ?? ''),
     deviceName: String(value.deviceName ?? value.device?.name ?? ''),
     serverName: String(value.serverName ?? value.server?.name ?? ''),
@@ -265,7 +267,10 @@ function normalizeSession(value) {
 }
 
 export function loadSession() {
-  return normalizeSession(readJson(LS.session, null));
+  const session = normalizeSession(readJson(LS.session, null));
+  const shell = globalThis.__POCKET_SHELL__;
+  if (shell?.scope && (session?.scope !== shell.scope || session.token !== shell.deviceToken)) return null;
+  return session;
 }
 
 export function saveSession(session) {
@@ -288,10 +293,14 @@ export function savePrefs(patch = {}) {
 
 /* ---------------- offline cache ---------------- */
 
+export function clearCache() { removeKey(LS.cache); }
+
 export function loadCache() {
   const cache = readJson(LS.cache, null);
   if (cache === null || !Array.isArray(cache.tasks)) return false;
-  if (cache.baseUrl !== baseUrl()) return false;
+  const session = store.session;
+  if (!session || !session.deviceId || cache.scope !== session.scope || cache.deviceId !== session.deviceId
+    || cache.baseUrl !== baseUrl()) return false;
   store.tasks = new Map(cache.tasks.map((task) => [task.id, task]));
   store.order = cache.tasks.map((task) => task.id);
   store.summary = { ...store.summary, ...(cache.summary ?? {}) };
@@ -305,7 +314,10 @@ export function saveCache() {
     .map((id) => store.tasks.get(id))
     .filter((task) => task !== undefined && (task.status === 'running' || (Number(task.updatedAt) || 0) > cutoff))
     .slice(0, LIMITS.cacheTasks);
-  writeJson(LS.cache, { baseUrl: baseUrl(), tasks, summary: store.summary, at: Date.now() });
+  if (store.session?.deviceId) writeJson(LS.cache, {
+    baseUrl: baseUrl(), scope: store.session.scope, deviceId: store.session.deviceId,
+    tasks, summary: store.summary, at: Date.now(),
+  });
 }
 
 /* ---------------- theme ---------------- */

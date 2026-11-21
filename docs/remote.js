@@ -2,8 +2,8 @@
    DSH Pocket · remote shell bootstrap (browser ESM)
    ------------------------------------------------------------
    This page is static. Everything dynamic is tunnelled through an
-   AES-256-GCM sealed MQTT room to the desktop bridge, which is the only
-   party that can open the seal. The UI itself (app.js) is untouched by the
+   shared AES-256-GCM room to the desktop bridge. Holders of the room key
+   can read room traffic. The UI itself (app.js) is untouched by the
    transport: we shim fetch / WebSocket / EventSource and let it talk to a
    fake origin that only exists inside this document.
 
@@ -26,7 +26,7 @@
      并要求重新用口令登录。
    - 但**链接本身会被明文记住**（见 `storeLink()` / `LINK_KEY`）：为了让 PWA
      从桌面图标启动（`manifest.start_url` 带不了 hash）与"浏览器退出再进来"还能
-     直接进，外壳把整条 `#r=…&k=…&t=…` 存进本机 localStorage。`k` 就是房间里
+     直接进，外壳把整条 `#r=…&k=…&t=1` 存进本机 localStorage。`k` 就是房间里
      那把 AES-256-GCM 密钥，所以这是**把解密能力放到本机**：本页所在 origin 上
      的任何脚本都能读到它。这正是外壳必须与 app 同源托管、且不接任何第三方脚本
      的原因（见 `remote/index.html` 的 CSP `script-src 'self'`）。
@@ -130,7 +130,7 @@ const decoder = new TextDecoder();
 
 /* -------------------------------- helpers ------------------------------- */
 
-const $ = (id) => document.getElementById(id);
+const $ = (id) => globalThis.document?.getElementById(id) ?? null;
 
 /** Tiny element factory: attributes, properties and text, never HTML. */
 function el(tag, props = {}, children = []) {
@@ -401,7 +401,9 @@ async function makeSealer(keyB64, room) {
   const keyBytes = unb64u(keyB64);
   if (keyBytes.length !== 32) throw new Error('密钥长度不正确');
   const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+  const scopeBytes = await crypto.subtle.digest('SHA-256', encoder.encode(JSON.stringify([room, keyB64])));
   return {
+    scope: b64(new Uint8Array(scopeBytes)),
     async seal(object, aad) {
       const iv = crypto.getRandomValues(new Uint8Array(12));
       const plaintext = encoder.encode(JSON.stringify(object));
@@ -455,7 +457,9 @@ async function deriveAuthKey(create) {
   );
 }
 
+let authSaveGeneration = 0;
 async function saveAuthSession(session) {
+  const generation = ++authSaveGeneration;
   const payload = encoder.encode(JSON.stringify({ ...session, at: Date.now() }));
   if (crypto?.subtle !== undefined) {
     try {
@@ -464,19 +468,25 @@ async function saveAuthSession(session) {
         const iv = crypto.getRandomValues(new Uint8Array(12));
         const sealed = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, payload);
         const record = { v: 1, iv: b64(iv), ct: b64(new Uint8Array(sealed)) };
-        if (writeStorage('local', LS_AUTH, JSON.stringify(record))) return;
+        if (generation !== authSaveGeneration) return;
+        if (writeStorage('local', LS_AUTH, JSON.stringify(record))) {
+          dropStorage('session', `${LS_AUTH}.plain`);
+          return;
+        }
       }
     } catch { /* fall through to the session-only copy */ }
   }
   // No WebCrypto (or storage refused): keep the token in this tab only.
+  if (generation !== authSaveGeneration) return;
+  dropStorage('local', LS_AUTH);
   writeStorage('session', `${LS_AUTH}.plain`, JSON.stringify(session));
 }
 
-async function loadAuthSession() {
+async function loadAuthSession(scope) {
   const raw = readStorage('local', LS_AUTH);
   if (raw === null) {
     const plain = readStorage('session', `${LS_AUTH}.plain`);
-    return plain === null ? null : parseAuthSession(plain);
+    return plain === null ? null : parseAuthSession(plain, scope);
   }
   try {
     const record = JSON.parse(raw);
@@ -484,7 +494,7 @@ async function loadAuthSession() {
     const key = await deriveAuthKey(false);
     if (key === null) return null;
     const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(record.iv) }, key, unb64(record.ct));
-    return parseAuthSession(decoder.decode(plaintext));
+    return parseAuthSession(decoder.decode(plaintext), scope);
   } catch {
     // Wrong key (fresh browser session) or tampered record: drop it.
     dropStorage('local', LS_AUTH);
@@ -492,20 +502,22 @@ async function loadAuthSession() {
   }
 }
 
-function parseAuthSession(text) {
+function parseAuthSession(text, scope) {
   try {
     const parsed = JSON.parse(text);
     if (parsed === null || typeof parsed !== 'object') return null;
     if (typeof parsed.token !== 'string' || parsed.token.length < 20) return null;
     const expiresAt = Number(parsed.expiresAt) || 0;
     if (expiresAt > 0 && expiresAt <= Date.now()) return null;
-    return { token: parsed.token, expiresAt, user: String(parsed.user ?? '') };
+    if (!scope || parsed.scope !== scope) return null;
+    return { token: parsed.token, scope, expiresAt, user: String(parsed.user ?? '') };
   } catch {
     return null;
   }
 }
 
 function clearAuthSession() {
+  authSaveGeneration += 1;
   dropStorage('local', LS_AUTH);
   dropStorage('session', `${LS_AUTH}.plain`);
 }
@@ -534,14 +546,14 @@ function clearDeviceSession() {
  * 必须在 `auth` 之前读出来：带上它桌面才会「原样回显」而不是又登记一台新
  * 设备 —— 少了这一步，每刷新一次页面就会多出一台设备，直到撞上设备上限。
  */
-function readDeviceSession() {
+function readDeviceSession(scope) {
   for (const key of [SS_SESSION, APP_SESSION_KEY]) {
     const raw = readStorage('local', key);
     if (typeof raw !== 'string' || raw.length === 0) continue;
     try {
       const parsed = JSON.parse(raw);
       const token = typeof parsed?.token === 'string' ? parsed.token : '';
-      if (token.length === 0) continue;
+      if (token.length === 0 || !scope || parsed.scope !== scope) continue;
       return { token, deviceId: typeof parsed?.deviceId === 'string' ? parsed.deviceId : '' };
     } catch { /* 坏了的那份跳过，别让一条脏记录挡住登录 */ }
   }
@@ -553,12 +565,13 @@ function readDeviceSession() {
  *
  * 令牌为空时必须把旧副本清掉：一张已经作废的令牌比没有更糟，它会一直 401。
  */
-function persistDeviceSession(token, deviceId, { name, room }) {
+function persistDeviceSession(token, deviceId, { name, room, scope }) {
   if (typeof token !== 'string' || token.length === 0) {
     clearDeviceSession();
     return;
   }
   saveDeviceSession({
+    scope,
     baseUrl: REMOTE_ORIGIN,
     token,
     deviceId: typeof deviceId === 'string' ? deviceId : '',
@@ -575,6 +588,9 @@ const LOGIN_ERROR_TEXT = {
   timeout: () => '电脑端没有回应，检查网络后重试',
   'send-failed': () => '中继还没连上，稍后重试',
   disabled: () => '电脑端没有启用访问口令',
+  revoked: () => '这台手机的配对已被移除，请重新输入口令配对。',
+  expired: () => '登录已过期，请重新输入口令。',
+  'device-unavailable': () => '电脑暂时无法登记这台手机，请检查电脑端状态后重试。',
 };
 
 /**
@@ -655,8 +671,8 @@ function showLoginGate(relay, { user = '', reason = '' } = {}) {
       errorBox.textContent = '';
       errorBox.classList.remove('is-visible');
       const reply = await relay.login({ user: name, password });
-      if (reply.ok === true && typeof reply.token === 'string') {
-        const session = { token: reply.token, expiresAt: Number(reply.expiresAt) || 0, user: name };
+      if (reply.ok === true && typeof reply.token === 'string' && relay.deviceToken) {
+        const session = { token: reply.token, scope: relay.sealer.scope, expiresAt: Number(reply.expiresAt) || 0, user: name };
         await saveAuthSession(session);
         relay.session = session;
         layer.remove();
@@ -731,7 +747,7 @@ class Relay {
     /** 已被新页面接管：不再重连、界面失效。 */
     this.superseded = false;
     /** 共享就绪等待器（null = 无人等待）。 */
-    this.readyWait = null;
+    this.readyWaiters = new Set();
     /**
      * 最近一次回到前台的时刻。
      *
@@ -777,8 +793,7 @@ class Relay {
     this.deviceIssue = '';
     this.authRequired = false;
     this.authUser = null;
-    this.authWaiter = undefined;
-    this.loginWaiter = undefined;
+    this.controlRequests = new Map();
     this.stats = { rx: 0, tx: 0, err: 0, stale: 0, lastError: '', lastRxAt: 0 };
   }
 
@@ -837,6 +852,7 @@ class Relay {
   async connect() {
     let lastError;
     for (const broker of this.brokers) {
+      if (this.superseded) throw new Error('页面已关闭');
       try {
         await this.connectOne(broker);
         return broker;
@@ -859,7 +875,7 @@ class Relay {
         // 才知道链路已经死了。实测「WiFi 正常、蜂窝反复断」正是这个窗口造成的；
         // 20 s 既显著降低被掐概率，也让死链路早 20 s 被发现。
         keepalive: 20,
-        reconnectPeriod: 3_000,
+        reconnectPeriod: 0,
         // 6 s 足够（实测本地 broker 0.35 s、公共 broker 2–3 s）。原来 12 s 意味着
         // 一次重建在两个 broker 上最多烧掉 26 s，这是「重连很久」的主要来源。
         connectTimeout: 6_000,
@@ -889,14 +905,17 @@ class Relay {
         // 超时这条路**没有** error / close 可等（连接卡在半路），必须在这里记一笔，
         // 否则手机界面上只剩「未知原因」。
         recordFailure({ code: 'ETIMEDOUT', message: '7 秒内没有收到中继的 connack（连接超时）' });
+        if (this.client === client) this.client = undefined;
         try { client.end(true); } catch { /* ignore */ }
         reject(new Error('连接超时'));
       }, 7_000);
 
       client.on('connect', () => {
+        if (this.client !== client || this.superseded) return;
         console.debug(`[pocket-diag] connectOne CONNECTED broker=${broker} settled=${settled}`);
-        this.onstate('online');
-        client.subscribe(this.downTopic, { qos: 1 }, (error) => {
+        client.subscribe(this.downTopic, { qos: 1 }, (error, grants) => {
+          if (this.client !== client || this.superseded || settled) return;
+          if (!error && !grants?.some((grant) => grant.topic === this.downTopic && grant.qos < 128)) error = new Error('中继拒绝了主题订阅');
           console.debug(`[pocket-diag] connectOne SUBSCRIBE ${error ? 'ERR ' + (error.message ?? error) : 'OK'} settled=${settled}`);
           if (error) {
             if (settled) return;
@@ -907,12 +926,14 @@ class Relay {
               code: typeof error?.code === 'string' ? error.code : '',
               message: String(error?.message ?? error),
             });
+            this.client = undefined;
+            client.end(true);
             reject(error);
             return;
           }
+          this.onstate('online');
           this.ready = true;
-    // 唤醒所有等待就绪的发送方（共享 promise，一次性放行）
-    if (this.readyWait !== null) { this.readyWait.release(); this.readyWait = null; }
+          for (const ready of this.readyWaiters) ready(true);
           // 看门狗用 Math.max(pcSeenAt, lastRxAt, readyAt) 当「最后一次活着的时刻」。
           // 没有 readyAt 时，首帧到达前这个下界是 0 → idle 恒等于 Date.now() → 刚建好
           // 的健康链路在头 2 秒里必判 stale，被自己推倒重建（实测 85 s 建了 4 条隧道）。
@@ -931,8 +952,14 @@ class Relay {
           resolve(broker);
         });
       });
-      client.on('message', (_topic, payload) => { void this.onMessage(payload); });
+      // WebCrypto resolves asynchronously. Deliver WS frames in MQTT arrival order.
+      let incoming = Promise.resolve();
+      client.on('message', (topic, payload) => {
+        if (this.client !== client || topic !== this.downTopic) return;
+        incoming = incoming.then(() => this.onMessage(payload, client)).catch(() => { this.stats.err += 1; });
+      });
       client.on('error', (error) => {
+        if (this.client !== client) return;
         // 以前这里只 `console.warn`，而手机上没有控制台 —— 真实断因当场销毁，
         // 用户能看到的只有一句「中继断开，正在重连…」。现在它同时落进
         // `lastFailure`，横幅与连接页的「中继诊断」都能直接读出来。
@@ -942,7 +969,8 @@ class Relay {
         recordFailure({ code, message });
         console.warn('[pocket] mqtt error', error?.message);
       });
-      client.on('connack', (packet) => {
+      client.on('packetreceive', (packet) => {
+        if (packet.cmd !== 'connack' || this.client !== client) return;
         // mqtt.js v5 把 connack 作为事件抛出来；返回码字段两代协议不同名
         // （v4 语义 `returnCode`、MQTT 5 `reasonCode`），交给 normalizeConnack 认。
         // 这条是「网络明明是通的，但中继不收」（返回码 4/5）唯一的证据来源。
@@ -975,6 +1003,14 @@ class Relay {
         }
         this.onstate('offline');
         this.failAll('中继连接中断');
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          this.client = undefined;
+          client.end(true);
+          reject(new Error('底层连接已关闭'));
+          return;
+        }
         // **立刻**安排重连。以前这里什么都不做，全靠 26 s 静默看门狗 + 15 s 冷却，
         // 而每次重建又要顺序等 2 个 broker 的超时 —— 一次网络抖动要几十秒才回来，
         // 用户体感就是「断了以后很久连不上，只能手动重连」。
@@ -998,6 +1034,7 @@ class Relay {
   markSuperseded() {
     if (this.superseded === true) return;
     this.superseded = true;
+    this.failAll('页面已被接管');
     try {
       if (this.staleTimer !== undefined) { clearInterval(this.staleTimer); this.staleTimer = undefined; }
     } catch { /* ignore */ }
@@ -1036,6 +1073,8 @@ class Relay {
     // 若能自己重建，就会反过来把新页面顶掉。
     if (this.superseded === true) return false;
     if (this.restarting === true) return false;
+    clearTimeout(this.fastRetryTimer);
+    this.fastRetryTimer = undefined;
     this.restarting = true;
     this.restartCount += 1;
     this.lastRestartAt = Date.now();
@@ -1076,7 +1115,10 @@ class Relay {
       // 它们会在同一毫秒一起回来，把刚恢复的中继再打趴一次（重连风暴）。
       const backoff = Math.min(15_000, 1_000 * (2 ** Math.min(this.restartCount, 4)));
       const retryDelay = Math.round(backoff * (0.8 + Math.random() * 0.4));
-      setTimeout(() => { void this.restart('重建失败重试'); }, retryDelay);
+      this.fastRetryTimer = setTimeout(() => {
+        this.fastRetryTimer = undefined;
+        if (!this.ready) void this.restart('重建失败重试');
+      }, retryDelay);
       if (this.downSince === 0) this.downSince = Date.now();
       if (this.restartCount >= HARD_RESET_AFTER
         && Date.now() - this.downSince > HARD_RESET_MIN_DOWN_MS) {
@@ -1111,16 +1153,17 @@ class Relay {
         this.onpcStale(stale, stale
           ? `电脑端已离线 ${Math.round(idle / 1000)} 秒 · 正在重连…（列表可能不是最新）`
           : null);
+      }
       // 只显示横幅是不够的：这条链路的坏法就是"看起来连着、其实发不出去"。
       // 静默够久就必须把底层客户端整个重建，否则永远等不到自动重连。
       if (stale && Date.now() - this.lastRestartAt > RESTART_COOLDOWN_MS) {
         void this.restart('下行静默');
       }
-      }
     }, 2_000);
   }
 
-  async onMessage(payload) {
+  async onMessage(payload, client = this.client) {
+    if (payload.byteLength > MAX_FRAME * 2 || client !== this.client) return;
     let message;
     try {
       message = await this.sealer.unseal(decoder.decode(payload), this.downTopic);
@@ -1129,6 +1172,7 @@ class Relay {
       this.stats.lastError = `unseal: ${error?.message}`;
       return; // wrong key / corrupted frame: ignore
     }
+    if (client !== this.client || this.superseded) return;
     this.stats.rx += 1;
     this.stats.lastRxAt = Date.now();
     if (message === null || typeof message !== 'object') return;
@@ -1159,7 +1203,7 @@ class Relay {
         clearTimeout(entry.timer);
         // Expired/revoked token: the desktop answers 401, so drop the local
         // session and go back to the gate instead of spinning.
-        if (Number(message.status) === 401) this.onunauthorized?.();
+        if (Number(message.status) === 401 && entry.sessionToken === this.session?.token && entry.deviceToken === this.deviceToken) this.onunauthorized?.();
         entry.resolve(message);
         break;
       }
@@ -1188,21 +1232,10 @@ class Relay {
         entry.reject(new Error(`中继拒绝了请求（${code === '' ? 'unknown' : code}）`));
         break;
       }
-      case 'auth': {
-        this.authRequired = message.required === true;
-        this.authUser = typeof message.user === 'string' ? message.user : null;
-        // 桌面顺手把设备令牌（或「被移除 / 设备数满」）一起写在应答里。
-        this.absorbDevice(message);
-        if (message.ok === true && Number(message.expiresAt) > 0 && this.session !== null) {
-          this.session.expiresAt = Number(message.expiresAt);
-          void saveAuthSession(this.session);
-        }
-        this.authWaiter?.({ required: this.authRequired, ok: message.ok === true, user: this.authUser });
-        break;
-      }
-      case 'login': {
-        this.absorbDevice(message);
-        this.loginWaiter?.(message);
+      case 'auth.reply':
+      case 'login.reply': {
+        const entry = this.controlRequests.get(message.id);
+        if (entry && message.t === entry.type + '.reply') entry.finish(message);
         break;
       }
       case 'ws.open': {
@@ -1243,6 +1276,7 @@ class Relay {
   }
 
   noteDesktopAlive(message) {
+    this.supportsAuthReplyId = message.authReplyId === true;
     this.pcHello = { name: String(message.name ?? '电脑'), at: Date.now() };
     this.pcSeenAt = Date.now();
     // `beat` carries `ver` too; keep the last known value when it is absent so
@@ -1267,6 +1301,10 @@ class Relay {
     const total = Number(message.total);
     if (!Number.isInteger(seq) || !Number.isInteger(total)) return null;
     if (total < 1 || total > PART_MAX_TOTAL || seq < 0 || seq >= total) return null;
+    if (typeof message.d !== 'string' || message.d.length > Math.ceil(MAX_FRAME / 3) * 4) return null;
+    let chunk;
+    try { chunk = unb64(message.d); } catch { return null; }
+    if (chunk.length > MAX_FRAME) return null;
     const now = Date.now();
     for (const [key, entry] of this.parts) {
       if (now - entry.at > PART_TTL_MS) this.parts.delete(key);
@@ -1279,7 +1317,7 @@ class Relay {
       this.parts.set(key, entry);
     }
     if (entry.total !== total) return null;
-    entry.chunks[seq] = unb64(message.d);
+    entry.chunks[seq] = chunk;
     entry.at = now;
     for (const chunk of entry.chunks) if (chunk === undefined) return null;
     this.parts.delete(key);
@@ -1299,36 +1337,39 @@ class Relay {
   /** 等中继就绪；所有等待者共享同一个 promise，就绪时一次性放行。 */
   waitReady(timeoutMs) {
     if (this.client !== undefined && this.ready) return Promise.resolve(true);
-    if (this.readyWait === null) {
-      let release = () => {};
-      const promise = new Promise((resolve) => { release = resolve; });
-      this.readyWait = { promise, release };
-    }
-    const waiter = this.readyWait;
-    return Promise.race([
-      waiter.promise.then(() => true),
-      new Promise((resolve) => setTimeout(() => resolve(false), timeoutMs)),
-    ]);
+    return new Promise((resolve) => {
+      const finish = (ready) => {
+        clearTimeout(timer);
+        this.readyWaiters.delete(finish);
+        resolve(ready);
+      };
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      this.readyWaiters.add(finish);
+    });
   }
 
-  async send(object) {
-    if (this.client === undefined || !this.ready) {
-      // 不立刻抛：刚打开页面时 App 往往比中继先发起连接，真实环境的公共 broker
-      // 要 1~2 秒才连上。以前这里直接 throw，导致"每次都先失败一次、第二次才成功"。
-      // 用**共享**的 ready promise：旧实现是每个调用方各开一个 50ms 轮询，
-      // 掉线窗口里 N 个并发请求就是 N 个 20Hz 定时器、最多各 160 次唤醒。
-      await this.waitReady(SEND_READY_WAIT_MS);
-      if (this.client === undefined || !this.ready) throw new Error('中继尚未就绪');
+  async send(object, signal) {
+    if (!this.ready || !this.client) {
+      if (!await this.waitReady(SEND_READY_WAIT_MS)) throw new Error('中继尚未就绪');
     }
+    const client = this.client;
+    const publish = async (frame) => {
+      signal?.throwIfAborted();
+      const sealed = await this.sealer.seal(frame, this.upTopic);
+      signal?.throwIfAborted();
+      if (!client || this.client !== client || !this.ready || this.superseded) throw new Error('中继连接已更换');
+      client.publish(this.upTopic, sealed, { qos: 1 });
+    };
     // The token rides on every uplink message: the desktop validates each one
     // statelessly, so a relay restart cannot lose the login.
-    const payload = this.session !== null && object.token === undefined
+    const needsSession = object.t === 'auth' || object.t === 'req' || object.t.startsWith('ws.');
+    const payload = needsSession && this.session !== null && object.token === undefined
       ? { ...object, token: this.session.token }
       : { ...object };
     const raw = encoder.encode(JSON.stringify(payload));
     this.stats.tx += 1;
     if (raw.length <= MAX_FRAME) {
-      this.client.publish(this.upTopic, await this.sealer.seal(payload, this.upTopic), { qos: 1 });
+      await publish(payload);
       return;
     }
     // Uplink fragmentation: the old shell published large frames as a single
@@ -1345,7 +1386,7 @@ class Relay {
         total,
         d: b64(slice),
       };
-      this.client.publish(this.upTopic, await this.sealer.seal(part, this.upTopic), { qos: 1 });
+      await publish(part);
     }
   }
 
@@ -1389,41 +1430,45 @@ class Relay {
   }
 
   /** Ask the desktop whether this link needs a login and whether ours works. */
-  checkAuth(timeoutMs = 8_000) {
+  exchangeControl(type, fields, timeoutMs) {
+    const id = randomId(12);
+    const controller = new AbortController();
     return new Promise((resolve) => {
-      let settled = false;
-      const done = (value) => {
-        if (settled) return;
-        settled = true;
-        this.authWaiter = undefined;
-        resolve(value);
+      const finish = (reply) => {
+        if (!this.controlRequests.delete(id)) return;
+        controller.abort();
+        clearTimeout(timer);
+        resolve(reply);
       };
-      this.authWaiter = done;
-      // `phone` 只在桌面需要新登记一台设备时用到（还没登录过 / 本地没有令牌）。
-      this.send({ t: 'auth', phone: this.phoneName, platform: 'web', ...this.deviceClaim() })
-        .catch(() => done({ required: false, ok: true }));
-      setTimeout(() => done({ required: this.authRequired, ok: !this.authRequired }), timeoutMs);
+      const timer = setTimeout(() => finish({ ok: false, reason: 'timeout' }), timeoutMs);
+      this.controlRequests.set(id, { type, finish });
+      this.send({ t: type, id, ...fields, phone: this.phoneName, platform: 'web', ...this.deviceClaim() }, controller.signal)
+        .catch(() => finish({ ok: false, reason: 'send-failed' }));
     });
   }
 
-  /** Trade a password for a session token. */
-  login({ user, password, remember = true, timeoutMs = 15_000 }) {
-    return new Promise((resolve) => {
-      let settled = false;
-      const done = (value) => {
-        if (settled) return;
-        settled = true;
-        this.loginWaiter = undefined;
-        resolve(value);
-      };
-      this.loginWaiter = done;
-      this.send({ t: 'login', user, password, remember, phone: this.phoneName, platform: 'web', ...this.deviceClaim() })
-        .catch((error) => done({ ok: false, reason: 'send-failed', message: String(error?.message ?? error) }));
-      setTimeout(() => done({ ok: false, reason: 'timeout' }), timeoutMs);
-    });
+  async checkAuth(timeoutMs = 8_000) {
+    const reply = await this.exchangeControl('auth', {}, timeoutMs);
+    if (typeof reply.required !== 'boolean') return { ok: false, unavailable: true };
+    this.authRequired = reply.required;
+    this.authUser = typeof reply.user === 'string' ? reply.user : null;
+    this.absorbDevice(reply);
+    if (reply.ok && this.session && Number(reply.expiresAt) > 0) {
+      this.session.expiresAt = Number(reply.expiresAt);
+      void saveAuthSession(this.session);
+    }
+    return { required: this.authRequired, ok: reply.ok === true, user: this.authUser };
+  }
+
+  async login({ user, password, remember = true, timeoutMs = 15_000 }) {
+    const reply = await this.exchangeControl('login', { user, password, remember }, timeoutMs);
+    this.absorbDevice(reply);
+    return reply;
   }
 
   failAll(reason) {
+    for (const ready of this.readyWaiters) ready(false);
+    for (const entry of this.controlRequests.values()) entry.finish({ ok: false, reason: 'send-failed' });
     for (const [, entry] of this.pending) {
       clearTimeout(entry.timer);
       entry.reject(new Error(reason));
@@ -1449,12 +1494,15 @@ class Relay {
     return new Promise((resolve, reject) => {
       let attempt = 0;
       let settled = false;
-      const entry = { id, at: Date.now(), timer: undefined, resolve: undefined, reject: undefined, retry: undefined };
+      const controller = new AbortController();
+      const entry = { id, at: Date.now(), sessionToken: this.session?.token, deviceToken: this.deviceToken, timer: undefined, resolve: undefined, reject: undefined, retry: undefined };
       const finish = (fn, value) => {
         if (settled) return;
         settled = true;
         clearTimeout(entry.timer);
         this.pending.delete(id);
+        signal?.removeEventListener('abort', abort);
+        controller.abort();
         fn(value);
       };
       entry.resolve = (message) => finish(resolve, message);
@@ -1485,7 +1533,7 @@ class Relay {
           headers,
           body: encoded,
           gzip,
-        }).catch((error) => entry.reject(error));
+        }, controller.signal).catch((error) => entry.reject(error));
         // Early duplicates repair a lost frame in a second or two; the *last*
         // attempt still gets the full per-request budget, because a slow route
         // (a long task list, a POST that spawns an agent) is not a lost frame.
@@ -1539,25 +1587,15 @@ function installFetch(relay) {
       && (url.pathname.startsWith('/api/') || url.pathname === '/healthz');
     if (!isRelayOrigin && !isShellOriginApi) return nativeFetch(input, init);
 
-    const headers = {};
-    const source = init.headers ?? (isRequest ? input.headers : undefined);
-    if (source instanceof Headers) source.forEach((value, name) => { headers[name] = value; });
-    else if (source !== undefined) for (const [name, value] of Object.entries(source)) if (typeof value === 'string') headers[name] = value;
-
-    let body;
-    const rawBody = init.body;
-    if (typeof rawBody === 'string') body = rawBody;
-    else if (rawBody instanceof URLSearchParams) body = rawBody.toString();
-    else if (rawBody instanceof Uint8Array) body = rawBody;
-    else if (rawBody instanceof ArrayBuffer) body = new Uint8Array(rawBody);
-    else if (typeof Blob !== 'undefined' && rawBody instanceof Blob) body = new Uint8Array(await rawBody.arrayBuffer());
-
+    const request = new Request(isRequest ? input : url, init);
+    const method = request.method;
+    const body = request.body === null ? undefined : new Uint8Array(await request.arrayBuffer());
     const reply = await relay.request({
-      method: String(init.method ?? (isRequest ? input.method : 'GET')).toUpperCase(),
+      method,
       path: `${url.pathname}${url.search}`,
-      headers,
+      headers: Object.fromEntries(request.headers),
       body,
-      signal: init.signal,
+      signal: request.signal,
       gzip: typeof DecompressionStream === 'function',
     });
     let bytes = unb64(reply.body ?? '');
@@ -1570,7 +1608,7 @@ function installFetch(relay) {
       try { outHeaders.set(name, value); } catch { /* forbidden header name */ }
     }
     const status = Number(reply.status) || 200;
-    const noBody = status === 204 || status === 205 || status === 304;
+    const noBody = method === 'HEAD' || status === 204 || status === 205 || status === 304;
     return new Response(noBody ? null : bytes, { status, statusText: '', headers: outHeaders });
   };
 }
@@ -1609,6 +1647,7 @@ function installWebSocket(relay) {
       this.onerror = null;
       this.id = randomId(8);
       this.binaryType = 'blob';
+      this.sendQueue = Promise.resolve();
       this.protocol = '';
       this.extensions = '';
       relay.sockets.set(this.id, this);
@@ -1643,7 +1682,12 @@ function installWebSocket(relay) {
     }
 
     _message(message) {
-      const data = message.bin === true ? unb64(message.data) : String(message.data ?? '');
+      if (this.readyState !== PocketWebSocket.OPEN) return;
+      let data = String(message.data ?? '');
+      if (message.bin === true) {
+        const bytes = unb64(data);
+        data = this.binaryType === 'arraybuffer' ? bytes.buffer : new Blob([bytes]);
+      }
       this._emit('message', new MessageEvent('message', { data }));
     }
 
@@ -1662,40 +1706,29 @@ function installWebSocket(relay) {
     }
 
     send(data) {
-      if (this.readyState !== PocketWebSocket.OPEN) throw new Error('WebSocket 未连接');
-      if (typeof data === 'string') {
-        void this._sendFrame(false, data);
-        return;
+      if (this.readyState === PocketWebSocket.CONNECTING) throw new DOMException('WebSocket 未连接', 'InvalidStateError');
+      if (this.readyState !== PocketWebSocket.OPEN) return;
+      const blob = data instanceof Blob;
+      const binary = typeof data !== 'string';
+      let payload = data;
+      if (binary && !blob) {
+        if (data instanceof ArrayBuffer) payload = b64(new Uint8Array(data));
+        else if (ArrayBuffer.isView(data)) payload = b64(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+        else throw new TypeError('WebSocket.send: 不支持的数据类型');
       }
-      if (typeof Blob !== 'undefined' && data instanceof Blob) {
-        void data.arrayBuffer()
-          .then((buffer) => this._sendFrame(true, b64(new Uint8Array(buffer))))
-          .catch(() => {});
-        return;
-      }
-      if (data instanceof ArrayBuffer) {
-        void this._sendFrame(true, b64(new Uint8Array(data)));
-        return;
-      }
-      const view = ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
-      if (view === null) throw new TypeError('WebSocket.send: 不支持的数据类型');
-      void this._sendFrame(true, b64(view));
-    }
-
-    async _sendFrame(bin, data) {
-      try {
-        // 同 ws.close：带上 seq/ts，服务端才能拒掉被录下来重放的隧道帧。
-      await relay.send({ t: 'ws.msg', id: this.id, bin, data, sid: relay.sid, seq: relay.nextSeq(), ts: relay.serverNow() });
-      } catch (error) {
+      this.sendQueue = this.sendQueue.then(async () => {
+        if (this.readyState === PocketWebSocket.CLOSED) return;
+        if (blob) payload = b64(new Uint8Array(await data.arrayBuffer()));
+        await relay.send({ t: 'ws.msg', id: this.id, bin: binary, data: payload, sid: relay.sid, seq: relay.nextSeq(), ts: relay.serverNow() });
+      }).catch((error) => {
         console.warn('[pocket] ws send failed', error?.message);
-      }
+        this._close(1006, 'send failed');
+      });
     }
-
     close(code = 1000, reason = '') {
       if (this.readyState >= PocketWebSocket.CLOSING) return;
       this.readyState = PocketWebSocket.CLOSING;
-      void relay.closeSocket(this.id);
-      setTimeout(() => this._close(code, reason), 0);
+      void this.sendQueue.then(() => relay.closeSocket(this.id)).finally(() => this._close(code, reason));
     }
   }
 
@@ -1751,7 +1784,7 @@ function renderManualEntry(reason) {
   input.value = fromHash.length > 0 ? fromHash : (readStoredLink() ?? '');
   const note = el('small', {
     class: 'pocket-note',
-    text: '链接在电脑端「配对页 → 远程访问」里，形如 …/#r=…&k=…&t=…',
+    text: '链接在电脑端「配对页 → 远程访问」里，形如 …/#r=…&k=…&t=1',
   });
   const form = el('form', { class: 'pocket-card', id: 'pocket-manual-form' }, [
     el('h1', { class: 'pocket-title', text: '连接你的电脑' }),
@@ -1769,9 +1802,9 @@ function renderManualEntry(reason) {
     const parsed = new URLSearchParams(next);
     // 链接必须包含房间、密钥、初始凭据三件套；不完整就明确说出来，
     // 而不是像以前那样静默 return —— 用户只会觉得"点了没反应"。
-    if (next.length === 0 || !parsed.get('r') || !parsed.get('k') || !parsed.get('t')) {
+    if (next.length === 0 || !parsed.get('r') || !parsed.get('k')) {
       note.textContent = value.length === 0
-        ? '还没有填链接：请从电脑端「配对页 → 远程访问」复制完整链接（形如 …/#r=…&k=…&t=…）。'
+        ? '还没有填链接：请从电脑端「配对页 → 远程访问」复制完整链接（形如 …/#r=…&k=…&t=1）。'
         : '这段链接不完整：需要同时包含 r、k、t 三段参数，请从电脑端重新复制。';
       note.classList.add('pocket-note-error');
       input.focus();
@@ -1789,7 +1822,7 @@ function closeChannels(relay) {
 }
 
 /**
- * 链接记忆：把 `#r=…&k=…&t=…` 存进 localStorage，供"裸启动"恢复。
+ * 链接记忆：把 `#r=…&k=…&t=1` 存进 localStorage，供"裸启动"恢复。
  *
  * 只存链接本身（房间、密钥、初始设备凭据），不存登录会话 —— 登录态仍由内层
  * 应用自己保管。桌面端「重置链接」后房间会变，旧值失效时外壳会照常报连不上，
@@ -1812,7 +1845,7 @@ function readStoredLink() {
     const value = globalThis.localStorage?.getItem(LINK_KEY);
     if (typeof value !== 'string' || value.length === 0 || value.length > 4096) return null;
     const parsed = new URLSearchParams(value);
-    if (!parsed.get('r') || !parsed.get('k') || !parsed.get('t')) return null;
+    if (!parsed.get('r') || !parsed.get('k')) return null;
     return value;
   } catch {
     return null;
@@ -1855,33 +1888,34 @@ async function main() {
    * 一次成功的链接必须被记住。
    *
    * 为什么：手机的 PWA 从桌面图标启动时，`manifest.start_url` 里带不了 hash，
-   * 浏览器也可能在"退出后再进来"时丢掉 `#r=…&k=…&t=…`。参数一没，外壳就判定
+   * 浏览器也可能在"退出后再进来"时丢掉 `#r=…&k=…&t=1`。参数一没，外壳就判定
    * "不是中继外壳"，把用户丢到「粘贴链接」页面 —— 那个页面的按钮只是把框里的
    * 内容塞回 hash，框里没有完整链接时自然点了没反应。
    */
   const savedLink = readStoredLink();
   let link = params;
-  if (!params.get('r') || !params.get('k') || !params.get('t')) {
+  const appRoute = location.hash.startsWith('#/');
+  if (!location.hash.slice(1) || appRoute) {
     if (savedLink !== null) {
       link = new URLSearchParams(savedLink);
       // 把地址栏也补回完整链接，后续任何读 location.hash 的代码都一致。
-      try { history.replaceState(null, '', '#' + savedLink); } catch { /* 老浏览器 */ }
+      if (!appRoute) {
+        try { history.replaceState(null, '', '#' + savedLink); } catch { /* 老浏览器 */ }
+      }
     }
   }
 
-  let room = link.get('r');
-  let key = link.get('k');
+  const room = link.get('r');
+  const key = link.get('k');
   // `t` 只用来判断「这是不是一个完整的远程链接」。它以前被当成手机的 API
   // 凭据；现在凭据只有一条路——口令登录换来的 deviceToken（见 persistDeviceSession）。
-  let token = link.get('t');
   const name = link.get('n') ?? 'DSH';
 
-  if (!room || !key || !token) {
+  if (!room || !key) {
     renderManualEntry('这个页面需要电脑端生成的远程链接才能工作。');
     return;
   }
   // 记住这次可用的链接，下次裸启动直接进。
-  storeLink(link.toString());
 
   const hint = resolveBrokerHint(link.get('s'));
   // broker 是**房间身份的一部分**：电脑和手机必须连同一个 broker 才能见面。
@@ -1911,12 +1945,20 @@ async function main() {
 
   const relay = new Relay({ room, sealer, brokers });
   // 上次拿到的设备令牌先装上：`auth` 靠它判断「还是那台设备」还是「新登记一台」。
-  const known = readDeviceSession();
+  if (link.has('t') && link.get('t') !== '1') {
+    link.set('t', '1');
+    if (!appRoute) {
+      try { history.replaceState(null, '', '#' + link.toString()); } catch { /* private browsing */ }
+    }
+  }
+  storeLink(link.toString());
+  const scope = sealer.scope;
+  const known = readDeviceSession(scope);
   if (known !== null) {
     relay.deviceToken = known.token;
     relay.deviceId = known.deviceId;
   }
-  relay.session = await loadAuthSession();
+  relay.session = await loadAuthSession(scope);
   window.__POCKET_RELAY__ = relay;
 
   /**
@@ -2027,7 +2069,7 @@ async function main() {
   try {
     await relay.connect();
   } catch (error) {
-    if (earlyForm !== null) { earlyForm.closest('.pocket-login')?.remove() ?? earlyForm.remove(); }
+    if (earlyForm !== null) { earlyForm.closest('.pocket-gate')?.remove(); }
     // 别把 `连接超时` 这种壳话当结论：真正有用的是 `connectOne` 抓到的 error.code /
     // connack（见 `relay.lastFailure`）。这条路径是"一次都没连上"时**唯一**的界面，
     // 断因在这里丢掉就再也拿不回来了。
@@ -2111,6 +2153,7 @@ async function main() {
     // 不在这里终结引导流程：电脑端可能正重启/热重载，等它回来就继续。
     const arrived = await waitForDesktopHello(relay, 60_000);
     if (!arrived) {
+      earlyForm?.closest('.pocket-gate')?.remove();
       showFatal('电脑端没有响应', '确认电脑上的 DSH 正在运行，且「远程访问」已开启');
       return;
     }
@@ -2125,21 +2168,22 @@ async function main() {
   // 就发，结果是「电脑端还没起来」时那次请求收不到应答，超时重发后落到了另一条
   // 分支，最终显示的是 App 自己的 /connect 页（只有「重新登录」按钮、没有账号
   // 密码框），与「电脑一直在」时的登录闸门不一致。省 0.8 s 不值得换来两套界面。
+  if (!relay.supportsAuthReplyId) {
+    earlyForm?.closest('.pocket-gate')?.remove();
+    showFatal('需要更新电脑端插件', '请将电脑端插件更新到与此手机页面配套的版本，然后重新加载。');
+    return;
+  }
   const authState = await relay.checkAuth();
+  if (authState.unavailable || (!authState.required && !authState.ok)) {
+    earlyForm?.closest('.pocket-gate')?.remove();
+    showFatal('未能确认登录状态', '电脑未确认这次登录检查，请检查连接后重新加载。');
+    return;
+  }
   if (authState.required && !authState.ok) {
-    relay.onunauthorized = () => {
-      clearAuthSession();
-      relay.session = null;
-      // 设备被移除 / 会话失效时，**直接给出口令框**，而不是让 App 自己跳到
-      // /connect 那个只有「重新登录」按钮、没有输入框的页面（实测被判无效后
-      // 落到的就是那个页面，用户还得再点一次才看得到输入框）。
-      if (document.getElementById('pocket-login-form') === null) {
-        void showLoginGate(relay, { reason: '登录已过期，请重新登录' })
-          .then((ok) => { if (ok) location.reload(); });
-      } else if (earlySubmit !== null) {
-        earlySubmit.disabled = false;
-      }
-    };
+    // A fresh password login provisions this installation again, including after revocation.
+    clearAuthSession();
+    relay.session = null;
+    relay.dropDevice('');
     hideSplash();
     if (earlyGate !== null) {
       // 早期就画好的那个框直接启用，不用再画一遍。
@@ -2156,20 +2200,18 @@ async function main() {
       showFatal('需要登录', '没有登录就无法访问这台电脑');
       return;
     }
-  } else if (authState.required) {
-    // 不需要登录（已持有有效会话）：把早期预报的登录框摘掉，别让它挡着界面。
-    if (earlyForm !== null) { earlyForm.closest('.pocket-login')?.remove() ?? earlyForm.remove(); }
-    relay.onunauthorized = () => {
-      clearAuthSession();
-      relay.session = null;
-      void showLoginGate(relay, { user: authState.user ?? '', reason: '登录已过期，请重新登录' })
-        .then((ok) => { if (ok) location.reload(); });
-    };
+  } else {
+    earlyForm?.closest('.pocket-gate')?.remove();
   }
+  relay.onunauthorized = () => {
+    clearAuthSession();
+    relay.session = null;
+    relay.dropDevice('');
+    if (!relay.authRequired || document.getElementById('pocket-login-form') !== null) return;
+    void showLoginGate(relay, { user: relay.authUser ?? '', reason: '登录已过期，请重新登录' })
+      .then((ok) => { if (ok) location.reload(); });
+  };
 
-  // 设备令牌：口令登录成功时桌面已经随应答一起下发（首次登录会自动登记一台）。
-  // 被移除 / 设备数满时桌面明确回 deviceToken:null，并且**不会**自动补发 ——
-  // 这两种情况绝不能再拿链接里的令牌顶上，否则「移除设备」就形同虚设。
   if (relay.deviceIssue === 'revoked') {
     // 设备被移除 = 这台手机的凭据作废：连 15 天登录会话一起清掉，
     // 下一次真正走一遍口令登录（口令是唯一凭据）。
@@ -2182,7 +2224,7 @@ async function main() {
   const deviceToken = relay.deviceToken;
 
   // Device session: app.js needs a record to build its Authorization header.
-  persistDeviceSession(deviceToken, relay.deviceId, { name, room });
+  persistDeviceSession(deviceToken, relay.deviceId, { name, room, scope });
 
   installShims(relay);
   hideSplash();
@@ -2191,6 +2233,7 @@ async function main() {
   // Contract with web/app.js: set before the import, read at module evaluation.
   globalThis.__POCKET_SHELL__ = {
     mode: 'remote',
+    scope,
     baseUrl: REMOTE_ORIGIN,
     swUrl: './sw.js',
     assetBase: './',
@@ -2208,7 +2251,7 @@ async function main() {
         .then((ok) => {
           if (!ok) return;
           // 闸门刚换到的新设备令牌得先落盘，否则刷新后又要重新登记一台。
-          persistDeviceSession(relay.deviceToken, relay.deviceId, { name, room });
+          persistDeviceSession(relay.deviceToken, relay.deviceId, { name, room, scope });
           location.reload();
         });
     },
@@ -2227,7 +2270,9 @@ async function main() {
      *   3. 记住的链接（含房间密钥）—— 否则下一个用这台手机的人还能进这个房间。
      */
     forgetSession() {
-      clearDeviceSession();
+      const token = relay.session?.token;
+      relay.session = null;
+      if (token && relay.ready) void relay.send({ t: 'logout', token }).catch(() => {});
       clearAuthSession();
       relay.dropDevice('');
       dropStoredLink();
@@ -2244,4 +2289,9 @@ async function main() {
   }
 }
 
-void main();
+export { Relay, installFetch, installWebSocket, makeSealer };
+
+if (typeof document !== 'undefined') void main().catch((error) => {
+  document.getElementById('pocket-login')?.remove();
+  showFatal('无法启动手机界面', String(error?.message ?? error));
+});

@@ -226,3 +226,14 @@ test('重启后（新 core 读同一 dataDir）仍认得这个令牌，设备数
   assert.equal(restarted.devicesView().length, 1);
   assert.equal(restarted.authenticateToken(issued.token).id, issued.device.id, '只存 sha256 也必须能认回来');
 });
+
+test('only the desktop identity is protected from device removal', () => {
+  const { core } = makeCore();
+  const desktop = core.mintDevice({ name: '远程中继', platform: 'relay' });
+  core.setCloud({ identity: { deviceId: desktop.device.id } });
+  const phone = core.provisionDevice({ name: '远程中继', platform: 'relay' });
+  assert.notEqual(phone.device.id, desktop.device.id);
+  assert.equal(core.deviceView(core.authenticateToken(desktop.token)).localRelay, true);
+  assert.equal(core.removeDevice(desktop.device.id), false);
+  assert.equal(core.removeDevice(phone.device.id), true);
+});

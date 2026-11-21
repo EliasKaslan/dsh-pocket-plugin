@@ -47,8 +47,8 @@ test('retry()：关掉全部隧道、清掉在途 RPC 与分片表，然后才�
   assert.equal(link.sockets.size, 1);
 
   // 两条在途 RPC + 一份未拼完的分片。
-  link.pending.set('rpc-1', { at: Date.now(), timer: setTimeout(() => {}, 60_000) });
-  link.pending.set('rpc-2', { at: Date.now(), timer: setTimeout(() => {}, 60_000) });
+  link.pending.set('rpc-1', { at: Date.now(), controller: new AbortController() });
+  link.pending.set('rpc-2', { at: Date.now(), controller: new AbortController() });
   link.parts.set('part:abcdef012345', { chunks: [Buffer.from('x')], total: 2, at: Date.now() });
 
   let connects = 0;
@@ -78,7 +78,7 @@ test('看门狗重建链路时同样清理隧道（broker 半死不会触发 clo
 
   link.handleSocketOpen({ id: 'aaaa1111', sid: 'page0002', path: '/ws' });
   created[0].emit('open');
-  link.pending.set('rpc-3', { at: now, timer: setTimeout(() => {}, 60_000) });
+  link.pending.set('rpc-3', { at: now, controller: new AbortController() });
 
   // 应用层证据全部老旧：connected 仍是 true（TCP 还在），但上行没有 ACK、也没有帧。
   link.connectedAt = now - 120_000;

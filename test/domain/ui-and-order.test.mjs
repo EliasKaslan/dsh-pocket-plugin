@@ -197,6 +197,6 @@ test('配对页：中继设备不给「移除」按钮（它是本机凭据，�
 
   // 前端刷新
   const js = read('web/pair.js');
-  assert.match(js, /const isRelay = device\.platform === 'relay'/u, '前端刷新也要识别');
+  assert.match(js, /const isRelay = device\.localRelay === true/u, '前端刷新也要识别');
   assert.match(js, /本机 · 不可移除/u);
 });

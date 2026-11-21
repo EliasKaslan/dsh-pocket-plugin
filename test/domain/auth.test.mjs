@@ -17,6 +17,8 @@ import {
   Auth, hashPassword, SESSION_TTL_MS, verifyPassword,
 } from '../../lib/auth.mjs';
 
+import { writeCredentials } from '../../lib/credentials.mjs';
+
 const FAST = { N: 1024, r: 8, p: 1, keylen: 32 };
 const PASSWORD = '正确口令 Passw0rd!';
 const DAY = 24 * 60 * 60 * 1000;
@@ -264,25 +266,12 @@ test('check：令牌过期即失效，并从内存与磁盘同时删除', () => 
   assert.deepEqual(JSON.parse(readFileSync(sessions, 'utf8')).sessions, [], '过期令牌必须从磁盘删除');
 });
 
-test('写盘后 sessionsSignature 不同步：下一次 check 会整份重载，内存改动被覆盖（现状记录）', () => {
-  const dir = scratch();
-  const { auth, sessions } = makeAuth(dir);
+test('本次登录写盘后不触发外部重载', () => {
+  const { auth } = makeAuth(scratch());
   const { token } = auth.login({ user: 'alice', password: PASSWORD });
-  const key = digest(token);
-
-  // saveSessions() 只写文件、不回写 sessionsSignature，
-  // 于是 save 之后的第一次 maybeReload 一定认为“文件被外部改过”。
-  // 签名是「mtime:size」，必须两个都比 —— 只比 mtime 的话，同一毫秒内的
-  // 连续两次写会被漏掉（那是另一个真 bug，见 lib/auth.mjs 的 fileSignature）。
-  const onDisk = statSync(sessions);
-  assert.equal(typeof auth.sessionsSignature, 'string', 'sessionsSignature 必须存在，否则这条断言是空转');
-  assert.notEqual(auth.sessionsSignature, `${onDisk.mtimeMs}:${onDisk.size}`,
-    'login 写盘后 sessionsSignature 还停在写之前');
-
-  auth.sessions.get(key).expiresAt = Date.now() - 1;
-  assert.equal(auth.check(token) !== null, true,
-    'check 先 reload，内存里刚被改成“已过期”的会话会被磁盘内容复活');
-  assert.equal(auth.maybeReload(), false, '这次 check 顺带把 sessionsSignature 同步了');
+  assert.equal(auth.maybeReload(), false);
+  auth.sessions.get(digest(token)).expiresAt = Date.now() - 1;
+  assert.equal(auth.check(token), null);
 });
 
 test('prune：只清过期会话，返回清除条数；没有过期时不写盘', () => {
@@ -394,7 +383,7 @@ test('sweepBuckets：只清“没锁且失败全在窗口外”的桶', () => {
   assert.deepEqual([...auth.buckets.keys()].sort(), ['locked', 'recent-failure']);
 });
 
-test('bucket 的数量上限是软上限：能清就清，清不掉就继续长', () => {
+test('bucket 达到上限时保留生效中的锁并拒绝新来源', () => {
   const dir = scratch();
   const { auth } = makeAuth(dir, { required: false, withCredentials: false });
   for (let index = 0; index < 512; index += 1) auth.bucket(`k${index}`);
@@ -403,13 +392,13 @@ test('bucket 的数量上限是软上限：能清就清，清不掉就继续长'
   auth.bucket('k512');
   assert.equal(auth.buckets.size, 1, '空桶在触发上限时被清掉');
 
-  // 所有桶都被锁住时 sweep 删不掉任何东西，于是会超过上限继续增长（软上限）。
+  // 已锁定的来源必须保留计数。
   auth.buckets.clear();
   for (let index = 0; index < 512; index += 1) {
     auth.buckets.set(`k${index}`, { failures: [], lockedUntil: Date.now() + 60_000, lockCount: 1 });
   }
-  auth.bucket('overflow');
-  assert.equal(auth.buckets.size, 513, '锁住的桶不会被清理，上限只是软约束');
+  assert.equal(auth.bucket('overflow'), undefined);
+  assert.equal(auth.buckets.size, 512);
 });
 
 test('登录失败：错用户名与错口令都只回 bad-credentials，且都计入同一个桶', () => {
@@ -676,4 +665,34 @@ test('authorize：required 但凭据缺失时 fail-closed；闸门正常时按�
     logger: { info() {}, warn() {}, error() {} },
   });
   assert.deepEqual(off.authorize('anything'), { required: false, ok: true, session: null });
+});
+
+test('credential changes invalidate both legacy and versioned session files even if cleanup is interrupted', () => {
+  const { auth, credentials, sessions } = makeAuth(scratch());
+  const legacy = auth.login({ user: 'alice', password: PASSWORD });
+  const old = JSON.parse(readFileSync(sessions, 'utf8'));
+  writeFileSync(sessions, JSON.stringify({ sessions: old.sessions }));
+  writeCredentials(credentials, { user: 'reset', password: 'first-new-pass' });
+  assert.equal(auth.check(legacy.token), null);
+  const fresh = auth.login({ user: 'reset', password: 'first-new-pass' });
+  assert.ok(auth.check(fresh.token));
+  writeCredentials(credentials, { user: 'reset', password: 'second-new-pass' });
+  assert.equal(new Auth({ required: true, credentialsFile: credentials, sessionsFile: sessions }).check(fresh.token), null);
+  assert.equal(auth.check(fresh.token), null);
+});
+
+test('a short session issued at full capacity can immediately authenticate', () => {
+  const { auth } = makeAuth(scratch());
+  for (let i = 0; i < 20; i++) auth.login({ user: 'alice', password: PASSWORD });
+  const next = auth.login({ user: 'alice', password: PASSWORD, remember: false });
+  assert.equal(auth.check(next.token)?.short, true);
+  assert.equal(auth.sessions.size, 20);
+});
+
+test('a running Auth instance follows removed and newly created credentials', () => {
+  const { auth, credentials } = makeAuth(scratch());
+  rmSync(credentials);
+  assert.equal(auth.login({ user: 'alice', password: PASSWORD }).reason, 'misconfigured');
+  writeCredentials(credentials, { user: 'alice', password: PASSWORD });
+  assert.equal(auth.login({ user: 'alice', password: PASSWORD }).ok, true);
 });

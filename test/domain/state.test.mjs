@@ -305,20 +305,18 @@ test('addDevice：缺省字段都有兜底，缺 id 时自动生成', () => {
   assert.match(store.addDevice({ id: '', tokenHash: sha256('t2') }).id, /^dev_/u);
 });
 
-test('addDevice：同一 id 重配对时，缺省的 name 会把已存的设备名抹掉（现状记录）', () => {
+test('addDevice：同一 id 重配对时保留已登记的设备信息', () => {
   const dir = scratch();
   const { store, file } = makeStore(dir);
   const tokenHash = sha256('t');
   store.addDevice({ id: 'dev_keep', name: '我的手机', platform: 'android', tokenHash });
   assert.equal(store.devices[0].name, '我的手机');
 
-  // 新增分支有 `name || '未命名设备'` 兜底，重建分支（state.mjs:112-119）没有：
-  // 重配对时如果客户端没带 name，磁盘上的名字就变成 undefined。
   store.addDevice({ id: 'dev_keep', tokenHash: sha256('t2') });
-  assert.equal(store.devices[0].name, undefined, '重配对把设备名冲掉了（现状）');
-  assert.equal(store.devices[0].platform, undefined);
+  assert.equal(store.devices[0].name, '我的手机');
+  assert.equal(store.devices[0].platform, 'android');
   assert.equal(store.devices[0].tokenHash, sha256('t2'), '令牌哈希仍然要换新');
-  assert.equal('name' in readState(file).devices[0], false, 'undefined 被 JSON 序列化丢键');
+  assert.equal(readState(file).devices[0].name, '我的手机');
 });
 
 test('findDeviceByTokenHash：空/非字符串一律查不到，非法记录被跳过', () => {

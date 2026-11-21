@@ -152,7 +152,7 @@ test('在途请求上限 96：超了回 503 busy，而不是把本机拖死', as
   const { link, sent } = makeLink();
   const stub = stubFetch();
   try {
-    for (let index = 0; index < 97; index += 1) link.pending.set(`seed-${index}`, { at: 0 });
+    for (let index = 0; index < 96; index += 1) link.pending.set(`seed-${index}`, { controller: new AbortController() });
     await link.handleRequest({ id: 'overflow', method: 'GET', path: '/api/v1/health' });
     assert.equal(stub.calls.length, 0);
     const refusal = decodeAll(link, sent).find((message) => message.id === 'overflow');

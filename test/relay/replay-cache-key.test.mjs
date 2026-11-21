@@ -48,3 +48,30 @@ test('同 id、同方法、同路径的重发：仍然只执行一次，第二�
     stub.restore();
   }
 });
+
+test('a reconnect during a pending write still executes the upstream operation once', async (t) => {
+  const { link } = makeLink();
+  const upstream = Promise.withResolvers();
+  const fetch = t.mock.method(globalThis, 'fetch', () => upstream.promise);
+  const request = { method: 'POST', path: '/api/v1/tasks', id: 'pending', body: 'e30=' };
+  const first = link.handleRequest(request);
+  link.clearPending();
+  await link.handleRequest(request);
+  assert.equal(fetch.mock.callCount(), 1);
+  upstream.resolve(new Response('{}'));
+  await first;
+  await link.handleRequest(request);
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.equal(link.pending.size, 0);
+});
+
+test('response caches are private to each login and device credential', async (t) => {
+  const { link } = makeLink();
+  const upstream = t.mock.method(globalThis, 'fetch', async () => new Response('{}'));
+  const req = { method: 'GET', path: '/api/v1/me', id: 'shared' };
+  for (const [token, authorization] of [['a', 'device-a'], ['b', 'device-b'], ['b', 'device-c'], ['b', 'device-c']]) {
+    await link.handleRequest({ ...req, token, headers: { Authorization: authorization } });
+  }
+  assert.equal(upstream.mock.callCount(), 3);
+  assert.equal(link.stats.replays, 1);
+});

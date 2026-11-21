@@ -21,7 +21,7 @@ import { parseShellBuild, shellCacheBuilds, staleShellBuilds } from './lib/shell
 import { unpairStorageKeys } from './lib/shell-session.js';
 import { toast } from './lib/ui.js';
 import {
-  LIMITS, applyTheme, baseUrl, isRelayShell, loadCache, loadPrefs, loadSession,
+  LIMITS, applyTheme, baseUrl, clearCache, isRelayShell, loadCache, loadPrefs, loadSession,
   saveCache, savePrefs, saveSession, serverName, sessionFromShell, shellDeviceError, store, token,
 } from './store.js';
 import { mountCompose } from './views/compose.js';
@@ -228,8 +228,10 @@ function onFrame(frame) {
 /* ---------------- data loading ---------------- */
 
 async function loadMe() {
+  const requestToken = token();
   try {
     const data = await api('/api/v1/me');
+    if (token() !== requestToken) return;
     store.me = data;
     if (data?.server) {
       store.bridge = { ...(store.bridge ?? {}), ...data.server };
@@ -240,6 +242,7 @@ async function loadMe() {
     const started = performance.now();
     try {
       const health = await api('/api/v1/health', { auth: false, timeout: 6000 });
+      if (token() !== requestToken) return;
       store.latency = Math.max(1, Math.round(performance.now() - started));
       if (health !== null && typeof health === 'object') store.bridge = { ...(store.bridge ?? {}), ...health };
     } catch { /* latency is best effort */ }
@@ -248,12 +251,16 @@ async function loadMe() {
   }
 }
 
+let taskListRequest = 0;
 async function loadTasks({ silent = false } = {}) {
-  if (store.session === null) return;
+  const requestToken = token();
+  if (!requestToken) return;
+  const request = ++taskListRequest;
   if (!silent) store.loading = store.tasks.size === 0;
   try {
     const subagents = store.prefs.showSubagents === true ? '1' : '0';
     const data = await api(`/api/v1/tasks?limit=${LIMITS.taskPage}&subagents=${subagents}`, { timeout: 25_000 });
+    if (request !== taskListRequest || token() !== requestToken) return;
     const list = Array.isArray(data?.tasks) ? data.tasks : [];
     store.tasks = new Map(list.map((task) => [task.id, task]));
     store.order = list.map((task) => task.id);
@@ -280,6 +287,7 @@ async function loadTasks({ silent = false } = {}) {
       if (fresh !== undefined && store.detail !== null) store.detail.task = fresh;
     }
   } catch (error) {
+    if (request !== taskListRequest || token() !== requestToken) return;
     store.loading = false;
     if (!silent) {
       store.loadError = error?.message ?? '读取任务失败';
@@ -291,16 +299,20 @@ async function loadTasks({ silent = false } = {}) {
 }
 
 async function loadPresets() {
+  const requestToken = token();
   try {
     const data = await api('/api/v1/presets');
+    if (token() !== requestToken) return;
     store.presets = Array.isArray(data?.presets) ? data.presets : [];
     if (store.draft.preset.length === 0 && typeof data?.defaultId === 'string') store.draft.preset = data.defaultId;
   } catch { /* optional capability */ }
 }
 
 async function loadWorkspaces() {
+  const requestToken = token();
   try {
     const data = await api('/api/v1/workspaces');
+    if (token() !== requestToken) return;
     store.workspaces = Array.isArray(data?.workspaces) ? data.workspaces : [];
     const normPath = (p) => String(p).replace(/[\\/]+$/u, '').toLowerCase();
     // 已注册工作区（registry 里的）与"只是历史会话目录"（recent）要分开：
@@ -536,7 +548,12 @@ function upsertTask(task, { repaint: shouldRepaint = true } = {}) {
 
 function parseRoute(hash) {
   const raw = String(hash ?? location.hash ?? '').replace(/^#/u, '');
-  if (raw.startsWith('/task/')) return { name: 'detail', id: decodeURIComponent(raw.slice(6)) };
+  if (raw.startsWith('/task/')) {
+    try {
+      const id = decodeURIComponent(raw.slice(6));
+      if (id) return { name: 'detail', id };
+    } catch { /* malformed bookmarks open the list */ }
+  }
   if (raw === '/new') return { name: 'new' };
   if (raw === '/settings') return { name: 'settings' };
   if (raw === '/connect') return { name: 'connect' };
@@ -720,12 +737,13 @@ function makeContext() {
      * 按 `unpairStorageKeys()` 的清单直接删（同一份清单，单测钉住）。
      */
     unpair() {
+      clearCache();
       const shell = globalThis.__POCKET_SHELL__;
       try {
         if (typeof shell?.forgetSession === 'function') shell.forgetSession();
         for (const key of unpairStorageKeys()) globalThis.localStorage?.removeItem(key);
       } catch { /* 隐私模式 / 没有 localStorage：下面的 signOut 仍会把会话置空 */ }
-      signOut({ forget: true });
+      signOut();
     },
     /** 回到口令闸门：清掉登录会话与设备令牌，由中继外壳重新弹登录页。 */
     relogin() {
@@ -753,10 +771,16 @@ function repaint() { repaintScheduled(); }
 
 /* ---------------- session lifecycle ---------------- */
 
-function signOut({ forget = false } = {}) {
+function signOut() {
   stopRealtime();
   saveSession(null);
-  if (forget) store.tasks = new Map();
+  store.tasks = new Map();
+  store.summary = { total: 0, running: 0, done: 0, error: 0, today: 0, subagents: 0 };
+  store.orderTotal = 0;
+  store.me = null;
+  store.bridge = null;
+  store.workspaces = [];
+  store.presets = [];
   store.order = [];
   store.detail = null;
   store.detailId = null;
@@ -767,8 +791,9 @@ function signOut({ forget = false } = {}) {
 async function enterApp() {
   store.loading = store.tasks.size === 0;
   loadCache();
-  store.screen = 'tasks';
-  navigate('/tasks', { replace: true });
+  const route = parseRoute();
+  if (['detail', 'settings', 'new'].includes(route.name)) await applyRoute();
+  else navigate('/tasks', { replace: true });
   startRealtime();
   const results = await Promise.allSettled([loadMe(), loadTasks(), loadPresets(), loadWorkspaces()]);
   const failed = results.find((result) => result.status === 'rejected');

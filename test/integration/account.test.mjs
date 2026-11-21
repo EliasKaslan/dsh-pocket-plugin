@@ -174,7 +174,7 @@ test('POST 成功：auth.json 原子重写 + 0600、sessions.json 被清、旧�
   // 1) 文件结构必须与 tools/set-auth.mjs 写出的完全同构。
   const raw = readFileSync(credentialsFile, 'utf8');
   const record = JSON.parse(raw);
-  assert.deepEqual(Object.keys(record).sort(), ['password', 'updatedAt', 'user']);
+  assert.deepEqual(Object.keys(record).sort(), ['password', 'sessionEpoch', 'updatedAt', 'user']);
   assert.equal(record.user, NEW_USER);
   assert.equal(typeof record.updatedAt, 'number');
   assert.deepEqual(Object.keys(record.password).sort(), ['N', 'algo', 'hash', 'p', 'r', 'salt']);

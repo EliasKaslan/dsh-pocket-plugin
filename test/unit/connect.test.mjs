@@ -325,9 +325,7 @@ test('app.js 开机用外壳令牌建会话，没有令牌才回连接页', asyn
 
 test('外壳（remote.js）用口令换设备令牌，并把失败态透传下去', async () => {
   const source = await readFile(join(REMOTE, 'remote.js'), 'utf8');
-  // 上行：auth 与 login 都要自报设备令牌
-  assert.match(source, /this\.send\(\{ t: 'auth'[^\n]*deviceClaim\(\) \}\)/u);
-  assert.match(source, /this\.send\(\{ t: 'login'[^\n]*deviceClaim\(\) \}\)/u);
+  // 上行行为（含两个并行登录的请求关联）由 shell-exchange.test.mjs 验证。
   // 应答：被移除的标记要吸收，并丢掉本地那份
   assert.match(source, /reply\?\.revoked === true/u);
   assert.match(source, /dropDevice\('revoked'\)/u);
