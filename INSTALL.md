@@ -161,7 +161,7 @@ node tools/build-shell.mjs          # 生成/刷新 docs/
 ```powershell
 # 1. 回环接口起来了，版本对，且要求登录
 Invoke-RestMethod http://127.0.0.1:47901/api/v1/health | ConvertTo-Json -Depth 4
-#   期望：started=true  ready=true  version=1.0.2  requiresLogin=true
+#   期望：started=true  ready=true  version=1.0.3  requiresLogin=true
 
 # 2. 启动日志里有监听与二维码落点
 Get-Content "$env:USERPROFILE\.dsh\pocket\bridge.log" -Tail 12
@@ -327,7 +327,7 @@ Get-Content "$env:USERPROFILE\.dsh\pocket\bridge.log" -Tail 20
 
 ```powershell
 node tools/check-syntax.mjs            # 语法（全仓 .mjs）
-node --test "test/**/*.test.mjs"       # 单测 + 集成 + 中继（631+ 条；以实际输出为准）
+node --test "test/**/*.test.mjs"       # 单测 + 集成 + 中继（条数以实际输出为准，见 HANDOFF.md §1）
 node test/e2e/run.mjs                  # 端到端（真 HTTP 打真 server）
 node tools/build-shell.mjs --check     # 外壳产物与源码是否一致
 ```
@@ -347,10 +347,11 @@ node tools/mock-host.mjs               # 假宿主，用虚构数据开发外壳
 
 ## 9. 版本策略
 
-**v1.0.0 已于 2026-11-11 发布；v1.0.2 是随后的 bugfix 发布（打包清单、市场索引、
+**v1.0.0 已于 2026-11-11 发布；v1.0.3 是最新一轮全量整改后的 bugfix 发布（打包清单、市场索引、
 CI 门禁与文档，不改协议）。** 0.x 阶段的充分自测已完成：真手机（HarmonyOS）+
 真网络下的连续进入、断线重连、向上翻页到底、流式增量、多设备并存、热重载与冷启动
-都跑过；本轮修复前的基线是 631 条单测 + 14 条 e2e 全绿（以实际输出为准）。
+都跑过；四条门禁全绿，**用例数以实际输出为准**（数字只在 HANDOFF.md §1 留了一份带日期的快照，
+这里不再重复写死——上一版这里的"631 条"已经过期两轮了）。
 
 1.0 之后的规则：
 

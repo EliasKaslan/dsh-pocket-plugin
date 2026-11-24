@@ -28,21 +28,59 @@ export function normalizeBase(input) {
 const DEFAULT_TIMEOUT = 20_000;
 
 /**
- * @param {string} path
- * @param {{method?: string, body?: unknown, base?: string, auth?: boolean, timeout?: number, signal?: AbortSignal}} options
+ * 有界重试：首次之外最多再试 2 次，间隔 400 ms / 800 ms。
+ *
+ * 为什么需要它：中继层的 `relay.request()` 只在**同一次调用内**按 request id 重发
+ * （1.2/2.4/4.8 s + 16 s 预算）。一旦它把错误抛到这里，在途请求就已经被判定失败了；
+ * 而用户的真实体感是"网络抖一下，点进会话就白屏报连不上"。补一层短退避重试能把
+ * 抖动吃掉，又不至于让用户对着转圈等 60 秒。
+ *
+ * **前提（重要，别删）**：重试会重新走一次 `fetch()` → 中继外壳会给它**新的**
+ * request id，于是桌面端看到的是一条全新的请求。所以：
+ *   - GET / HEAD 天然可重复执行（多读一遍没有副作用），默认重试；
+ *   - 写方法（POST/PUT/PATCH/DELETE）默认**不重试** —— 那不是"同 id 幂等"，
+ *     重发只会把副作用做第二遍（例如把同一条 prompt 发进会话两次）；
+ *   - 只有两种情况写方法也安全：调用方显式声明 `idempotent: true`，或者错误本身
+ *     证明请求**根本没发出去**（`beforeSend`，外壳在"中继尚未就绪"时打的标）。
+ *     后者最典型：中继还没连上就点了发送。
  */
-export function createApi({ getBase, getToken, onUnauthorized }) {
+const RETRY_ATTEMPTS = 2;
+const RETRY_BASE_MS = 400;
+
+/** 默认 sleep：只在这里出现定时器，测试可以整个换掉。 */
+function defaultSleep(ms) {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+/** 这条请求在失败之后还能不能再试一次。 */
+function canRetry({ method, options, error, attempt, attempts, signal }) {
+  if (attempt >= attempts) return false;
+  if (signal?.aborted === true) return false;
+  if (options?.signal?.aborted === true) return false;
+  // 自己的超时 / 用户取消 / 协议层错误（401、坏 body）重试只会重复同一结果。
+  if (error?.code !== 'network' && error?.code !== 'read') return false;
+  const verb = String(method ?? 'GET').toUpperCase();
+  if (verb === 'GET' || verb === 'HEAD' || verb === 'OPTIONS') return true;
+  if (options?.idempotent === true) return true;
+  return error?.beforeSend === true;
+}
+
+/**
+ * @param {string} path
+ * @param {{method?: string, body?: unknown, base?: string, auth?: boolean, timeout?: number,
+ *   signal?: AbortSignal, idempotent?: boolean}} options
+ *   `idempotent: true` 表示这个写请求重复执行是安全的（调用方自己保证语义）。
+ * @param {{attempts?: number, baseMs?: number, sleep?: (ms: number) => Promise<unknown>}} [retry]
+ */
+export function createApi({ getBase, getToken, onUnauthorized }, retry = {}) {
+  const attempts = Math.max(1, Number(retry.attempts ?? RETRY_ATTEMPTS) || RETRY_ATTEMPTS);
+  const baseMs = Math.max(0, Number(retry.baseMs ?? RETRY_BASE_MS) || 0);
+  const sleep = typeof retry.sleep === 'function' ? retry.sleep : defaultSleep;
+
   return async function api(path, options = {}) {
     const base = normalizeBase(options.base ?? getBase());
     const method = options.method ?? 'GET';
     const timeout = options.timeout ?? DEFAULT_TIMEOUT;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeout);
-    const abort = () => controller.abort();
-    if (options.signal !== undefined) {
-      if (options.signal.aborted) controller.abort();
-      else options.signal.addEventListener('abort', abort, { once: true });
-    }
 
     const headers = { accept: 'application/json' };
     const requestToken = options.auth === false ? null : getToken();
@@ -53,6 +91,36 @@ export function createApi({ getBase, getToken, onUnauthorized }) {
       body = JSON.stringify(options.body);
     }
 
+    let lastError;
+    // 已经取消的请求连发都不发：既省一次握手，也避免"取消之后又冒出一次重试"。
+    if (options.signal?.aborted === true) throw new ApiError('已取消', { code: 'aborted' });
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (attempt > 0) {
+        await sleep(baseMs * 2 ** (attempt - 1));
+        // 退避期间用户取消了：必须立刻收手，不能"睡醒再发一次"。
+        if (options.signal?.aborted === true) throw new ApiError('已取消', { code: 'aborted' });
+      }
+      try {
+        return await attemptOnce({ base, path, method, headers, body, timeout, options, requestToken });
+      } catch (error) {
+        lastError = error;
+        if (!canRetry({ method, options, error, attempt, attempts, signal: options.signal })) throw error;
+        console.debug(`[pocket-diag] api retry ${method} ${path} attempt=${attempt + 2} code=${error?.code}`);
+      }
+    }
+    throw lastError;
+  };
+
+  /** 一次完整尝试：自己的超时计时器 + 外部 signal 透传（两者的语义必须分开）。 */
+  async function attemptOnce({ base, path, method, headers, body, timeout, options, requestToken }) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    const abort = () => controller.abort();
+    if (options.signal !== undefined) {
+      if (options.signal.aborted) controller.abort();
+      else options.signal.addEventListener('abort', abort, { once: true });
+    }
+
     let response;
     try {
       response = await fetch(base + path, { method, headers, body, cache: 'no-store', signal: controller.signal });
@@ -61,7 +129,11 @@ export function createApi({ getBase, getToken, onUnauthorized }) {
       options.signal?.removeEventListener?.('abort', abort);
       if (options.signal?.aborted === true) throw new ApiError('已取消', { code: 'aborted' });
       if (error?.name === 'AbortError') throw new ApiError('请求超时，电脑端可能正忙', { code: 'timeout' });
-      throw new ApiError('连不上电脑，请检查网络与插件状态', { code: 'network' });
+      const failure = new ApiError('连不上电脑，请检查网络与插件状态', { code: 'network' });
+      // 外壳在"这条请求一次都没发出去"时打的标记：中继未就绪 / 客户端换代。
+      // 保留它，写方法才敢重试（见 canRetry）。
+      if (error?.beforeSend === true) failure.beforeSend = true;
+      throw failure;
     }
     // 注意：计时器**不能**在这里清。`fetch()` 只要拿到响应头就 resolve，而中继
     // 半边挂住时（头已回、body 永不进流）`response.text()` 会一直 pending；
@@ -108,7 +180,7 @@ export function createApi({ getBase, getToken, onUnauthorized }) {
       throw new ApiError(`请求失败（HTTP ${response.status}）`, { status: response.status, code: 'http', body: payload });
     }
     return payload.data ?? payload;
-  };
+  }
 }
 
 const RECONNECT_BASE = 700;

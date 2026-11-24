@@ -39,3 +39,47 @@ export const LINK_STORAGE_KEY = 'dsh.pocket.link.v1';
 export function unpairStorageKeys() {
   return [...new Set([...DEVICE_SESSION_KEYS, LEGACY_SESSION_KEY, LINK_STORAGE_KEY])];
 }
+
+/* ------------------------- 会话记录里的 `scope` 向后兼容 ------------------------- */
+
+/**
+ * 判断一条旧会话记录的 `scope` 该不该被接受。
+ *
+ * 背景：1.0.3 给设备会话 / 登录会话加了一条 `scope` 强校验（房间身份的一部分，
+ * 换一台电脑就换一个 scope），用来避免把上一台电脑的令牌带去撞新电脑。但 **v1.0.2
+ * 写下的记录里根本没有这个字段** —— 强校验一上，升级后的每台手机都会把本地那份
+ * 有效令牌当成"不是这个房间的"丢掉，于是所有人都被踢回口令登录一次。
+ *
+ * 这里按 legacy 接受缺字段的记录：桌面端本来就会校验令牌真伪（用不了的令牌只会
+ * 得到 401，然后正常走重新登录），在这个位置 fail-closed 换来的不是安全，而是
+ * 一次全网用户都要重输口令的升级事故。字段**存在但与当前不同**仍然拒绝。
+ *
+ * @param {unknown} recordScope 记录里的 scope（可能不存在）
+ * @param {unknown} currentScope 本次会话的 scope（房间密钥派生）
+ * @returns {'ok'|'legacy'|'mismatch'}
+ */
+export function scopeVerdict(recordScope, currentScope) {
+  const current = typeof currentScope === 'string' ? currentScope : '';
+  // 没有当前 scope（局域网直连布局 / 还没算出）→ 不做校验。
+  if (current === '') return 'ok';
+  if (recordScope === current) return 'ok';
+  // v1.0.2 的记录没有这个字段：按 legacy 接受，下次写入时补上。
+  if (typeof recordScope !== 'string' || recordScope === '') return 'legacy';
+  return 'mismatch';
+}
+
+/**
+ * 把一条旧记录补上当前 scope（legacy 记录"下次写入时补上该字段"）。
+ *
+ * 只补字段、不改别的：调用方拿到的仍然是原来那份令牌 / deviceId。
+ *
+ * @template T
+ * @param {T} record
+ * @param {unknown} currentScope
+ * @returns {T & {scope: string}}
+ */
+export function adoptScope(record, currentScope) {
+  const current = typeof currentScope === 'string' ? currentScope : '';
+  const source = record !== null && typeof record === 'object' ? record : {};
+  return { ...source, scope: current };
+}

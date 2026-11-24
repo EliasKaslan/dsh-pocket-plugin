@@ -13,14 +13,17 @@
  * 一次性临时目录、127.0.0.1 的临时端口，不联网、不碰 ~/.dsh。
  */
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { Auth, hashPassword } from '../../lib/auth.mjs';
 import { clearSessions, validateCredentials, writeCredentials } from '../../lib/credentials.mjs';
+import { passwordPolicyReason } from '../../lib/pair-page.mjs';
 import { jsonResponse, requestJson, startBridge } from './support/harness.mjs';
 
 const OLD_USER = '旧账号';
@@ -161,6 +164,57 @@ test('POST 校验失败：空账号 / 弱口令 / 非法字符 / 超长都 400 i
   assert.equal(ctx.core.auth.login({ user: OLD_USER, password: OLD_PASSWORD }).ok, true);
 });
 
+/* ------------------------------------------- 口令多样性（配对页 = CLI） */
+
+test('POST 口令多样性：<3 种不同字符一律 400 invalid_credentials，够 3 种就放行', async () => {
+  const before = readFileSync(credentialsFile, 'utf8');
+  for (const password of ['aaaaaaaa', 'abababab', 'ababababab', 'aabbbbbb']) {
+    const response = await postAccount({ user: NEW_USER, password });
+    const body = jsonResponse(response, 400, `弱口令 ${password}`);
+    assert.equal(body.error.code, 'invalid_credentials');
+    assert.match(body.error.message, /口令太简单（至少要有 3 种不同字符）/u, `弱口令 ${password} 的拒绝原因不对：${body.error.message}`);
+  }
+  assert.equal(readFileSync(credentialsFile, 'utf8'), before, '弱口令被拒时改动了 auth.json');
+
+  // 边界：刚好 3 种不同字符必须放行（CLI 的判据是 `< 3`，不是 `<= 3`）。
+  assert.equal(passwordPolicyReason('aaabbbcc'), '');
+  const ok = jsonResponse(await postAccount({ user: NEW_USER, password: 'aaabbbcc' }), 200, '刚好 3 种不同字符');
+  assert.equal(ok.ok, true);
+});
+
+test('口令策略两边一致：配对页用的 passwordPolicyReason 与真正跑 CLI 子进程的判定逐条相同', async () => {
+  // tools/set-auth.mjs 不能改（也不在本轮可写范围），它内联了同一条
+  // `new Set(password).size < 3`。这里真的把 CLI 当子进程跑一遍，逐条对比判定，
+  // 保证「电脑上 CLI 设不进去的口令，配对页也设不进去」不会悄悄漂移。
+  const cli = fileURLToPath(new URL('../../tools/set-auth.mjs', import.meta.url));
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'dsh-pocket-cli-policy-'));
+  try {
+    // 全部先过长度的闸（8–200），只让「多样性」这一条决定胜负。
+    const passwords = [
+      'aaaaaaaa', // 1 种 → 两边都拒
+      'abababab', // 2 种 → 两边都拒
+      'aabbbbbb', // 2 种 → 两边都拒
+      'aaabbbcc', // 3 种 → 两边都放
+      'aabbccdd', // 4 种 → 两边都放
+      'Ab1!Ab1!', // 4 种 → 两边都放
+    ];
+    for (const password of passwords) {
+      const result = spawnSync(process.execPath, [cli, '--user', 'cli-user', '--password', password, '--data', dataDir], {
+        encoding: 'utf8',
+      });
+      const cliRejects = result.status !== 0;
+      const sharedRejects = passwordPolicyReason(password).length > 0;
+      assert.equal(cliRejects, sharedRejects, `CLI 与配对页策略不一致：${password}（CLI 退出码 ${result.status}：${(result.stderr || result.stdout || '').trim().split('\n').slice(-1)[0]}）`);
+    }
+    // CLI 的拒绝原因也必须是同一句，否则前端提示会对不上。
+    const weak = spawnSync(process.execPath, [cli, '--user', 'cli-user', '--password', 'abababab', '--data', dataDir], { encoding: 'utf8' });
+    assert.equal(weak.status, 2);
+    assert.match(`${weak.stderr}`, /3 种不同字符/u);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 /* --------------------------------------------------------------- 成功路径 */
 
 test('POST 成功：auth.json 原子重写 + 0600、sessions.json 被清、旧口令失效、新口令可登录、日志无明文', async () => {
@@ -249,14 +303,51 @@ test('POST 成功：中继处于 blocked/unconfigured/error 时补一次 stop→
     `中继启动失败必须留日志，实际：${ctx.logs.slice(-4).join(' | ')}`,
   );
 
-  // 非 stuck 状态不重启：online 时原样返回，不产生多余的 stop/start。
+  // 非 stuck 状态不重启 —— 但**夹具必须与生产同形**：
+  // 生产里 `cloud.enabled` 是 CloudService 的「链路已启动」标志（`link.start()` 的
+  // 返回值），`state === 'online'` 必然 `enabled === true`。修之前这里写的是
+  // `state='online' + enabled=false`（生产里不存在），断言「在线时不重启」，等于
+  // 在测一条假路径（评审 D2）。真机上的行为是**会** stop→start：改口令已把所有会话
+  // 清空，旧手机连接必须被掐断、用新口令重登。
   const before = calls.length;
+  fake.enabled = true;
   fake.state = 'online';
-  fake.start = () => { calls.push(['start-unexpected']); this.state = 'online'; };
+  fake.start = (port) => { calls.push(['start', port]); fake.state = 'online'; };
   const online = await postAccount({ user: NEW_USER, password: THIRD_PASSWORD });
-  assert.equal(jsonResponse(online, 200, '在线时不重启中继').data.relayState, 'online');
-  assert.equal(calls.length, before, '中继已经在线时不该再 stop/start');
+  assert.equal(jsonResponse(online, 200, '在线时改口令').data.relayState, 'online');
+  assert.deepEqual(calls.slice(before), [['stop'], ['start', ctx.core.port]], '中继在线时改口令必须 stop→start');
 });
+
+test('POST 成功：cloud.enabled=true（= 生产里 state=online 的真实形状）确实 stop→start；用户关掉的中继不被拉起', async () => {
+  // 这条用例单独钉住评审 D3 的第三处空洞：`enabled=true` 时改口令真的重拉中继。
+  const calls = [];
+  const online = {
+    enabled: true,
+    state: 'online',
+    stop() { calls.push(['stop']); this.enabled = false; this.state = 'disabled'; },
+    start(port) { calls.push(['start', port]); this.enabled = true; this.state = 'online'; },
+    status() { return { state: this.state }; },
+  };
+  ctx.core.setCloud(online);
+  const changed = jsonResponse(await postAccount({ user: NEW_USER, password: NEW_PASSWORD }), 200, 'enabled=true 时改口令');
+  assert.equal(changed.data.relayState, 'online');
+  assert.deepEqual(calls, [['stop'], ['start', ctx.core.port]], 'enabled=true 时改口令必须 stop→start');
+
+  // 反例：用户主动关掉的中继（enabled=false + state=disabled）不许被改口令顺手打开。
+  const offCalls = [];
+  const off = {
+    enabled: false,
+    state: 'disabled',
+    stop() { offCalls.push('stop'); },
+    start() { offCalls.push('start'); },
+    status() { return { state: 'disabled' }; },
+  };
+  ctx.core.setCloud(off);
+  const kept = jsonResponse(await postAccount({ user: NEW_USER, password: THIRD_PASSWORD }), 200, '中继关闭时改口令');
+  assert.equal(kept.data.relayState, 'disabled');
+  assert.deepEqual(offCalls, [], '用户主动关掉的中继不能被改口令顺手打开');
+});
+
 
 /* --------------------------------------------- credentials.mjs 的单元层 */
 

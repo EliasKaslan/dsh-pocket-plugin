@@ -136,22 +136,26 @@ test('真实请求路径：写方法记进"已执行"，读方法不记', async 
   }
 });
 
-test('"已执行"账本有上限：写请求刷屏也不会无限增长', async () => {
+test('"已执行"账本有上限：满了按最旧淘汰，新写请求照样执行（不再 503）', async () => {
   const { link } = makeLink();
   const stub = stubFetch('{"ok":true}');
+  const path = '/api/v1/tasks/task_abc/prompt';
   try {
     for (let index = 0; index < 600; index += 1) {
-      await link.handleRequest({ id: `w${index}`, method: 'POST', path: '/api/v1/tasks/task_abc/prompt', body: '' });
+      await link.handleRequest({ id: `w${index}`, method: 'POST', path, body: '' });
       link.recent.clear(); // 只压"已执行"账本，避免响应体预算先淘汰掉它们
       link.recentBytes = 0;
     }
     assert.ok(link.executed.size <= 512, `已执行账本必须有上限（实际 ${link.executed.size}）`);
-    assert.equal(link.executed.has(CloudLink.requestKey('POST', '/api/v1/tasks/task_abc/prompt', 'w0')), true);
-    assert.equal(stub.calls.length, 512);
-    assert.equal(link.executed.has(CloudLink.requestKey('POST', '/api/v1/tasks/task_abc/prompt', 'w599')), false);
+    // R3：旧代码在 512 条之后把新写请求一律 503 拒掉，而且没有 retryAfter。
+    assert.equal(stub.calls.length, 600, '每一次写请求都必须真的执行');
+    assert.equal(link.executed.has(CloudLink.requestKey('POST', path, 'w0')), false, '被淘汰的是最旧的一条');
+    assert.equal(link.executed.has(CloudLink.requestKey('POST', path, 'w599')), true, '最新的一条必须留着');
+    // TTL 之外全部清掉，之后照常记账。
     link.sweepExecuted(Date.now() + 24 * 3600_000);
-    await link.handleRequest({ id: 'next', method: 'POST', path: '/api/v1/tasks/task_abc/prompt' });
-    assert.equal(stub.calls.length, 513);
+    assert.equal(link.executed.size, 0);
+    await link.handleRequest({ id: 'next', method: 'POST', path, body: '' });
+    assert.equal(stub.calls.length, 601);
   } finally {
     stub.restore();
   }

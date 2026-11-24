@@ -1,4 +1,4 @@
-/* Build stamp: tools/build-shell.mjs replaces da8f20ca1961cfc5 with the content hash of app.js + remote.js + remote.css + index.html — never hand-edit CACHE below. */
+/* Build stamp: tools/build-shell.mjs replaces 31519fa9a23a86df with the content hash of app.js + remote.js + remote.css + index.html — never hand-edit CACHE below. */
 /*
  * DSH Pocket · remote shell service worker
  * ------------------------------------------------------------
@@ -15,7 +15,7 @@
  */
 'use strict';
 
-const BUILD = 'da8f20ca1961cfc5';
+const BUILD = '31519fa9a23a86df';
 const CACHE = `pocket-shell-${BUILD}`;
 
 /**
@@ -45,6 +45,8 @@ const PRECACHE = [
   "./lib/perf.js",
   "./lib/relay-diag.js",
   "./lib/shell-fresh.js",
+  "./lib/shell-parts.js",
+  "./lib/shell-retry.js",
   "./lib/shell-session.js",
   "./lib/sprite.js",
   "./lib/ui.js",

@@ -122,7 +122,11 @@ export function mountConnect(root, ctx) {
     h('span', { text: '复制诊断信息' }));
   const diagCard = h('section', { class: 'diag-card', hidden: !showDiag },
     h('h2', { class: 'diag-title', text: '中继诊断' }),
-    h('p', { class: 'diag-lead', text: '连不上时先读这里的结论。仍然不行就复制下面这段发给维护者——里面没有房间密钥、没有设备令牌。' }),
+    // 「中继在线」与「电脑端在线」是两个判据：手机连上公共 broker 只说明 *它自己*
+    // 的上行还在，电脑端有没有在说话要看心跳（diagRows 里分成两行显示）。
+    // 这两句以前被同一行「当前状态：在线」盖住，屏幕上就出现了"一边显示在线、
+    // 一边横幅说电脑端已离线"的自相矛盾。
+    h('p', { class: 'diag-lead', text: '连不上时先读这里的结论：中继状态是手机到中继这一段，电脑端心跳是电脑到中继那一段，两者可以一个正常一个不正常。仍然不行就复制下面这段发给维护者——里面没有房间密钥、没有设备令牌。' }),
     diagList,
     diagAdvice,
     diagCopy,

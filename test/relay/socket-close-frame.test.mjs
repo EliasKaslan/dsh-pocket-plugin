@@ -90,3 +90,40 @@ test('手机主动关掉的隧道不再回 ws.close（避免重复帧）', () =>
   assert.equal(decodeAll(link, sent).some((message) => message.t === 'ws.close'), false,
     '手机自己关的隧道不该再收到一条 ws.close');
 });
+
+/**
+ * R6：四个 emit 点必须**都**带 psid，且都要先取 psid 再删表。
+ * 旧代码缺两处：`closeAllSockets`（先 socketPage.delete 再发，取也取不到）与
+ * `handleSocketOpen` 的墓碑分支（直接 publish 一个没有 psid 的帧）。
+ */
+test('R6：closeAllSockets 的 ws.close 必须带 psid（旧代码先删表 → 恒为空串）', () => {
+  const { link, sent } = makeLink();
+  const created = stubSocket(link);
+
+  link.handleSocketOpen({ id: 'dddd4444', sid: 'page0004', path: '/ws' });
+  created[0].emit('open');
+  sent.length = 0;
+
+  link.closeAllSockets('云端连接中断');
+  const close = decodeAll(link, sent).find((message) => message.t === 'ws.close' && message.id === 'dddd4444');
+  assert.ok(close !== undefined, '必须回一条 ws.close');
+  assert.equal(close.psid, 'page0004', 'psid 必须带出来，否则手机认不出被关的是自己这一页');
+  assert.equal(close.code, 1001);
+  assert.equal(link.socketPage.has('dddd4444'), false, 'socketPage 仍然要清理，不能泄漏');
+});
+
+test('R6：墓碑分支的 ws.close 也要带 psid（从迟到 ws.open 的 sid 取）', () => {
+  const { link, sent } = makeLink();
+  const created = stubSocket(link);
+
+  link.handleSocketOpen({ id: 'eeee5555', sid: 'page0005', path: '/ws' });
+  created[0].emit('open');
+  link.handleSocketClose({ id: 'eeee5555' }); // 手机主动关：条目已删，只剩墓碑
+  sent.length = 0;
+
+  link.handleSocketOpen({ id: 'eeee5555', sid: 'page0005', path: '/ws' }); // 迟到的重开
+  const close = decodeAll(link, sent).find((message) => message.t === 'ws.close');
+  assert.ok(close !== undefined);
+  assert.equal(close.psid, 'page0005', '墓碑分支以前完全不带 psid');
+  assert.equal(link.sockets.size, 0, '仍然不许建链');
+});

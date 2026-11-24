@@ -107,13 +107,33 @@ test('分片上限与分片校验：total>64 / id 非法 / seq 越界 / 数据�
   assert.equal(link.parts.size, 0);
 });
 
-test('同时打开的分片表不超过 8 个（PART_MAX_OPEN）', () => {
+test('同时打开的分片表不超过 8 个（PART_MAX_OPEN）：满了淘汰最旧，不丢新到的组（R7）', () => {
   const { link } = makeLink();
   const ids = Array.from({ length: 9 }, (_value, index) => index.toString(16).padStart(12, '0'));
   for (const id of ids) feed(link, { t: 'part', id, seq: 0, total: 2, d: 'AAAA' });
 
-  assert.equal(link.parts.size, 8, '第 9 个半开分片必须被拒');
-  assert.ok(link.stats.errors >= 1);
+  assert.equal(link.parts.size, 8, '表必须守住 8 组的上限');
+  // 旧代码在这里直接 return（只 errors+1）：第 9 组静默消失，对端等到 30 s TTL。
+  assert.equal(link.parts.has(`part:${ids[8]}`), true, '第 9 组必须进表（淘汰最旧的那一组）');
+  assert.equal(link.parts.has(`part:${ids[0]}`), false, '被淘汰的必须是最久没动静的那一组');
+  assert.equal(link.stats.errors, 0, '淘汰是正常回收，不该记 error');
+});
+
+test('分片表满之后新的一组仍能拼出整帧并派发（旧代码会永久丢失这一帧）', () => {
+  const { link } = makeLink();
+  const dispatched = [];
+  link.dispatch = (message) => dispatched.push(message);
+  for (let index = 0; index < 8; index += 1) {
+    feed(link, { t: 'part', id: index.toString(16).padStart(12, '0'), seq: 0, total: 2, d: 'AAAA' });
+  }
+  // 第 9 组：完整的 2 片（payload 必须是合法 JSON —— 拼完就直接 dispatch）。
+  const id = 'ffffffffffff';
+  const raw = Buffer.from(JSON.stringify({ t: 'hello', name: '手机' }), 'utf8');
+  const half = Math.ceil(raw.length / 2);
+  feed(link, { t: 'part', id, seq: 0, total: 2, d: raw.subarray(0, half).toString('base64') });
+  feed(link, { t: 'part', id, seq: 1, total: 2, d: raw.subarray(half).toString('base64') });
+  assert.equal(dispatched.length, 1, '第 9 组必须能拼出来并派发');
+  assert.equal(dispatched[0].name, '手机');
 });
 
 test('请求体上限：超过 8MiB（base64 后）回 413，不转发；上限内照常转发', async () => {

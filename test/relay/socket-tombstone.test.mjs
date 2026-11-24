@@ -57,7 +57,10 @@ test('墓碑：ws.open → ws.close → 迟到的 ws.open 不许复活孤儿槽�
   link.handleSocketOpen({ id: ID, path: '/ws' });
   assert.equal(link.sockets.size, 0, '墓碑内的 id 不许再占槽位');
   assert.equal(created.length, 0, '连建链都不该尝试');
-  assert.deepEqual(decodeAll(link, sent), [{ t: 'ws.close', id: ID, code: 1000, reason: 'closed by client' }]);
+  // 关闭帧必须**带 psid 字段**（R6：四个 emit 点统一走 emitSocketClose）。
+  assert.deepEqual(decodeAll(link, sent), [{
+    t: 'ws.close', id: ID, code: 1000, reason: 'closed by client', psid: '',
+  }]);
   assert.ok(logger.lines.some((line) => line.includes('隧道已关闭')), '要留痕，否则孤儿槽位无法从日志定位');
 });
 

@@ -107,6 +107,53 @@ test('SSE：带 since 时先把环形缓冲里的旧帧补发一遍', async () =
   await until(() => ctx.server.allSse.size === 0, { label: 'SSE 清理' });
 });
 
+test('SSE：带 boot 但 bootId 不是本次启动 → 一条历史帧都不补发（序号不可比）', async () => {
+  // 评审 D3：`replayFor` 的 `boot !== bootId` 分支此前全库零覆盖（没有任何用例带
+  // `boot=` 参数）。宿主重启后序号会从 0 重新算，旧 since 与本次启动的 seq 没有可比性，
+  // 所以必须整段丢弃补发，而不是把不相干的旧帧灌给手机。
+  ctx.core.emit('integration.stale-boot', { marker: 'stale-boot-must-not-replay' });
+  const seqAtOpen = ctx.core.seq;
+  const stale = await openStream(ctx.port, `/api/v1/events?token=${encodeURIComponent(token)}&since=0&boot=${encodeURIComponent('boot-deadbeef')}`);
+  try {
+    const head = await stale.readUntil((value) => value.includes('event: hello'));
+    assert.equal(head.includes('stale-boot-must-not-replay'), false, 'bootId 变了还补发了旧帧');
+    const helloFrame = head.split('\n\n').find((block) => block.includes('event: hello'));
+    assert.notEqual(helloFrame, undefined, `没等到 hello 帧：${head.slice(0, 200)}`);
+    const hello = JSON.parse(helloFrame.slice(helloFrame.indexOf('data: ') + 'data: '.length));
+    assert.ok(hello.seq >= seqAtOpen, `boot 不匹配时 hello.seq 必须是当前序号，实际 ${hello.seq} < ${seqAtOpen}`);
+  } finally {
+    stale.destroy();
+  }
+  await until(() => ctx.server.allSse.size === 0, { label: 'SSE 清理' });
+
+  // 对照：boot 就是本次启动时，同样的 since=0 必须补发 —— 证明上一条不是「本来就没帧」。
+  const current = await openStream(ctx.port, `/api/v1/events?token=${encodeURIComponent(token)}&since=0&boot=${encodeURIComponent(ctx.core.bootId)}`);
+  try {
+    const text = await current.readUntil((value) => value.includes('stale-boot-must-not-replay'));
+    assert.match(text, /"marker":"stale-boot-must-not-replay"/u, 'boot 匹配时必须补发历史帧');
+  } finally {
+    current.destroy();
+  }
+  await until(() => ctx.server.allSse.size === 0, { label: 'SSE 清理' });
+});
+
+test('SSE：不带 since（since === null）时一条历史帧都不补发', async () => {
+  // `replayFor` 的另一条分支：只有 since 才谈得上补发；没有 since 就走「当前状态」。
+  ctx.core.emit('integration.no-since', { marker: 'no-since-must-not-replay' });
+  const seqAtOpen = ctx.core.seq;
+  const stream = await openStream(ctx.port, `/api/v1/events?token=${encodeURIComponent(token)}`);
+  try {
+    const head = await stream.readUntil((value) => value.includes('event: hello'));
+    assert.equal(head.includes('no-since-must-not-replay'), false, '不带 since 也补发了历史帧');
+    const helloFrame = head.split('\n\n').find((block) => block.includes('event: hello'));
+    const hello = JSON.parse(helloFrame.slice(helloFrame.indexOf('data: ') + 'data: '.length));
+    assert.ok(hello.seq >= seqAtOpen, `没有 since 时 hello.seq 必须是当前序号，实际 ${hello.seq} < ${seqAtOpen}`);
+  } finally {
+    stream.destroy();
+  }
+  await until(() => ctx.server.allSse.size === 0, { label: 'SSE 清理' });
+});
+
 test('SSE：同一设备超过 6 条流 → 503 too_many_streams + retry-after', async () => {
   const streams = [];
   try {

@@ -149,6 +149,34 @@
   color: rgba(230, 236, 255, .66);
 }
 
+/* 旧式握手提示（电脑端插件比手机页面旧）：步骤要能一眼照着做，按钮并排但不挤。 */
+.pocket-steps {
+  margin: 2px 0 4px;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: rgba(230, 236, 255, .78);
+}
+
+.pocket-step {
+  /* 长 URL / 长路径在窄屏上不许把卡片顶宽。 */
+  overflow-wrap: anywhere;
+}
+
+.pocket-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.pocket-actions .pocket-btn {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
 .pocket-label {
   font-size: 12px;
   letter-spacing: .4px;

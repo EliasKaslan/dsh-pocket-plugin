@@ -1381,6 +1381,32 @@ test('resolveWorkdir：无根 fail-closed；NUL/相对/UNC/不存在/不是目�
   });
 });
 
+test('resolveWorkdir：isInside 按路径段判定 —— 名字以 .. 开头的根内目录放行，真正的 ../ 仍拒', async () => {
+  const base = await mkdtemp(path.join(tmpRoot, 'isinside-'));
+  // 三个真实存在的目录，分别覆盖「名字看起来像穿越的根内目录」与「真兄弟目录」。
+  const dotCache = path.join(base, '..cache');
+  const hidden = path.join(base, '.hidden');
+  const outside = path.join(tmpRoot, `outside-${path.basename(base)}`);
+  for (const dir of [dotCache, hidden, outside]) await mkdir(dir, { recursive: true });
+
+  const { index } = await makeIndex({
+    config: { allowedRoots: [base] },
+    services: { sessionQuery: { async listSessions() { return []; } } },
+  });
+
+  // `..cache` 是根内一个名字以两个点开头的正常目录：字符前缀判定会误判成越界。
+  assert.equal(await index.resolveWorkdir(dotCache), await realpathOf(dotCache), '..cache 兄弟目录被误判成穿越');
+  assert.equal(await index.resolveWorkdir(hidden), await realpathOf(hidden), '.hidden 是根内文件，必须放行');
+
+  // 真正的 ../x（根外）：cwd_forbidden；相对路径/纯 .. 更早被拦成 bad_cwd。
+  await assert.rejects(index.resolveWorkdir(outside), (error) => {
+    assert.equal(error.code, 'cwd_forbidden', `根外目录应给 cwd_forbidden，实际 ${error.code}`);
+    return true;
+  });
+  await assert.rejects(index.resolveWorkdir('..'), (error) => error.code === 'bad_cwd');
+  await assert.rejects(index.resolveWorkdir('../x'), (error) => error.code === 'bad_cwd');
+});
+
 test('resolveWorkdir：root 自己 realpath 失败时回落到 path.resolve（不因坏根全盘拒绝）', async () => {
   const base = await mkdtemp(path.join(tmpRoot, 'fallback-'));
   const ghostRoot = path.join(base, 'ghost-root');
@@ -1532,6 +1558,82 @@ test('createTask reuses the created session and initial message ID after a deliv
   assert.deepEqual(messages[0], messages[1]);
 });
 
+test('createTask：索引满（upsertRow 拒收）时同一 clientTaskId 重放也只能 create 一次', async () => {
+  let creates = 0;
+  const agents = {
+    get() { return undefined; },
+    async create(request) {
+      creates += 1;
+      return {
+        agent: {
+          header: { id: request.sessionId, createdAt: 1 },
+          async followup() { /* 投递成功 */ },
+        },
+      };
+    },
+  };
+  const { index } = await makeIndex({
+    // MAX_TASKS 默认 5000，这里用 config.maxTasks 把它压到 1：真走到「满了」那条分支。
+    config: { allowedRoots: [tmpRoot], maxTasks: 1 },
+    services: { agents, sessionQuery: { async listSessions() { return []; } } },
+  });
+  index.upsertRow(row({ id: 'full-1', createdAt: 1 }));
+  assert.equal(index.tasks.size, 1);
+
+  const input = { prompt: '索引满时的幂等', cwd: tmpRoot, clientTaskId: 'idem-full' };
+  const first = await index.createTask(input);
+  assert.equal(creates, 1);
+  assert.equal(first.reused, false);
+  assert.equal(index.tasks.has(first.task.id), false, '索引已满：新会话本来就不会进表');
+  assert.equal(typeof first.task.id, 'string');
+
+  // 成功后重放：命中幂等键 → 复用，绝不再建第二份会话（修之前这里 creates=2、reused=false）。
+  const replay = await index.createTask(input);
+  assert.equal(creates, 1, '成功后重放又建了一份会话');
+  assert.equal(replay.reused, true);
+  assert.equal(replay.task.id, first.task.id);
+  // 合成视图的字段集合必须与真实视图一致，客户端不用猜缺了哪些键。
+  assert.deepEqual(
+    Object.keys(replay.task).sort(),
+    Object.keys(index.publicTask(index.tasks.get('full-1'))).sort(),
+  );
+});
+
+test('createTask：索引满时 followup 失败，重试仍只 create 一次（失败分支必须记住幂等键）', async () => {
+  let creates = 0;
+  const deliveries = [];
+  const agent = {
+    header: { id: 'session-full-fail', createdAt: 1 },
+    async followup(message) {
+      deliveries.push(message);
+      if (deliveries.length === 1) throw new Error('transport closed');
+    },
+  };
+  const { index } = await makeIndex({
+    config: { allowedRoots: [tmpRoot], maxTasks: 1 },
+    services: {
+      agents: { get: () => agent, async create() { creates += 1; return { agent }; } },
+      sessionQuery: { async listSessions() { return []; } },
+    },
+  });
+  index.upsertRow(row({ id: 'full-1', createdAt: 1 }));
+  const input = { prompt: '索引满的重试', cwd: tmpRoot, clientTaskId: 'retry-full' };
+
+  await assert.rejects(index.createTask(input), /transport closed/u);
+  assert.equal(creates, 1);
+  // 关键：任务行进不了索引（task 是 undefined），修之前 rememberClientId 因此被跳过。
+  assert.equal(index.tasks.has('session-full-fail'), false);
+  assert.notEqual(index.byClientId.get('retry-full'), undefined, '失败分支也必须记住幂等键');
+
+  const retry = await index.createTask(input);
+  assert.equal(creates, 1, '失败重试又建了一份会话');
+  assert.equal(retry.reused, true);
+  assert.equal(retry.task.id, 'session-full-fail');
+  assert.equal(deliveries.length, 2, '重试必须把同一条消息重投给同一个会话');
+  assert.deepEqual(deliveries[0], deliveries[1]);
+});
+
+
 test('createTask：agent factory 未注册时短暂重试，成功一次即停', async () => {
   let attempts = 0;
   const agents = {
@@ -1632,6 +1734,29 @@ test('cancelTask：agent 缺失 → not_running；宿主中断失败时保留原
   });
   assert.deepEqual(await orphan.index.cancelTask('ghost'), { id: 'ghost', status: 'cancelled' });
 });
+
+test('cancelTask：中断失败不再吞掉宿主原始 error —— 挂在 cause 上，状态不动', async () => {
+  const original = new Error('cancel exploded');
+  original.code = 'HOST_CANCEL_BUSY';
+  const { index } = await makeIndex({
+    services: {
+      agents: { get: (id) => (id === 'c1' ? { id, async cancel() { throw original; } } : undefined) },
+      sessionQuery: { async listSessions() { return []; } },
+    },
+  });
+  index.upsertRow(row({ id: 'c1', createdAt: 1 }));
+  const statusBefore = index.getTask('c1').status;
+  await assert.rejects(index.cancelTask('c1'), (error) => {
+    assert.equal(error.code, 'cancel_failed');
+    // 语义收紧后只回一句中文，排障线索必须留在 cause（server 侧会把它写进日志）。
+    assert.equal(error.cause, original, '宿主原始 error 被吞掉了');
+    assert.equal(error.cause.code, 'HOST_CANCEL_BUSY');
+    assert.equal(error.taskId, 'c1');
+    return true;
+  });
+  assert.equal(index.getTask('c1').status, statusBefore, '中断失败不许把状态改成 cancelled');
+});
+
 
 /* ------------------------------------------------------------------ */
 /* 工作区与预设                                                         */

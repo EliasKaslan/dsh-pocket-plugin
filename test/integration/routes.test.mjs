@@ -322,6 +322,71 @@ test('POST /tasks/:id/prompt 与 /cancel 真的作用到 agent，而不是回 20
   assert.deepEqual(agent.cancelReason, { kind: 'user' });
 });
 
+test('POST /tasks/:id/cancel：宿主中断失败 → 500 cancel_failed；宿主不支持 → 501 unsupported', async () => {
+  // 评审 D5：cancelTask 的语义收紧成「失败即抛」（cancel_failed / unsupported）之后，
+  // 这两个 code 必须真的能被 HTTP 出口承载，且给手机看的是中文原因、不是宿主报错原文。
+  const agent = ctx.fakes.agents.get(taskId);
+  assert.notEqual(agent, undefined, '创建任务时应注册 agent');
+  const originalCancel = agent.cancel;
+  const statusBefore = ctx.core.index.getTask(taskId)?.status;
+  try {
+    agent.cancel = async () => { throw new Error('host cancelled refused: bus is wedged'); };
+    const failed = await requestJson(ctx.port, `/api/v1/tasks/${taskId}/cancel`, { method: 'POST', headers: authed() });
+    const failedBody = jsonResponse(failed, 500, 'POST /tasks/:id/cancel（宿主中断失败）');
+    assert.equal(failedBody.error.code, 'cancel_failed');
+    assert.match(failedBody.error.message, /宿主未能中断任务/u, '必须回显给用户看的中文原因');
+    assert.equal(failed.body.includes('bus is wedged'), false, '宿主原始报错不许原样回给手机');
+    assert.equal(ctx.core.index.getTask(taskId)?.status, statusBefore, '中断失败不许把任务标成 cancelled');
+    // 原始 error 不能丢：它要能出现在宿主日志里（lib/task-index.mjs 的 cause + warn）。
+    assert.ok(ctx.logs.some((line) => line.includes('agent cancel failed') && line.includes('bus is wedged')), '原始 error 必须留在日志里');
+
+    delete agent.cancel;
+    const unsupported = await requestJson(ctx.port, `/api/v1/tasks/${taskId}/cancel`, { method: 'POST', headers: authed() });
+    const unsupportedBody = jsonResponse(unsupported, 501, 'POST /tasks/:id/cancel（宿主不支持）');
+    assert.equal(unsupportedBody.error.code, 'unsupported');
+    assert.match(unsupportedBody.error.message, /宿主不支持中断这个任务/u);
+  } finally {
+    if (originalCancel !== undefined) agent.cancel = originalCancel;
+  }
+});
+
+test('POST /self/revoke：自己就是「本机远程中继」设备时 409 revoke_failed；/devices/:id/revoke 同情形仍是 404', async () => {
+  // 评审 D3 的第二处空洞：/self/revoke 的新 409 分支此前零覆盖，且要和
+  // /devices/:id/revoke 的 404 对照着看 —— 两个 code **刻意不统一**（见 server.mjs
+  // 那里的注释）：self 的 id 来自已鉴权的调用方，设备一定存在、只是不可移除；
+  // /devices/:id 收任意 id，不存在就是不存在。
+  const relayDevice = ctx.mint({ name: '本机中继身份' });
+  cloud.identity = { deviceId: relayDevice.device.id };
+  try {
+    const response = await requestJson(ctx.port, '/api/v1/self/revoke', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${relayDevice.token}` },
+    });
+    const body = jsonResponse(response, 409, 'POST /self/revoke（本机中继设备）');
+    assert.equal(body.error.code, 'revoke_failed');
+    assert.match(body.error.message, /本机中继设备/u);
+    expectSecurityHeaders(response, 'POST /self/revoke 409');
+    // 被拒 = 什么都没发生：令牌仍然有效。
+    jsonResponse(await requestJson(ctx.port, '/api/v1/me', {
+      headers: { authorization: `Bearer ${relayDevice.token}` },
+    }), 200, '被拒之后的 /me');
+
+    const viaDevices = await requestJson(ctx.port, `/api/v1/devices/${relayDevice.device.id}/revoke`, {
+      method: 'POST',
+      headers: authed(),
+    });
+    const other = jsonResponse(viaDevices, 404, 'POST /devices/:id/revoke（本机中继设备）');
+    assert.equal(other.error.code, 'not_found', '/devices/:id/revoke 对同一情形仍是 404 not_found');
+
+    assert.ok(
+      ctx.logs.some((line) => line.includes('拒绝移除本机中继设备')),
+      '拒绝移除本机中继设备必须留日志（排障要看）',
+    );
+  } finally {
+    delete cloud.identity;
+  }
+});
+
 test('未知任务的详情/追问/中断：404、404、409，不是 500', async () => {
   const detail = await requestJson(ctx.port, '/api/v1/tasks/session-missing', { headers: authed() });
   assert.equal(jsonResponse(detail, 404, 'GET 未知任务').error.code, 'not_found');

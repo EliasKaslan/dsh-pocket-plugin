@@ -91,7 +91,36 @@ jobs:
         run: node tools/build-shell.mjs --check
 
       # package.json 的 files[] 是本包真正发布出去的范围；多写一个不存在的
-      # 路径不会报错，只会让发布物缺文件。这里提前拦住。
-      - name: 发布清单完整性（package.json files[]）
+      # 路径不会报错，只会让发布物缺文件。这里提前拦住「列了的不缺」。
+      - name: 发布清单完整性（package.json files[] 指向的路径都存在）
         run: |
           node -e 'const fs=require("node:fs"); const list=JSON.parse(fs.readFileSync("package.json","utf8")).files || []; const missing=list.filter((p)=>!fs.existsSync(p)); if (missing.length>0) { console.error("package.json files[] 指向不存在的路径："+missing.join(", ")); process.exit(1); } console.log("files[] 全部存在："+list.length+" 项");'
+
+      # 上面那一条只证明「列了的都在」，**证明不了「该有的没漏」**：把 `web` 从
+      # files[] 里删掉，existsSync 检查照样绿，但 `lib/index.mjs` 的 `webRoot` 指向
+      # `web/`（外壳、PWA 资源全在里面），装上之后手机打开就是 404 —— 这是发布后
+      # 才会被发现的一类事故。所以再用 npm 自己的打包结果反查一次：
+      # `npm pack --dry-run` 按 files[] 算出真实 tarball 清单，不写盘、不联网。
+      # 断言的是**运行必需**的四个入口，不是"随便挑几个文件"：
+      #   web/index.html    → webRoot 的外壳入口（files[] 漏 web 立刻红）
+      #   docs/mqtt.min.js  → 外壳依赖的 MQTT 客户端（漏 docs 立刻红）
+      #   lib/index.mjs     → 插件主入口（漏 lib 连加载都做不到）
+      #   cordis.patch.yml  → 宿主 bundle patch（漏了插件不会被挂载）
+      # 清单落盘到当前目录的 pack.json（runner 是一次性的，不留也无所谓）；
+      # 用相对路径是为了这段脚本能在 Windows 上原样复跑验证。
+      - name: 发布清单完整性（npm pack 实测 tarball 必须含运行必需文件）
+        run: |
+          npm pack --dry-run --json > pack.json
+          node -e '
+          const fs = require("node:fs");
+          const required = ["web/index.html", "docs/mqtt.min.js", "lib/index.mjs", "cordis.patch.yml"];
+          const packed = JSON.parse(fs.readFileSync("pack.json", "utf8"));
+          const files = new Set((packed[0]?.files ?? []).map((entry) => entry.path));
+          const missing = required.filter((path) => !files.has(path));
+          if (missing.length > 0) {
+            console.error("npm pack 的 tarball 缺运行必需文件：" + missing.join(", "));
+            console.error("（files[] 只保证「列了的都存在」，漏列不会报错，必须用打包结果反查）");
+            process.exit(1);
+          }
+          console.log("tarball 含全部运行必需文件（共 " + files.size + " 个）：" + required.join(", "));
+          '

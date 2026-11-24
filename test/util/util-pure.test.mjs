@@ -246,6 +246,38 @@ test('safeJoin：编码穿越、反斜杠、UNC、NUL、深度回退一律关在
   assert.equal(safeJoin(root, '图标/下载.png'), path.join(root, '图标', '下载.png'), 'Unicode 文件名必须原样放行');
 });
 
+test('safeJoin：与 isInside 同一套「路径段」判定 —— ..cache 兄弟目录放行，../ 与盘符仍拒', () => {
+  const root = path.resolve(tmpdir(), 'pocket-safejoin-segments');
+  // 名字以两个点开头的根内目录/文件**不是**穿越。旧的 `relative.startsWith('..')`
+  // 会把它误判成越界（静态文件凭空 404）；`lib/task-index.mjs` 的 isInside 早已按
+  // 路径段判定，这里把 safeJoin 对齐到同一套语义（两边用例互为镜像）。
+  assert.equal(safeJoin(root, '..cache'), path.join(root, '..cache'), '..cache 目录被误判成穿越');
+  assert.equal(safeJoin(root, '..cache/a.txt'), path.join(root, '..cache', 'a.txt'));
+  assert.equal(safeJoin(root, '.hidden'), path.join(root, '.hidden'), '.hidden 是根内普通文件名');
+  assert.equal(safeJoin(root, '.well-known/asset.json'), path.join(root, '.well-known', 'asset.json'));
+
+  // 真正的穿越：整段 `..` 或 `..<sep>` 前缀，一条都不许放行。
+  for (const probe of ['..', '../x', '../..', 'a/../../x', 'a/%2e%2e/%2e%2e/x', '..\\x', '..%2fx']) {
+    assert.equal(safeJoin(root, probe), undefined, `放行了穿越：${probe}`);
+  }
+
+  // 绝对路径：前导 `/` 按既有契约被当作根内相对路径；盘符则一定拒（平台相关，
+  // 见 test/protocol/util.test.mjs 的同款说明）。
+  assert.equal(safeJoin(root, '/etc/passwd'), path.join(root, 'etc', 'passwd'));
+  const driveOut = safeJoin(root, 'C:\\Windows\\win.ini');
+  if (process.platform === 'win32') {
+    assert.equal(driveOut, undefined, '盘符路径在 win32 上是绝对路径，必须拒');
+  } else {
+    assert.ok(driveOut === undefined || driveOut.startsWith(`${root}${path.sep}`), `POSIX 上必须关在根内：${driveOut}`);
+  }
+
+  // NUL（编码前后）都拒；畸形百分号编码返回 undefined 而不是抛。
+  assert.equal(safeJoin(root, 'a\0b'), undefined);
+  assert.equal(safeJoin(root, 'a%00b'), undefined);
+  assert.equal(safeJoin(root, '%zz'), undefined);
+  assert.equal(safeJoin(root, undefined), root, '缺省路径等价于根本身');
+});
+
 test('网络工具：IPv4 映射、方括号 IPv6、Host 头与回环白名单', () => {
   assert.equal(normalizeIp('::1'), '127.0.0.1');
   assert.equal(normalizeIp('::ffff:192.168.1.9'), '192.168.1.9');

@@ -5,6 +5,7 @@
  * framework would cost more than it saves, and explicit `store.emit()` calls
  * keep the places that can cause a repaint obvious.
  */
+import { scopeVerdict } from './lib/shell-session.js';
 
 const NS = 'dsh.pocket';
 const LS = {
@@ -269,7 +270,12 @@ function normalizeSession(value) {
 export function loadSession() {
   const session = normalizeSession(readJson(LS.session, null));
   const shell = globalThis.__POCKET_SHELL__;
-  if (shell?.scope && (session?.scope !== shell.scope || session.token !== shell.deviceToken)) return null;
+  if (session === null || !shell?.scope) return session;
+  // scope 判据与外壳同一套（见 web/lib/shell-session.js 的 scopeVerdict）：
+  // 缺字段的 v1.0.2 记录按 legacy 接受，存在但不同的才拒绝。这里 fail-closed
+  // 等于"升级后每台手机都被踢回口令登录一次"，那不是安全收益。
+  if (scopeVerdict(session.scope, shell.scope) === 'mismatch') return null;
+  if (session.token !== shell.deviceToken) return null;
   return session;
 }
 

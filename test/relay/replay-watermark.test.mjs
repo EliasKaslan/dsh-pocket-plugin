@@ -211,14 +211,21 @@ test('a low sequence number accepted in order stays consumed as the high-water m
   assert.equal(link.checkFreshness('req', frame).code, 'replay');
 });
 
-test('full sequence table retains active pages and frees inactive slots', () => {
+test('full sequence table evicts the least recently active page instead of answering busy (R2)', () => {
   const { link } = makeLink();
   const ts = Date.now();
   for (let i = 0; i < 64; i++) {
     assert.equal(link.checkFreshness('req', { sid: i.toString(16).padStart(8, '0'), ts, seq: 1 }).ok, true);
   }
-  assert.equal(link.checkFreshness('req', { sid: SID, ts, seq: 1 }).code, 'busy');
-  assert.equal(link.checkFreshness('req', { sid: '00000000', ts, seq: 1 }).code, 'replay');
-  link.lastSeq.get('req:00000001').at = 0;
-  assert.equal(link.checkFreshness('req', { sid: SID, ts, seq: 1 }).ok, true);
+  // 第 65 页（10 分钟里约 16 次页面加载就会到这一步）：表满也必须放行。
+  // 旧代码回 { ok:false, code:'busy' }，手机端对 busy 不重试 → 新页面首帧永远被拒。
+  const fresh = link.checkFreshness('req', { sid: SID, ts, seq: 1 });
+  assert.equal(fresh.ok, true, '表满不许回 busy');
+  assert.equal(link.lastSeq.has(`req:${SID}`), true, '新页面必须落地');
+  assert.equal(link.lastSeq.size, 64, '硬上限仍然要守住');
+  assert.equal(link.lastSeq.has('req:00000000'), false, '被淘汰的是最久未活动的那一页');
+  // 它下次再出现时按「新页面」处理（水位随淘汰消失，这是淘汰的代价，不是漏洞）。
+  assert.equal(link.checkFreshness('req', { sid: '00000000', ts, seq: 1 }).ok, true);
+  // 仍然活跃的页面不受影响：同 sid 同样 seq 的重放照样被拒。
+  assert.equal(link.checkFreshness('req', { sid: '0000003f', ts, seq: 1 }).code, 'replay');
 });

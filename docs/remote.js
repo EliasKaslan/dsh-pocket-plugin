@@ -49,6 +49,15 @@ import {
   buildDiagText, describeAdvice, describeBrokerChoice, describeFailure, describeFailureShort,
   diagRows, normalizeConnack,
 } from './lib/relay-diag.js';
+/*
+ * 连接层的重试策略与分片重组表同样放在 `web/lib/`（纯逻辑，Node 可直接 import）：
+ * 这一段以前是浏览器代码里的内联循环，只能靠对源码做正则断言；抽出去之后
+ * `test/unit/shell-retry` / `test/unit/shell-parts` 测的是行为（失败几次、隔多久、
+ * 谁被淘汰），而不是"某个字符串还在不在"。
+ */
+import { CONTROL_RESEND_DELAYS, connectWithRetry, wakeDecision } from './lib/shell-retry.js';
+import { PartTable } from './lib/shell-parts.js';
+import { adoptScope, scopeVerdict } from './lib/shell-session.js';
 
 /* ------------------------------- constants ------------------------------ */
 
@@ -107,12 +116,14 @@ const HARD_RESET_MIN_DOWN_MS = 180_000;
 const HARD_RESET_MIN_GAP_MS = 120_000;
 /** A request stalled longer than this may be re-sent on the next beat. */
 const BEAT_RESEND_AFTER_MS = 4_000;
-/** Fragment reassembly limits, mirroring the desktop side. */
-const PART_MAX_TOTAL = 64;
-const PART_MAX_OPEN = 8;
-const PART_TTL_MS = 30_000;
-/** Largest single plaintext frame before fragmentation. */
+/**
+ * Largest single plaintext frame before fragmentation. The reassembly limits
+ * (`PART_MAX_TOTAL` / `PART_MAX_OPEN` / `PART_TTL_MS`) live in
+ * `web/lib/shell-parts.js` next to the table that enforces them.
+ */
 const MAX_FRAME = 64 * 1024;
+/** Uplink fragment budget: how many parts one request body may be split into. */
+const PART_MAX_TOTAL = 64;
 
 /* Storage layout. Everything is namespaced with `pocket.` (or the historical
    `dsh.pocket.` prefix the in-app UI uses) so a neighbouring project on the
@@ -289,15 +300,52 @@ function diagCopyButton() {
   return button;
 }
 
+/**
+ * 致命页上「重新连接」的动作。
+ *
+ * 引导流程一装好就把它接上（见 main() 里的 `retryBoot`），在那之前是 null ——
+ * 早期那几条 fatal（链接参数不合法 / 密钥无效）此时什么都还没启动，重连没有意义。
+ *
+ * 为什么要有它：1.0.2 的失败页只有一个「重新加载」，而刷新回到的**还是同一张
+ * 死页**（首连失败的现场就是这样）。失败页必须是可恢复的入口，不是终点。
+ */
+let retryBootAction = null;
+
+/**
+ * 失败页上的「重新连接」按钮（引导流程还没接上时返回 null）。
+ *
+ * 抽成独立函数而不是写在 `showFatal()` 里：致命页的按钮顺序是
+ * 重连 → 重载 → 复制诊断，而复制按钮的降级逻辑（clipboard 不可用时退回可选中
+ * 的只读文本框）已经单独测着，别让两段长逻辑缠在一起。
+ */
+function fatalRetryButton() {
+  if (typeof retryBootAction !== 'function') return null;
+  return el('button', {
+    class: 'pocket-btn pocket-btn-primary',
+    type: 'button',
+    text: '重新连接',
+    onclick: () => {
+      const retry = retryBootAction;
+      try { retry(); } catch { location.reload(); }
+    },
+  });
+}
+
 function showFatal(title, detail) {
   if (splash === null) return;
   splash.classList.remove('is-hidden');
   splash.classList.add('is-error');
   setSplash(title, detail ?? '');
   if (splashExtra === null) return;
-  const children = [
-    el('button', { class: 'pocket-btn pocket-btn-ghost', type: 'button', text: '重新加载', onclick: () => location.reload() }),
-  ];
+  const children = [];
+  const retry = fatalRetryButton();
+  if (retry !== null) children.push(retry);
+  children.push(el('button', {
+    class: 'pocket-btn pocket-btn-ghost',
+    type: 'button',
+    text: retry === null ? '重新加载' : '重新加载页面',
+    onclick: () => location.reload(),
+  }));
   const copy = diagCopyButton();
   if (copy !== null) children.push(copy);
   splashExtra.replaceChildren(...children);
@@ -509,8 +557,13 @@ function parseAuthSession(text, scope) {
     if (typeof parsed.token !== 'string' || parsed.token.length < 20) return null;
     const expiresAt = Number(parsed.expiresAt) || 0;
     if (expiresAt > 0 && expiresAt <= Date.now()) return null;
-    if (!scope || parsed.scope !== scope) return null;
-    return { token: parsed.token, scope, expiresAt, user: String(parsed.user ?? '') };
+    // v1.0.2 写下的记录没有 `scope`：按 legacy 接受（判据见 web/lib/shell-session.js）。
+    // 强校验一上，升级后的每台手机都会把本地有效令牌当"不是这个房间的"丢掉，
+    // 于是所有人都被踢回口令登录一次 —— 那是升级事故，不是安全收益。
+    const verdict = scopeVerdict(parsed.scope, scope);
+    if (verdict === 'mismatch') return null;
+    const record = adoptScope(parsed, scope);
+    return { token: record.token, scope, expiresAt, user: String(parsed.user ?? '') };
   } catch {
     return null;
   }
@@ -553,7 +606,11 @@ function readDeviceSession(scope) {
     try {
       const parsed = JSON.parse(raw);
       const token = typeof parsed?.token === 'string' ? parsed.token : '';
-      if (token.length === 0 || !scope || parsed.scope !== scope) continue;
+      if (token.length === 0) continue;
+      // 缺 `scope` 的旧记录按 legacy 接受（见 web/lib/shell-session.js 的
+      // `scopeVerdict()`）：令牌真伪由电脑端校验，这里 fail-closed 只会让
+      // 每一台升级上来的手机都被踢回口令登录。
+      if (scopeVerdict(parsed?.scope, scope) === 'mismatch') continue;
       return { token, deviceId: typeof parsed?.deviceId === 'string' ? parsed.deviceId : '' };
     } catch { /* 坏了的那份跳过，别让一条脏记录挡住登录 */ }
   }
@@ -691,6 +748,46 @@ function showLoginGate(relay, { user = '', reason = '' } = {}) {
   });
 }
 
+/* ------------------------------ 旧式握手提示 ----------------------------- */
+
+/**
+ * 电脑端插件版本落后（hello 里没有 `authReplyId`）时的降级提示。
+ *
+ * 1.0.2 在这里直接 `showFatal('需要更新电脑端插件')` —— 整屏硬拦，唯一的按钮是
+ * 「重新加载」，而重新加载拿到的还是同一张死页。真实场景恰恰是**手机 SW 已经缓存
+ * 了新外壳、电脑端插件还没升级**：用户什么也做不了，只能白屏等着两边版本对上。
+ *
+ * 协议本身没有变（`auth` / `login` 的帧格式一致），旧式握手仍然是可用的，缺的只是
+ * 桌面端"我支持按 id 回控制帧"这个标记。所以检测保留、降级成可操作的提示：
+ * 写清具体步骤，再给一个「仍然继续」。这个 Promise 只在用户点「仍然继续」时
+ * resolve —— 点「重新加载」走的是真的刷新。
+ *
+ * @returns {Promise<void>}
+ */
+function promptLegacyDesktop() {
+  return new Promise((resolve) => {
+    const step = (text) => el('li', { class: 'pocket-step', text });
+    const card = el('div', { class: 'pocket-card pocket-legacy', id: 'pocket-legacy' }, [
+      el('div', { class: 'pocket-mark', 'aria-hidden': 'true' }),
+      el('h1', { class: 'pocket-title', text: '电脑端插件版本较旧' }),
+      el('p', {
+        class: 'pocket-sub',
+        text: '这个手机页面比电脑上的插件新。现在还能用，但建议把两边版本对齐，否则下次更新可能连不上。',
+      }),
+      el('ol', { class: 'pocket-steps' }, [
+        step('在电脑上打开 DSH，进入「插件 / 市场」把 DSH Pocket 更新到最新版。'),
+        step('更新完成后回到这个页面，点下面的「重新加载」。'),
+        step('暂时不能更新就点「仍然继续」：旧式握手仍然可用，只是少一条更严格的校验。'),
+      ]),
+      el('div', { class: 'pocket-actions' }, [
+        el('button', { class: 'pocket-btn pocket-btn-ghost', type: 'button', text: '重新加载', onclick: () => location.reload() }),
+        el('button', { class: 'pocket-btn pocket-btn-primary', type: 'button', text: '仍然继续', onclick: () => resolve() }),
+      ]),
+    ]);
+    document.body.append(el('div', { class: 'pocket-gate', role: 'dialog', 'aria-modal': 'true' }, [card]));
+  });
+}
+
 /* ------------------------------ status chrome --------------------------- */
 
 let bannerNode = null;
@@ -724,7 +821,9 @@ class Relay {
     this.client = undefined;
     this.ready = false;
     this.pending = new Map();
-    this.parts = new Map();
+    // 下行分片表：满了就 LRU 淘汰最旧的半包（见 web/lib/shell-parts.js），
+    // 而不是像 1.0.2 那样把新来的分片丢掉、让大响应干等 30 秒 TTL。
+    this.parts = new PartTable();
     this.sockets = new Map();
     this.pcHello = null;
     this.pcSeenAt = 0;
@@ -746,6 +845,15 @@ class Relay {
     this.readyAt = 0;
     /** 已被新页面接管：不再重连、界面失效。 */
     this.superseded = false;
+    /**
+     * 界面已经收摊（fatal / 重试重建前）：
+     *
+     * 与 `superseded` 分开是因为语义不同 —— 那个是"被新页面顶掉"，会盖一层
+     * 「这个界面已失效」；这个只是"这一轮引导不要再往前跑了"，不该画任何覆盖层。
+     */
+    this.disposed = false;
+    /** 连续离线多久：分片表被迫淘汰半包的次数（诊断用）。 */
+    this.partsDropped = 0;
     /** 共享就绪等待器（null = 无人等待）。 */
     this.readyWaiters = new Set();
     /**
@@ -946,6 +1054,10 @@ class Relay {
           // Every (re)connect announces: the desktop may have restarted and
           // forgotten us. announce() self-throttles to one hello per 10 s.
           this.announce();
+          // **重连成功立刻重发在途请求**（同一个 request id，新的 seq/ts）。
+          // 只靠 8 s 一跳的 beat 兜底的话，用户点进会话后要盯着"转圈"等一个
+          // 心跳周期；这里把恢复时间压到一次 RTT。
+          this.resendPending();
           if (settled) return;
           settled = true;
           clearTimeout(timer);
@@ -1002,7 +1114,11 @@ class Relay {
           this.noteFailure({ code: 'CLOSE', message: '底层连接已关闭（close 事件没有错误码）' });
         }
         this.onstate('offline');
-        this.failAll('中继连接中断');
+        // 传输断了，但**在途请求不 reject**：桌面按 request id 幂等，重发不会重复
+        // 执行（见 request() 的注释）。1.0.2 在这里 failAll()，于是一次网络抖动就
+        // 把「点进会话」的 detail 请求判死，界面立刻弹「连不上电脑」。800 ms 后
+        // 重连成功也救不回来 —— 请求已经没了。
+        this.abortTransport('中继连接中断');
         if (!settled) {
           settled = true;
           clearTimeout(timer);
@@ -1072,6 +1188,8 @@ class Relay {
     // 已被新页面接管：不再重连。这一条是防乒乓的关键 —— 被顶掉的旧页面
     // 若能自己重建，就会反过来把新页面顶掉。
     if (this.superseded === true) return false;
+    // 界面已经收摊（fatal 页 / 准备重跑引导）：计时器与客户端都停了，别再拉起来。
+    if (this.disposed === true) return false;
     if (this.restarting === true) return false;
     clearTimeout(this.fastRetryTimer);
     this.fastRetryTimer = undefined;
@@ -1087,7 +1205,8 @@ class Relay {
     this.pcHello = null;
     this.pcStale = false;
     this.parts.clear();
-    this.failAll('中继连接重建中');
+    // 重建不是终点：在途请求留着，连上之后按同一个 request id 重发。
+    this.abortTransport('中继连接重建中');
     try { this.onstate('connecting'); } catch { /* 界面回调不该影响重建 */ }
     try { previous?.end?.(true); } catch { /* 已经断了 */ }
 
@@ -1102,6 +1221,7 @@ class Relay {
       // 触发，横幅「电脑端已离线 N 秒…」会永久挂着。显式通知一次已恢复。
       try { this.onpcStale(false, null); } catch { /* 界面回调不该影响重建 */ }
       this.announce(true);
+      this.resendPending();
       this.startStaleWatch();
       return true;
     } catch (error) {
@@ -1293,45 +1413,37 @@ class Relay {
     this.onpc(this.pcHello);
   }
 
-  /** Reassemble a fragmented payload; null means "not complete yet". */
+  /**
+   * 重组一条下行分片；null 表示"还没拼完 / 这一片不可用"。
+   *
+   * 具体规则在 `web/lib/shell-parts.js`（可被 Node 直接 import 并测行为）。
+   * 这里只负责两件外壳才知道的事：
+   *   1. 表满时被淘汰的那组半包要**记进诊断**（否则"手机收不到大响应"永远查不出来）；
+   *   2. 淘汰发生时立刻把最老的在途请求重发一次 —— 那条大响应永远拼不齐了，
+   *      与其让用户干等 16 秒预算超时，不如按同一个 id 让电脑端重放一份。
+   */
   collectPart(message) {
-    const id = String(message.id ?? '');
-    if (!/^[0-9a-f]{12}$/u.test(id)) return null;
-    const seq = Number(message.seq);
-    const total = Number(message.total);
-    if (!Number.isInteger(seq) || !Number.isInteger(total)) return null;
-    if (total < 1 || total > PART_MAX_TOTAL || seq < 0 || seq >= total) return null;
-    if (typeof message.d !== 'string' || message.d.length > Math.ceil(MAX_FRAME / 3) * 4) return null;
-    let chunk;
-    try { chunk = unb64(message.d); } catch { return null; }
-    if (chunk.length > MAX_FRAME) return null;
-    const now = Date.now();
-    for (const [key, entry] of this.parts) {
-      if (now - entry.at > PART_TTL_MS) this.parts.delete(key);
+    const result = this.parts.add(message);
+    if (result.evicted.length > 0) this.noteDroppedParts(result.evicted.length);
+    return result.kind === 'complete' ? result.value : null;
+  }
+
+  /**
+   * 分片表被迫淘汰了半包：大响应已经不可能拼齐。
+   *
+   * 下行大帧都是某个 `req` 的回包（任务列表 / 会话 detail），所以挑最老的
+   * 在途请求重发是最贴近真实原因的一步 —— 它要么拿到重放的回包，要么自己
+   * 在预算内超时，两种都比"静默等 30 秒 TTL"快。
+   */
+  noteDroppedParts(count) {
+    const dropped = Math.max(0, Number(count) || 0);
+    this.partsDropped += dropped;
+    this.stats.err += dropped;
+    let oldest = null;
+    for (const [, entry] of this.pending) {
+      if (oldest === null || entry.at < oldest.at) oldest = entry;
     }
-    const key = `part:${id}`;
-    let entry = this.parts.get(key);
-    if (entry === undefined) {
-      if (this.parts.size >= PART_MAX_OPEN) return null;
-      entry = { chunks: new Array(total), total, at: now };
-      this.parts.set(key, entry);
-    }
-    if (entry.total !== total) return null;
-    entry.chunks[seq] = chunk;
-    entry.at = now;
-    for (const chunk of entry.chunks) if (chunk === undefined) return null;
-    this.parts.delete(key);
-    const merged = new Uint8Array(entry.chunks.reduce((sum, part) => sum + part.length, 0));
-    let offset = 0;
-    for (const part of entry.chunks) {
-      merged.set(part, offset);
-      offset += part.length;
-    }
-    try {
-      return JSON.parse(decoder.decode(merged));
-    } catch {
-      return null;
-    }
+    oldest?.retry?.();
   }
 
   /** 等中继就绪；所有等待者共享同一个 promise，就绪时一次性放行。 */
@@ -1349,15 +1461,28 @@ class Relay {
   }
 
   async send(object, signal) {
+    /**
+     * 传输层暂时不可用：这是**可重试**的错误，必须和"请求被拒绝"区分开。
+     *
+     * `transient` 让 `request()` 不把它当成结论（不 reject，等重连后重发）；
+     * `beforeSend` 进一步说明"这一帧一次都没发出去"——`web/lib/net.js` 只对
+     * 这种失败才敢重试写方法（新的一次 fetch 会换 request id）。
+     */
+    const unavailable = (message, { beforeSend = true } = {}) => {
+      const error = new Error(message);
+      error.transient = true;
+      if (beforeSend === true) error.beforeSend = true;
+      return error;
+    };
     if (!this.ready || !this.client) {
-      if (!await this.waitReady(SEND_READY_WAIT_MS)) throw new Error('中继尚未就绪');
+      if (!await this.waitReady(SEND_READY_WAIT_MS)) throw unavailable('中继尚未就绪');
     }
     const client = this.client;
     const publish = async (frame) => {
       signal?.throwIfAborted();
       const sealed = await this.sealer.seal(frame, this.upTopic);
       signal?.throwIfAborted();
-      if (!client || this.client !== client || !this.ready || this.superseded) throw new Error('中继连接已更换');
+      if (!client || this.client !== client || !this.ready || this.superseded) throw unavailable('中继连接已更换');
       client.publish(this.upTopic, sealed, { qos: 1 });
     };
     // The token rides on every uplink message: the desktop validates each one
@@ -1429,21 +1554,60 @@ class Relay {
     clearDeviceSession();
   }
 
-  /** Ask the desktop whether this link needs a login and whether ours works. */
+  /**
+   * 发一条控制帧（`auth` / `login`）并等应答。
+   *
+   * 1.0.2 只 `send()` 一次：桌面热重载或弱网丢一帧，8 秒后就是
+   * `{ok:false, reason:'timeout'}` → `checkAuth` 判 unavailable → 整屏
+   * 「未能确认登录状态」。用户能做的只有刷新，而刷新大概率还是同一个结果。
+   *
+   * 现在复用普通请求那套重发：**同一份帧**再发 2 次（`CONTROL_RESEND_DELAYS`），
+   * 全部没有应答才 fallback 成 timeout。重连成功时 `resendPending()` 也会
+   * 通过 `entry.resend()` 再来一次。
+   *
+   * 必须逐字节相同：桌面 `handleControl()` 的幂等键是
+   * `sha256(JSON.stringify(message))` —— 换 id 或加 seq/ts 都会被当成**一次新的
+   * 登录**（重复跑 scrypt、甚至撞上登录限流），所以这里绝不重新构造帧。
+   */
   exchangeControl(type, fields, timeoutMs) {
     const id = randomId(12);
     const controller = new AbortController();
+    const frame = { t: type, id, ...fields, phone: this.phoneName, platform: 'web', ...this.deviceClaim() };
     return new Promise((resolve) => {
+      let settled = false;
+      let attempt = 0;
+      let resendTimer;
       const finish = (reply) => {
-        if (!this.controlRequests.delete(id)) return;
+        if (settled) return;
+        settled = true;
+        this.controlRequests.delete(id);
         controller.abort();
-        clearTimeout(timer);
+        if (resendTimer !== undefined) clearTimeout(resendTimer);
+        clearTimeout(deadline);
         resolve(reply);
       };
-      const timer = setTimeout(() => finish({ ok: false, reason: 'timeout' }), timeoutMs);
-      this.controlRequests.set(id, { type, finish });
-      this.send({ t: type, id, ...fields, phone: this.phoneName, platform: 'web', ...this.deviceClaim() }, controller.signal)
-        .catch(() => finish({ ok: false, reason: 'send-failed' }));
+      const deadline = setTimeout(() => finish({ ok: false, reason: 'timeout' }), timeoutMs);
+      const sendOnce = () => {
+        attempt += 1;
+        this.send(frame, controller.signal).catch((error) => {
+          // 传输层暂时不通：留着，等重连后由 resendPending() 重发（同一条帧）。
+          // 其它失败（例如帧根本无法加密）才是结论。
+          if (error?.transient === true) return;
+          finish({ ok: false, reason: 'send-failed' });
+        });
+        if (resendTimer !== undefined) clearTimeout(resendTimer);
+        const delay = CONTROL_RESEND_DELAYS[attempt - 1];
+        if (delay === undefined) return;
+        resendTimer = setTimeout(() => { if (!settled) sendOnce(); }, delay);
+      };
+      const resume = () => {
+        if (settled) return;
+        // 重连后的重发也照原有节奏走，不额外放宽总预算（deadline 不变）。
+        if (attempt >= CONTROL_RESEND_DELAYS.length + 1) return;
+        sendOnce();
+      };
+      this.controlRequests.set(id, { type, finish, resend: resume });
+      sendOnce();
     });
   }
 
@@ -1466,16 +1630,71 @@ class Relay {
     return reply;
   }
 
-  failAll(reason) {
+  /**
+   * 底层传输断了（MQTT close / 重建）：**只收拾传输层，不 reject 在途请求**。
+   *
+   * 为什么不能 reject：桌面端对 `req` 是按 request id 幂等的（`lib/cloud.mjs` 的
+   * 幂等缓存键 = 方法 + 路径 + id + 令牌），重发同一条 id 只会拿到缓存的回包，
+   * 不会把动作做第二遍。而 reject 之后 `web/lib/net.js` 只会把它翻译成
+   * 「连不上电脑，请检查网络与插件状态」—— 真实链路 800 ms 后就恢复了，
+   * 用户的请求却已经没了。这是"网络抖一下，点进会话就白屏"的病根。
+   *
+   * 在途请求由 `resendPending()` 在重连成功后按同一个 id 重发，超时只由请求
+   * 自身的 16 s 预算兜底（见 request()）。
+   */
+  abortTransport(reason) {
     for (const ready of this.readyWaiters) ready(false);
+    this.parts.clear();
+    for (const [, socket] of this.sockets) socket._close(1001, reason);
+  }
+
+  /**
+   * 重连成功：把断线期间还活着的请求/控制帧按**同一个 id** 重发一遍。
+   *
+   * 控制帧在这里一起重发（A3）：`auth` / `login` 以前只 send 一次，8 秒没应答
+   * 就整屏「未能确认登录状态」。它们的重发必须逐字节相同（桌面按整帧哈希去重），
+   * 所以 `controlRequests` 里存的是可重放的 `resend()`，而不是重新构造一次帧。
+   */
+  resendPending(reason = '中继已恢复') {
+    if (this.ready !== true || this.superseded === true || this.disposed === true) return;
+    for (const [, entry] of this.pending) entry.retry?.();
+    for (const [, entry] of this.controlRequests) entry.resend?.();
+    console.debug(`[pocket-diag] resendPending ${reason} pending=${this.pending.size} control=${this.controlRequests.size}`);
+  }
+
+  /**
+   * 界面收摊时的收尾：停掉一切会自己再跑起来的东西。
+   *
+   * 只关 MQTT 不够 —— 看门狗、快重连、在途请求都会在几百毫秒内把事情重新拉起来，
+   * 于是"死页"其实还在跑，还会被新标签页的抢主逻辑覆盖成「这个界面已失效」，
+   * 把本来有用的诊断页挡掉。
+   */
+  stop(reason = '界面已停止') {
+    this.disposed = true;
+    if (this.staleTimer !== undefined) { clearInterval(this.staleTimer); this.staleTimer = undefined; }
+    if (this.fastRetryTimer !== undefined) { clearTimeout(this.fastRetryTimer); this.fastRetryTimer = undefined; }
+    const client = this.client;
+    this.client = undefined;
+    this.ready = false;
+    try { client?.end?.(true); } catch { /* 已经断了 */ }
+    // 终结路径：页面不会再有人用这些回包了，连同控制帧一起收掉。
+    this.failAll(reason);
+  }
+
+  /**
+   * 终结路径：页面已被接管 / 已经收摊，在途请求与在途控制帧一起 reject。
+   *
+   * 与 `abortTransport()` 的唯一区别就在这里：那条路留着请求等重发，
+   * 这条路是真的没人再等了。
+   */
+  failAll(reason) {
+    this.abortTransport(reason);
     for (const entry of this.controlRequests.values()) entry.finish({ ok: false, reason: 'send-failed' });
     for (const [, entry] of this.pending) {
       clearTimeout(entry.timer);
       entry.reject(new Error(reason));
     }
     this.pending.clear();
-    this.parts.clear();
-    for (const [, socket] of this.sockets) socket._close(1001, reason);
   }
 
   /**
@@ -1533,7 +1752,17 @@ class Relay {
           headers,
           body: encoded,
           gzip,
-        }, controller.signal).catch((error) => entry.reject(error));
+        }, controller.signal).catch((error) => {
+          // 传输层暂时不可用（断线 / 客户端换代）：**不判死**。请求还活着等
+          // resendPending() 用同一个 id 重发；这里只需要补一个计时器，让既有的
+          // 16 秒预算继续生效 —— 否则这条请求再没有任何东西能结束它。
+          if (error?.transient !== true) { entry.reject(error); return; }
+          if (settled) return;
+          clearTimeout(entry.timer);
+          entry.timer = setTimeout(() => {
+            if (!settled) entry.reject(new Error('中继请求超时'));
+          }, timeout);
+        });
         // Early duplicates repair a lost frame in a second or two; the *last*
         // attempt still gets the full per-request budget, because a slow route
         // (a long task list, a POST that spawns an agent) is not a lost frame.
@@ -1977,10 +2206,19 @@ async function main() {
     snapshot: () => ({
       brokers: relay.brokers,
       online: relay.ready === true,
+      // 与 online 分开：中继在线 ≠ 电脑端在说话。同屏"一边在线、一边显示电脑端
+      // 已离线"的矛盾就是这两件事挤在一个字段里造成的。
+      pcStale: relay.pcStale === true,
       attempts: relay.failureStreak,
       lastFailure: relay.lastFailure,
       lastOkAt: relay.lastOkAt,
       lastAttemptAt: relay.lastAttemptAt,
+      // 只有 online 判断不了"手机收不到下行"这种坏法：真实链路自认为在线、
+      // 实际一帧都收不进来。收 / 发 / 错与最后收帧时刻是唯一的证据。
+      stats: { rx: relay.stats.rx, tx: relay.stats.tx, err: relay.stats.err, lastRxAt: relay.stats.lastRxAt },
+      pending: relay.pending.size,
+      restartCount: relay.restartCount,
+      sockets: relay.sockets.size,
       now: Date.now(),
     }),
     describeFailure,
@@ -1990,12 +2228,6 @@ async function main() {
     diagRows,
     buildDiagText,
   };
-
-  // 页面被关掉 / 切到后台时，尽力把隧道关掉，别让电脑端留着僵尸槽位。
-  // 手机被强杀时这段不会执行——所以电脑侧还有一层按活动时间的槽位回收。
-  const release = () => closeChannels(relay);
-  window.addEventListener('pagehide', release);
-  window.addEventListener('beforeunload', release);
 
   relay.onpc = (pc) => setSplash(`已连接 ${pc.name}`, '正在同步任务…');
   // One banner, two conditions: the relay link is down, or the desktop stopped
@@ -2051,52 +2283,15 @@ async function main() {
     renderBanner();
   };
 
-  // 首屏：没有本地会话时**先把登录框画出来**，不要让人对着 splash 等 MQTT 握手。
-  // 实测公共 broker 的握手要 ≈2.1 s，而这段时间用户完全可以开始输口令；
-  // 提交按钮先禁用，等鉴权结果回来再启用（真不需要登录时直接把框摘掉）。
-  const earlyGate = relay.session === null ? showLoginGate(relay, {}) : null;
-  const earlyForm = earlyGate === null ? null : document.getElementById('pocket-login-form');
-  let earlyHint = null;
-  let earlySubmit = null;
-  if (earlyForm !== null) {
-    hideSplash();
-    earlySubmit = earlyForm.querySelector('button[type="submit"]');
-    if (earlySubmit !== null) earlySubmit.disabled = true;
-    earlyHint = el('p', { class: 'pocket-sub', text: '正在连接电脑…' });
-    earlyForm.append(earlyHint);
-  }
+  /* ------------------------------------------------------------------------
+     初始化脚手架：收尾 / 致命页 / 重试
+     ------------------------------------------------------------------------
+     为什么要先有这三样再谈引导流程：1.0.2 把 tabTimer 与 pagehide 监听写在
+     4 条 `showFatal` 之前，于是"死页"其实还在跑（staleWatch / 快重连 / MQTT 都
+     没停），而且会被新标签页的抢主逻辑覆盖成「这个界面已失效」，把唯一有用的
+     诊断页挡掉。现在副作用一律在初始化成功之后注册，任何 fatal 都走 teardown。
+     ------------------------------------------------------------------------ */
 
-  try {
-    await relay.connect();
-  } catch (error) {
-    if (earlyForm !== null) { earlyForm.closest('.pocket-gate')?.remove(); }
-    // 别把 `连接超时` 这种壳话当结论：真正有用的是 `connectOne` 抓到的 error.code /
-    // connack（见 `relay.lastFailure`）。这条路径是"一次都没连上"时**唯一**的界面，
-    // 断因在这里丢掉就再也拿不回来了。
-    const raw = String(error?.message ?? error);
-    let because = raw;
-    try {
-      const described = describeFailure(relay.lastFailure);
-      if (typeof described === 'string' && described.length > 0 && described !== raw) because = `${described}（${raw}）`;
-    } catch { /* 翻译表炸了也不能盖掉原始错误 */ }
-    showFatal('无法建立中继连接', because);
-    return;
-  }
-  relay.startStaleWatch();
-  // 用户可见的「重连」、以及手机从后台回到前台，都要能把底层连接推倒重建。
-  // 只重开 WS 隧道救不了"MQTT 已死但自以为活着"的状态。
-  globalThis.__POCKET_RELAY_RESTART__ = (reason) => relay.restart(reason || '手动重连');
-  relay.onhardreset = () => { location.reload(); };
-
-  // ---- 同一台手机只让"最新打开的界面"生效：localStorage 抢主 ----
-  //
-  // 为什么不放在服务端：实测服务端拿到的页面身份（psid）不可靠 —— 同一个页面
-  // 重连时会带上不同的 psid，服务端会把它的新隧道当成"别的页面"顶掉，页面被
-  // 自己反复杀死。而这个需求本质是"同一台设备上哪个标签页最新"，localStorage
-  // 天然是**同源跨标签共享**的，最可靠。
-  //
-  // 规则：每个页面启动时把自己的 id 写进去；每 1.5 s 检查一次，发现不是自己就
-  // 认输（停止重连 + 整屏提示）。抢输的页面自己停，所以不会再发生互相反抢。
   const TAB_KEY = 'dsh.pocket.activeTab';
   const tabId = randomId(6);
   let tabTimer = null;
@@ -2106,187 +2301,355 @@ async function main() {
       return raw === null ? null : JSON.parse(raw);
     } catch { return null; }
   };
-  try {
-    localStorage.setItem(TAB_KEY, JSON.stringify({ id: tabId, at: Date.now() }));
-  } catch { /* 隐私模式：退化为多页并存 */ }
-  tabTimer = setInterval(() => {
-    const active = readActiveTab();
-    if (active === null || active.id === tabId) return;
-    if (tabTimer !== null) { clearInterval(tabTimer); tabTimer = null; }
-    relay.markSuperseded();
-  }, 1_500);
-  // 主动关闭时让出位置，别把"最新"这个名字带走（否则别的页面永远等不到）。
-  window.addEventListener('pagehide', () => {
+  /** 主动关闭时让出位置，别把"最新"这个名字带走（否则别的页面永远等不到）。 */
+  const yieldActiveTab = () => {
     const active = readActiveTab();
     if (active !== null && active.id === tabId) {
       try { localStorage.removeItem(TAB_KEY); } catch { /* ignore */ }
     }
-  });
-
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState !== 'visible') return;
-    // 醒来第一件事：把「活着的下界」重置到此刻。冻结期间收不到心跳是正常的，
-    // 不重置就会拿冻结前的时间戳算静默 → 立刻判「电脑端已离线」并重连。
-    relay.lastWakeAt = Date.now();
-    // 顺带主动探一次：活着的话电脑会立刻回 hello+beat，把静默清零；
-    // 真断了就由 26 s 看门狗在醒来之后重新计时接管。
-    relay.announce(true);
-    // 只有真的没连上才重建。
-    const justRestarted = Date.now() - (relay.lastRestartAt ?? 0) < 20_000;
-    if (!justRestarted && !relay.ready) void relay.restart('回到前台');
-  });
-
-  await new Promise((resolve) => {
-    const started = Date.now();
-    const timer = setInterval(() => {
-      if (relay.pcHello !== null || Date.now() - started > HELLO_TIMEOUT_MS) {
-        clearInterval(timer);
-        resolve();
-      }
-    }, 200);
-    // Self-throttled (<= 1 per 10 s): connectOne() already announced, so this
-    // normally becomes a no-op rather than a second hello.
-    relay.announce();
-  });
-
-  if (relay.pcHello === null) {
-    // 不在这里终结引导流程：电脑端可能正重启/热重载，等它回来就继续。
-    const arrived = await waitForDesktopHello(relay, 60_000);
-    if (!arrived) {
-      earlyForm?.closest('.pocket-gate')?.remove();
-      showFatal('电脑端没有响应', '确认电脑上的 DSH 正在运行，且「远程访问」已开启');
-      return;
-    }
-  }
-  if (relay.pcVersion > 0 && relay.pcVersion < PROTOCOL) {
-    console.warn(`[pocket] desktop speaks protocol ${relay.pcVersion}, shell speaks ${PROTOCOL}`);
-  }
-
-  // Login gate: no valid token, no UI. The 15-day token is encrypted at rest.
-  //
-  // 这里**必须串行**：之前为了省一个公网往返，把 checkAuth 提前到 connect 之后
-  // 就发，结果是「电脑端还没起来」时那次请求收不到应答，超时重发后落到了另一条
-  // 分支，最终显示的是 App 自己的 /connect 页（只有「重新登录」按钮、没有账号
-  // 密码框），与「电脑一直在」时的登录闸门不一致。省 0.8 s 不值得换来两套界面。
-  if (!relay.supportsAuthReplyId) {
-    earlyForm?.closest('.pocket-gate')?.remove();
-    showFatal('需要更新电脑端插件', '请将电脑端插件更新到与此手机页面配套的版本，然后重新加载。');
-    return;
-  }
-  const authState = await relay.checkAuth();
-  if (authState.unavailable || (!authState.required && !authState.ok)) {
-    earlyForm?.closest('.pocket-gate')?.remove();
-    showFatal('未能确认登录状态', '电脑未确认这次登录检查，请检查连接后重新加载。');
-    return;
-  }
-  if (authState.required && !authState.ok) {
-    // A fresh password login provisions this installation again, including after revocation.
-    clearAuthSession();
-    relay.session = null;
-    relay.dropDevice('');
-    hideSplash();
-    if (earlyGate !== null) {
-      // 早期就画好的那个框直接启用，不用再画一遍。
-      if (earlyHint !== null) earlyHint.remove();
-      if (earlySubmit !== null) earlySubmit.disabled = false;
-    }
-    const passed = earlyGate !== null
-      ? await earlyGate
-      : await showLoginGate(relay, {
-        user: authState.user ?? '',
-        reason: relay.session === null ? '' : '登录已过期，请重新登录',
-      });
-    if (!passed) {
-      showFatal('需要登录', '没有登录就无法访问这台电脑');
-      return;
-    }
-  } else {
-    earlyForm?.closest('.pocket-gate')?.remove();
-  }
-  relay.onunauthorized = () => {
-    clearAuthSession();
-    relay.session = null;
-    relay.dropDevice('');
-    if (!relay.authRequired || document.getElementById('pocket-login-form') !== null) return;
-    void showLoginGate(relay, { user: relay.authUser ?? '', reason: '登录已过期，请重新登录' })
-      .then((ok) => { if (ok) location.reload(); });
   };
 
-  if (relay.deviceIssue === 'revoked') {
-    // 设备被移除 = 这台手机的凭据作废：连 15 天登录会话一起清掉，
-    // 下一次真正走一遍口令登录（口令是唯一凭据）。
-    clearAuthSession();
-    relay.session = null;
-  }
-  // 设备令牌只有一个来源：口令登录成功时桌面随应答下发的这张。
-  // 拿不到就是拿不到 —— 链接里的 `t` 是电脑自己的中继身份，用它顶替等于让
-  // 电脑端的「移除设备」形同虚设，所以这里不做任何回落。
-  const deviceToken = relay.deviceToken;
+  /** 已注册的监听器：[target, type, handler]，收尾时逐条摘掉。 */
+  const lifecycle = [];
+  const listen = (target, type, handler) => {
+    target.addEventListener(type, handler);
+    lifecycle.push([target, type, handler]);
+  };
 
-  // Device session: app.js needs a record to build its Authorization header.
-  persistDeviceSession(deviceToken, relay.deviceId, { name, room, scope });
+  /** 停掉一切会自己再跑起来的东西（计时器、监听器、MQTT、在途请求）。 */
+  const teardownShell = () => {
+    if (tabTimer !== null) { clearInterval(tabTimer); tabTimer = null; }
+    if (relayBannerTimer !== null) { clearTimeout(relayBannerTimer); relayBannerTimer = null; }
+    yieldActiveTab();
+    for (const [target, type, handler] of lifecycle.splice(0)) {
+      try { target.removeEventListener(type, handler); } catch { /* 无关紧要 */ }
+    }
+    try { relay.stop('界面已停止'); } catch { /* 收尾不该再抛 */ }
+  };
 
-  installShims(relay);
-  hideSplash();
-  registerShellWorker();
+  /** 所有 fatal 路径的统一出口：先收尾，再画可恢复的失败页。 */
+  const failBoot = (title, detail) => {
+    teardownShell();
+    document.getElementById('pocket-login')?.remove();
+    showFatal(title, detail);
+  };
 
-  // Contract with web/app.js: set before the import, read at module evaluation.
-  globalThis.__POCKET_SHELL__ = {
-    mode: 'remote',
-    scope,
-    baseUrl: REMOTE_ORIGIN,
-    swUrl: './sw.js',
-    assetBase: './',
-    /** 口令登录换来的设备令牌：app.js 拿到它就直接渲染任务列表。 */
-    deviceToken,
-    deviceId: relay.deviceId,
-    /** 为什么没有令牌：'revoked' 已被电脑端移除，'limit' 设备数已达上限。 */
-    deviceError: relay.deviceIssue,
-    /** 重新登录：清掉登录会话与设备令牌，回到口令闸门（口令是唯一凭据）。 */
-    relogin() {
-      clearAuthSession();
-      relay.session = null;
-      relay.dropDevice('');
-      void showLoginGate(relay, { user: relay.authUser ?? '', reason: '请重新登录' })
-        .then((ok) => {
-          if (!ok) return;
-          // 闸门刚换到的新设备令牌得先落盘，否则刷新后又要重新登记一台。
-          persistDeviceSession(relay.deviceToken, relay.deviceId, { name, room, scope });
-          location.reload();
-        });
-    },
+  /**
+   * 失败页上「重新连接」要做的事：把这一轮引导从头再跑一遍。
+   *
+   * 注意 `relay.stop()` 会把 relay 标成"已收摊"（防止看门狗 / 快重连在死页上
+   * 继续跑），所以重跑前必须显式叫醒它；页面已被接管时不能重跑，只能刷新。
+   */
+  const retryBoot = () => {
+    if (relay.superseded === true) { location.reload(); return; }
+    relay.disposed = false;
+    void boot();
+  };
+
+  /**
+   * 引导流程本体（可以在致命页上被「重新连接」重跑）。
+   *
+   * 结构上刻意做成闭包而不是一条直线：1.0.2 的失败页只有 `location.reload()`，
+   * 而刷新回到的还是同一张死页 —— 用户没有任何恢复路径。
+   */
+  const boot = async () => {
+    // 上一轮（重试）可能留下了计时器与 MQTT 客户端：先收拾干净再开始。
+    teardownShell();
+    relay.disposed = false;
+    document.getElementById('pocket-login')?.remove();
+    // 失败页的按钮与红字也要收掉：这一轮是从「重新连接」点进来的，界面得回到
+    // "正在连接"，而不是把上一轮的致命页留在 splash 上。
+    splash?.classList.remove('is-error');
+    splashExtra?.replaceChildren();
+    retryBootAction = retryBoot;
+    setSplash('正在连接电脑…', '通过加密中继建立通道');
+
+    // 首屏：没有本地会话时**先把登录框画出来**，不要让人对着 splash 等 MQTT 握手。
+    // 实测公共 broker 的握手要 ≈2.1 s，而这段时间用户完全可以开始输口令；
+    // 提交按钮先禁用，等鉴权结果回来再启用（真不需要登录时直接把框摘掉）。
+    const earlyGate = relay.session === null ? showLoginGate(relay, {}) : null;
+    const earlyForm = earlyGate === null ? null : document.getElementById('pocket-login-form');
+    let earlyHint = null;
+    let earlySubmit = null;
+    if (earlyForm !== null) {
+      hideSplash();
+      earlySubmit = earlyForm.querySelector('button[type="submit"]');
+      if (earlySubmit !== null) earlySubmit.disabled = true;
+      earlyHint = el('p', { class: 'pocket-sub', text: '正在连接电脑…' });
+      earlyForm.append(earlyHint);
+    }
+    const removeGate = () => { document.getElementById('pocket-login')?.remove(); };
+
     /**
-     * 彻底忘掉这台手机与当前电脑的配对（设置页「换一台电脑」/ 解除配对）。
+     * 首次建联失败**不是终局**（A2）。
      *
-     * 必须由外层调用：app.js 只清得掉自己的 `dsh.pocket.session.v1`，而设备
-     * 令牌的真身在**外壳**这里 —— `persistDeviceSession()` 同时写了
-     * `pocket.session.v1`，`main()` 开头又会 `readDeviceSession()` 把它读回来
-     * 塞进 `relay.deviceToken`。不在这里清，用户确认"已断开"之后一刷新，
-     * `adoptShellSession()` 就把旧令牌重新采纳，等于没解除配对。
-     *
-     * 一起清掉的三样东西，缺一样都能把旧配对"复活"：
-     *   1. 设备令牌（两份键名 + 历史键）—— 否则刷新即复活；
-     *   2. 登录会话（口令换来的凭据）—— 设置页对用户的承诺是"登录信息会被清除"；
-     *   3. 记住的链接（含房间密钥）—— 否则下一个用这台手机的人还能进这个房间。
+     * 1.0.2 在这里一次失败就 `showFatal` + `return`，而那页面上唯一的按钮是
+     * 「重新加载」——刷新回到的还是同一张死页。公共 broker 的首次握手本来就
+     * 常失败（实测 1/3 的概率第一次 connect 超时），退避重试能把"打开就白屏"
+     * 变成"多等 1~2 秒就进去了"；只有连续 5 次都失败才落到可重试的失败页。
      */
-    forgetSession() {
-      const token = relay.session?.token;
-      relay.session = null;
-      if (token && relay.ready) void relay.send({ t: 'logout', token }).catch(() => {});
+    let lastBecause = '';
+    const connected = await connectWithRetry({
+      async connect() {
+        await relay.connect();
+      },
+      onRetry: ({ attempt, delay, error }) => {
+        const raw = String(error?.message ?? error);
+        let because = raw;
+        // 别把 `连接超时` 这种壳话当结论：真正有用的是 `connectOne` 抓到的
+        // error.code / connack（见 `relay.lastFailure`）。这条路径是"一次都没
+        // 连上"时**唯一**的界面，断因在这里丢掉就再也拿不回来了。
+        try {
+          const described = describeFailure(relay.lastFailure);
+          if (typeof described === 'string' && described.length > 0 && described !== raw) because = `${described}（${raw}）`;
+        } catch { /* 翻译表炸了也不能盖掉原始错误 */ }
+        lastBecause = because;
+        if (delay === null) return;
+        // 界面上必须看得见"第 N 次重试 · 原因"：否则用户只会觉得页面卡住了。
+        if (earlyHint !== null) earlyHint.textContent = `第 ${attempt} 次重试 · ${because}`;
+        setSplash(`正在重试连接（第 ${attempt} 次）…`, `${because} · ${Math.round(delay / 1_000)} 秒后自动再试`);
+      },
+    });
+    if (!connected.ok) {
+      removeGate();
+      teardownShell();
+      const because = lastBecause || String(connected.lastError?.message ?? connected.lastError);
+      showFatal('无法建立中继连接', because);
+      return;
+    }
+    relay.startStaleWatch();
+    // 用户可见的「重连」、以及手机从后台回到前台，都要能把底层连接推倒重建。
+    // 只重开 WS 隧道救不了"MQTT 已死但自以为活着"的状态。
+    relay.onhardreset = () => { location.reload(); };
+
+    await new Promise((resolve) => {
+      const started = Date.now();
+      const timer = setInterval(() => {
+        if (relay.pcHello !== null || Date.now() - started > HELLO_TIMEOUT_MS) {
+          clearInterval(timer);
+          resolve();
+        }
+      }, 200);
+      // Self-throttled (<= 1 per 10 s): connectOne() already announced, so this
+      // normally becomes a no-op rather than a second hello.
+      relay.announce();
+    });
+
+    if (relay.pcHello === null) {
+      // 不在这里终结引导流程：电脑端可能正重启/热重载，等它回来就继续。
+      const arrived = await waitForDesktopHello(relay, 60_000);
+      if (!arrived) {
+        removeGate();
+        failBoot('电脑端没有响应', '确认电脑上的 DSH 正在运行，且「远程访问」已开启');
+        return;
+      }
+    }
+    if (relay.pcVersion > 0 && relay.pcVersion < PROTOCOL) {
+      console.warn(`[pocket] desktop speaks protocol ${relay.pcVersion}, shell speaks ${PROTOCOL}`);
+    }
+
+    // 旧式握手（A9）：桌面插件还没升级到会回 `authReplyId` 的版本。
+    //
+    // 1.0.2 在这里整屏硬拦「需要更新电脑端插件」，唯一的按钮是「重新加载」——
+    // 而手机 SW 可能已经缓存了新外壳、电脑端还没升级，于是刷新还是这张死页，
+    // 用户白屏且完全无从下手。协议本身没变（auth/login 帧格式一致），缺的只是
+    // 桌面端一个"我支持按 id 回控制帧"的标记，所以降级成可操作的提示 + 继续。
+    if (!relay.supportsAuthReplyId) {
+      removeGate();
+      await promptLegacyDesktop();
+      hideSplash();
+    }
+
+    // Login gate: no valid token, no UI. The 15-day token is encrypted at rest.
+    //
+    // 这里**必须串行**：之前为了省一个公网往返，把 checkAuth 提前到 connect 之后
+    // 就发，结果是「电脑端还没起来」时那次请求收不到应答，超时重发后落到了另一条
+    // 分支，最终显示的是 App 自己的 /connect 页（只有「重新登录」按钮、没有账号
+    // 密码框），与「电脑一直在」时的登录闸门不一致。省 0.8 s 不值得换来两套界面。
+    const authState = await relay.checkAuth();
+    if (authState.unavailable || (!authState.required && !authState.ok)) {
+      removeGate();
+      failBoot('未能确认登录状态', '电脑未确认这次登录检查，请检查连接后重新加载。');
+      return;
+    }
+    if (authState.required && !authState.ok) {
+      // A fresh password login provisions this installation again, including after revocation.
       clearAuthSession();
+      relay.session = null;
       relay.dropDevice('');
-      dropStoredLink();
-      // 地址栏里那段 `#r=…&k=…` 也一起去掉：留着的话它仍是可分享、可恢复的入口。
-      try { history.replaceState(null, '', location.pathname + location.search); } catch { /* 老浏览器 */ }
-    },
+      hideSplash();
+      if (earlyGate !== null) {
+        // 早期就画好的那个框直接启用，不用再画一遍。
+        if (earlyHint !== null) earlyHint.remove();
+        if (earlySubmit !== null) earlySubmit.disabled = false;
+      }
+      const passed = earlyGate !== null
+        ? await earlyGate
+        : await showLoginGate(relay, {
+          user: authState.user ?? '',
+          reason: relay.session === null ? '' : '登录已过期，请重新登录',
+        });
+      if (!passed) {
+        failBoot('需要登录', '没有登录就无法访问这台电脑');
+        return;
+      }
+    } else {
+      removeGate();
+    }
+    relay.onunauthorized = () => {
+      clearAuthSession();
+      relay.session = null;
+      relay.dropDevice('');
+      if (!relay.authRequired || document.getElementById('pocket-login-form') !== null) return;
+      void showLoginGate(relay, { user: relay.authUser ?? '', reason: '登录已过期，请重新登录' })
+        .then((ok) => { if (ok) location.reload(); });
+    };
+
+    if (relay.deviceIssue === 'revoked') {
+      // 设备被移除 = 这台手机的凭据作废：连 15 天登录会话一起清掉，
+      // 下一次真正走一遍口令登录（口令是唯一凭据）。
+      clearAuthSession();
+      relay.session = null;
+    }
+    // 设备令牌只有一个来源：口令登录成功时桌面随应答下发的这张。
+    // 拿不到就是拿不到 —— 链接里的 `t` 是电脑自己的中继身份，用它顶替等于让
+    // 电脑端的「移除设备」形同虚设，所以这里不做任何回落。
+    const deviceToken = relay.deviceToken;
+
+    // Device session: app.js needs a record to build its Authorization header.
+    persistDeviceSession(deviceToken, relay.deviceId, { name, room, scope });
+
+    /* --------------------------------------------------------------------
+       **到这里才算初始化成功**：下面这些副作用（定时器、监听器、抢主、shims）
+       一律在这里注册，任何一条 fatal 都发生在它们之前，死页不会带着计时器跑。
+       -------------------------------------------------------------------- */
+
+    // 用户可见的「重连」，以及手机从后台回到前台，都要能把底层连接推倒重建。
+    globalThis.__POCKET_RELAY_RESTART__ = (reason) => relay.restart(reason || '手动重连');
+
+    // 页面被关掉 / 切到后台时，尽力把隧道关掉，别让电脑端留着僵尸槽位。
+    // 手机被强杀时这段不会执行——所以电脑侧还有一层按活动时间的槽位回收。
+    const release = () => closeChannels(relay);
+    listen(window, 'pagehide', release);
+    listen(window, 'beforeunload', release);
+    listen(window, 'pagehide', yieldActiveTab);
+
+    // ---- 同一台手机只让"最新打开的界面"生效：localStorage 抢主 ----
+    //
+    // 为什么不放在服务端：实测服务端拿到的页面身份（psid）不可靠 —— 同一个页面
+    // 重连时会带上不同的 psid，服务端会把它的新隧道当成"别的页面"顶掉，页面被
+    // 自己反复杀死。而这个需求本质是"同一台设备上哪个标签页最新"，localStorage
+    // 天然是**同源跨标签共享**的，最可靠。
+    //
+    // 规则：每个页面启动时把自己的 id 写进去；每 1.5 s 检查一次，发现不是自己就
+    // 认输（停止重连 + 整屏提示）。抢输的页面自己停，所以不会再发生互相反抢。
+    try {
+      localStorage.setItem(TAB_KEY, JSON.stringify({ id: tabId, at: Date.now() }));
+    } catch { /* 隐私模式：退化为多页并存 */ }
+    tabTimer = setInterval(() => {
+      const active = readActiveTab();
+      if (active === null || active.id === tabId) return;
+      if (tabTimer !== null) { clearInterval(tabTimer); tabTimer = null; }
+      relay.markSuperseded();
+    }, 1_500);
+
+    // 回到前台要立刻恢复（A7）：判据与动作都在 onVisible 里。
+    document.addEventListener('visibilitychange', onVisible);
+    lifecycle.push([document, 'visibilitychange', onVisible]);
+
+    installShims(relay);
+    hideSplash();
+    registerShellWorker();
+
+    // Contract with web/app.js: set before the import, read at module evaluation.
+    globalThis.__POCKET_SHELL__ = {
+      mode: 'remote',
+      scope,
+      baseUrl: REMOTE_ORIGIN,
+      swUrl: './sw.js',
+      assetBase: './',
+      /** 口令登录换来的设备令牌：app.js 拿到它就直接渲染任务列表。 */
+      deviceToken,
+      deviceId: relay.deviceId,
+      /** 为什么没有令牌：'revoked' 已被电脑端移除，'limit' 设备数已达上限。 */
+      deviceError: relay.deviceIssue,
+      /** 重新登录：清掉登录会话与设备令牌，回到口令闸门（口令是唯一凭据）。 */
+      relogin() {
+        clearAuthSession();
+        relay.session = null;
+        relay.dropDevice('');
+        void showLoginGate(relay, { user: relay.authUser ?? '', reason: '请重新登录' })
+          .then((ok) => {
+            if (!ok) return;
+            // 闸门刚换到的新设备令牌得先落盘，否则刷新后又要重新登记一台。
+            persistDeviceSession(relay.deviceToken, relay.deviceId, { name, room, scope });
+            location.reload();
+          });
+      },
+      /**
+       * 彻底忘掉这台手机与当前电脑的配对（设置页「换一台电脑」/ 解除配对）。
+       *
+       * 必须由外层调用：app.js 只清得掉自己的 `dsh.pocket.session.v1`，而设备
+       * 令牌的真身在**外壳**这里 —— `persistDeviceSession()` 同时写了
+       * `pocket.session.v1`，`main()` 开头又会 `readDeviceSession()` 把它读回来
+       * 塞进 `relay.deviceToken`。不在这里清，用户确认"已断开"之后一刷新，
+       * `adoptShellSession()` 就把旧令牌重新采纳，等于没解除配对。
+       *
+       * 一起清掉的三样东西，缺一样都能把旧配对"复活"：
+       *   1. 设备令牌（两份键名 + 历史键）—— 否则刷新即复活；
+       *   2. 登录会话（口令换来的凭据）—— 设置页对用户的承诺是"登录信息会被清除"；
+       *   3. 记住的链接（含房间密钥）—— 否则下一个用这台手机的人还能进这个房间。
+       */
+      forgetSession() {
+        const token = relay.session?.token;
+        relay.session = null;
+        if (token && relay.ready) void relay.send({ t: 'logout', token }).catch(() => {});
+        clearAuthSession();
+        relay.dropDevice('');
+        dropStoredLink();
+        // 地址栏里那段 `#r=…&k=…` 也一起去掉：留着的话它仍是可分享、可恢复的入口。
+        try { history.replaceState(null, '', location.pathname + location.search); } catch { /* 老浏览器 */ }
+      },
+    };
+
+    try {
+      await import('./app.js');
+    } catch (error) {
+      clearDeviceSession();
+      failBoot('界面加载失败', String(error?.message ?? error));
+    }
   };
 
-  try {
-    await import('./app.js');
-  } catch (error) {
-    clearDeviceSession();
-    showFatal('界面加载失败', String(error?.message ?? error));
-  }
+  /**
+   * 回到前台（A7）：**先算静默，再重置下界**。
+   *
+   * 1.0.2 先把 `lastWakeAt` 设成"现在"，而 idle 的下界里就含它 —— 冻结期间一条
+   * 下行都没收到也判不出静默，只能等 26 秒看门狗 + 最多 15 秒冷却；`justRestarted`
+   * 的 20 秒窗口还会把那次 kick 也跳掉。iOS 上的体感就是"回到前台后最长 ~40 秒
+   * 页面不动"。现在只要 ready 且已经 2 个心跳周期没有下行，立刻重建。
+   */
+  const onVisible = () => {
+    if (document.visibilityState !== 'visible') return;
+    const now = Date.now();
+    const decision = wakeDecision({
+      ready: relay.ready,
+      now,
+      lastRxAt: relay.stats.lastRxAt,
+      pcSeenAt: relay.pcSeenAt,
+      readyAt: relay.readyAt,
+      restarting: relay.restarting,
+    });
+    relay.lastWakeAt = now;
+    // 顺带主动探一次：活着的话电脑会立刻回 hello+beat，把静默清零。
+    relay.announce(true);
+    if (decision === 'restart-silent') { void relay.restart('回到前台后下行静默'); return; }
+    if (decision !== 'restart-down') return;
+    // 真的没连上：沿用 20 秒窗口，避免刚重建过又立刻拆一遍。
+    const justRestarted = now - (relay.lastRestartAt ?? 0) < 20_000;
+    if (!justRestarted) void relay.restart('回到前台');
+  };
+
+  await boot();
 }
 
 export { Relay, installFetch, installWebSocket, makeSealer };

@@ -12,11 +12,22 @@
  *   4. 横幅保留主句并补上短原因，6 秒去抖不变；连接页有诊断块与复制按钮。
  *
  * 纯函数（映射表本身）由 `test/unit/relay-diag.test.mjs` 覆盖，这里只做接线断言。
+ *
+ * 例外（也是本文件最有价值的两条）：断因的**记账本体** `noteFailure()` 与横幅短标签
+ * `relayReasonSuffix()` 现在真跑一遍 —— 从 `remote/remote.js` 切片、在 vm 沙箱里执行
+ * （`test/support/shell-source.mjs`），断因分类走真实的 `web/lib/relay-diag.js`。
+ * 以前这里是对源码做正则：把 `code` 写成别名字段、把 `connack` 漏掉，正则照样绿，
+ * 而手机界面上该类断因就变成「未知原因」。
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
+
+import { describeFailureShort, normalizeConnack } from '../../web/lib/relay-diag.js';
+import {
+  readRepoFile, runSlices, sliceConst, sliceMethod,
+} from '../support/shell-source.mjs';
 
 const repo = path.join(import.meta.dirname, '..', '..');
 const read = (relative) => readFileSync(path.join(repo, relative), 'utf8');
@@ -30,7 +41,104 @@ function slice(source, from, length = 900) {
 
 /* ------------------------- 1. 断因捕获（error / connack / close） ------------------------- */
 
-test('connectOne：error / connack / close 三个事件的断因都要落进 lastFailure', () => {
+test('noteFailure（行为）：真跑 noteFailure() —— error / connack / close 的断因都落进 lastFailure', () => {
+  const remote = readRepoFile('remote/remote.js');
+  let now = 1_700_000_000_000;
+  const api = runSlices({
+    declarations: [{ name: 'noteFailure', source: sliceMethod(remote, 'noteFailure') }],
+    // 断因分类是真实的生产模块：外壳 import 的正是 web/lib/relay-diag.js 构建出来的那份。
+    globals: { normalizeConnack },
+    clock: () => now,
+  });
+  /** 一台"刚刚失败过两次、上次成功在 60 s 前"的中继实例。 */
+  const makeRelay = () => ({
+    lastErrorCode: '',
+    lastErrorMessage: '',
+    lastConnack: null,
+    failureStreak: 2,
+    lastOkAt: now - 60_000,
+    lastFailure: null,
+  });
+
+  // ① error 事件：code + message 都要落进快照（它们是手机界面上唯一的证据）。
+  const relay = makeRelay();
+  api.noteFailure.call(relay, { code: 'ECONNRESET', message: 'socket hang up' });
+  assert.deepEqual(JSON.parse(JSON.stringify(relay.lastFailure)), {
+    code: 'ECONNRESET',
+    message: 'socket hang up',
+    connack: null,
+    at: now,
+    attempts: 2,
+    okAt: now - 60_000,
+  }, 'error 事件的 code/message/时间/连续失败数/最后成功时刻 都要进 lastFailure');
+
+  // ② connack 事件：v4 的 returnCode 与 MQTT 5 的 reasonCode 两种字段名都要认
+  //    （真实实现是外壳从 relay-diag 拿到的 normalizeConnack，这里断言"两种写法结果相同"）。
+  const v4 = makeRelay();
+  api.noteFailure.call(v4, { connack: { returnCode: 5 } });
+  const v5 = makeRelay();
+  api.noteFailure.call(v5, { connack: { reasonCode: 5 } });
+  assert.equal(v4.lastFailure.connack, 5, 'returnCode 必须被认出来（4/5 是"中继拒绝"的唯一证据）');
+  assert.equal(v5.lastFailure.connack, 5, 'reasonCode 必须被认出来（MQTT 5 的字段名）');
+  assert.deepEqual(JSON.parse(JSON.stringify(v4.lastFailure)), JSON.parse(JSON.stringify(v5.lastFailure)));
+
+  // ③ close 事件：没有错误码时补 CLOSE；而且**不能把这一轮已记下的 error 码冲掉**。
+  const closed = makeRelay();
+  api.noteFailure.call(closed, { code: 'ECONNRESET', message: 'reset by peer' });
+  now += 5;
+  api.noteFailure.call(closed, { code: 'CLOSE' }); // close 可以不带参数，这条是兜底码
+  assert.equal(closed.lastFailure.code, 'CLOSE', 'close 没有错误码时必须补一个 CLOSE（界面才能说"被关闭"而不是"未知原因"）');
+  assert.equal(closed.lastFailure.message, 'reset by peer', '空 message 不许覆盖已有的 message');
+  assert.equal(closed.lastFailure.at, now, '时间戳要跟着最后一次记账走');
+
+  // ④ 断因要能真的被翻译成界面文案：把 lastFailure 交给真实的 describeFailureShort。
+  const short = describeFailureShort(relay.lastFailure);
+  assert.equal(typeof short, 'string');
+  assert.notEqual(short.trim(), '', '短标签不许是空串（横幅会出现一个空括号）');
+  assert.equal(short, describeFailureShort({ code: 'ECONNRESET', message: 'socket hang up' }),
+    '同样的断因必须得到同样的短标签');
+
+  // ⑤ 超时这条路没有 error/close 可等：ETIMEDOUT 必须也能被翻译。
+  assert.notEqual(describeFailureShort({ code: 'ETIMEDOUT', message: '连接超时' }).trim(), '');
+});
+
+test('relayReasonSuffix（行为）：真跑外壳的横幅后缀 —— 断因现算、异常时不许拖垮横幅', () => {
+  const remote = readRepoFile('remote/remote.js');
+  const now = 1_700_000_000_000;
+  /**
+   * `relayReasonSuffix` 是 `main()` 里闭包引用 `relay` 的箭头函数，没法用 `this` 注入，
+   * 所以把假的 `relay` 作为**同一作用域里的绑定**注进去（`const relay = globalThis.__relay`）。
+   */
+  const suffixFor = (lastFailure, deps = {}) => {
+    const api = runSlices({
+      declarations: [
+        { name: 'relay', source: 'const relay = globalThis.__relay;' },
+        { name: 'relayReasonSuffix', source: sliceConst(remote, 'relayReasonSuffix') },
+      ],
+      globals: { describeFailureShort, __relay: { lastFailure }, ...deps },
+    });
+    return api.relayReasonSuffix();
+  };
+
+  // ① 没有断因 → 空串（只显示主句「中继断开，正在重连…」）。
+  assert.equal(suffixFor(null), '');
+  assert.equal(suffixFor(undefined), '');
+
+  // ② 有断因 → 带括号的短标签，且必须真的来自 describeFailureShort（渲染时现算）。
+  const failure = { code: 'ECONNRESET', message: 'socket hang up', connack: null, at: now, attempts: 1, okAt: 0 };
+  const suffix = suffixFor(failure);
+  assert.equal(suffix, `（${describeFailureShort(failure)}）`, '横幅后缀必须是现算的短标签');
+  assert.match(suffix, /^（.+）$/u, '短标签用中文括号包住，接在主句后面');
+
+  // ③ 诊断永远不该影响主流程：分类函数抛错时后缀退化成空串，横幅照常显示主句。
+  assert.equal(
+    suffixFor(failure, { describeFailureShort: () => { throw new Error('classify exploded'); } }),
+    '',
+    '诊断抛错时不许把横幅一起弄坏',
+  );
+});
+
+test('connectOne：三个事件都接到 noteFailure，且每次尝试先清空上一轮的断因', () => {
   const source = read('remote/remote.js');
 
   assert.match(source, /client\.on\('error', \(error\) => \{/u, 'error 必须被捕获（原来只有 console.warn）');
@@ -43,11 +151,10 @@ test('connectOne：error / connack / close 三个事件的断因都要落进 las
   assert.match(source, /client\.on\('packetreceive', \(packet\) => \{/u, 'connack 返回码必须被捕获（4/5 是"中继拒绝"的唯一证据）');
   assert.match(source, /normalizeConnack\(packet\)/u, '返回码要兼容 returnCode / reasonCode 两种字段名');
 
-  // 三个事件都走同一条记账路径
+  // 三个事件都走同一条记账路径（字段集合本身已由上面的 noteFailure 行为用例覆盖，
+  // 这里只钉"接线"：三类事件都必须调到 noteFailure / recordFailure）。
   const failureBody = slice(source, 'noteFailure({ code = \'\'', 700);
-  for (const field of ['code', 'message', 'connack', 'at', 'attempts', 'okAt']) {
-    assert.match(failureBody, new RegExp(`${field}:`, 'u'), `lastFailure 必须带 ${field}`);
-  }
+  assert.match(failureBody, /this\.lastFailure = \{/u, '三个事件必须落到同一个 lastFailure 快照');
 
   // error 带 code（ENOTFOUND / ECONNRESET / ERR_TLS_… 都在 code 里）
   assert.match(slice(source, "client.on('error'", 400), /error\?\.code/u, 'error.code 必须被记下来');

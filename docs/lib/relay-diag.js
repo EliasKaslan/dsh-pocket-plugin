@@ -304,6 +304,12 @@ export function rawFailureText(failure) {
 export function describeAdvice(diag) {
   const source = diag !== null && typeof diag === 'object' ? diag : {};
   if (source.online === true) {
+    // 「中继在线」和「电脑端在线」是两件事：手机连上公共 broker 只说明上行链路
+    // 还在，电脑端有没有在说话要看心跳。这两句以前被同一行「当前状态：在线」盖住，
+    // 屏幕上就出现了"一边显示在线、一边横幅说电脑端已离线"的自相矛盾。
+    if (source.pcStale === true) {
+      return '中继在线，但电脑端已经停止心跳：先确认电脑没有休眠 / 断网 / 关掉远程访问，再点界面上的「重连」；仍不恢复请复制诊断信息发给维护者。';
+    }
     return '中继当前在线。如果页面还是进不去，问题在登录状态或电脑端，请复制诊断信息发给维护者。';
   }
   const failure = failureOf(source);
@@ -343,14 +349,28 @@ export function describeAdvice(diag) {
   }
 }
 
+/** 计数字段：非法 / 缺失一律当 0，诊断永远不该显示 `NaN` 或 `undefined`。 */
+function countOf(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) return 0;
+  return Math.trunc(number);
+}
+
 /**
  * 连接页「中继诊断」的表格数据（纯数据，DOM 由调用方拼）。
  *
  * 离线时这些字段必须照样有值 —— 这块内容存在的意义就是"连不上的时候能看"，
  * 所以每一行都只依赖 relay 自己记下的东西，不依赖任何网络请求。
  *
- * @param {{brokers?: unknown, online?: boolean, attempts?: number,
+ * 1.0.3 追加了收发计数与在途/隧道/重建数：只有 `online` 时**判断不了"手机收不到
+ * 下行"**这种坏法（自认为在线、实际一帧都收不进来）。同时把「中继」与「电脑端
+ * 心跳」拆成两行 —— 它们本来就是两个判据，挤在一行就会出现"同屏一边在线、
+ * 一边说电脑端已离线"。
+ *
+ * @param {{brokers?: unknown, online?: boolean, pcStale?: boolean, attempts?: number,
  *   lastFailure?: object|null, lastOkAt?: number, lastAttemptAt?: number,
+ *   stats?: {rx?: number, tx?: number, err?: number, lastRxAt?: number},
+ *   pending?: number, restartCount?: number, sockets?: number,
  *   now?: number}} [diag]
  * @returns {Array<{key: string, label: string, value: string}>}
  */
@@ -365,10 +385,21 @@ export function diagRows(diag) {
     : null;
   const okAt = Number(source.lastOkAt);
   const attemptAt = Number(source.lastAttemptAt);
+  const stats = source.stats !== null && typeof source.stats === 'object' ? source.stats : {};
+  const lastRxAt = Number(stats.lastRxAt);
 
   const rows = [
     { key: 'broker', label: '中继地址', value: describeBrokerChoice(source.brokers) },
     { key: 'state', label: '当前状态', value: source.online === true ? '在线' : '离线' },
+    {
+      key: 'pc',
+      label: '电脑端心跳',
+      // 与「当前状态」并列、不复用：中继在线只说明手机连上了公共 broker，
+      // 电脑端有没有在说话是另一个判据。
+      value: source.pcStale === true
+        ? '已静默（电脑端可能休眠 / 断网）'
+        : source.online === true ? '正常' : '未连上（无从判断）',
+    },
     { key: 'attempts', label: '连续失败', value: `${attempts} 次` },
     {
       key: 'ok',
@@ -376,6 +407,12 @@ export function diagRows(diag) {
       value: `${formatAgo(okAt, now, '还没有成功过')}${formatClock(okAt) === '' ? '' : `（${formatClock(okAt)}）`}`,
     },
     { key: 'attempt', label: '最后尝试', value: formatAgo(attemptAt, now, '还没有尝试过') },
+    { key: 'rx', label: '收到下行', value: `${countOf(stats.rx)} 帧 · ${formatAgo(lastRxAt, now, '还没收到过')}` },
+    { key: 'tx', label: '发出上行', value: `${countOf(stats.tx)} 帧` },
+    { key: 'err', label: '解析 / 传输错误', value: `${countOf(stats.err)} 次` },
+    { key: 'pending', label: '在途请求', value: `${countOf(source.pending)} 条` },
+    { key: 'sockets', label: '实时通道', value: `${countOf(source.sockets)} 条` },
+    { key: 'restart', label: '连接重建', value: `${countOf(source.restartCount)} 次` },
     {
       key: 'failure',
       label: '最后失败',
@@ -392,13 +429,16 @@ export function diagRows(diag) {
 /**
  * 「复制诊断信息」按钮真正复制的那段文本。
  *
- * 只输出白名单字段：中继地址（已剥掉 userinfo/query）、连续失败次数、最后成功 /
- * 最后尝试时刻、最后失败原因与原始 code、当前是否在线、是否 PWA、UA。
+ * 只输出白名单字段：中继地址（已剥掉 userinfo/query）、中继与电脑端两个状态、
+ * 连续失败次数、最后成功 / 最后尝试时刻、收发帧计数、在途请求 / 实时通道 / 重建
+ * 次数、最后失败原因与原始 code、是否 PWA、UA。
  * **不含**房间密钥 `k`、设备令牌、链接里的 `r`/`t`、房间号 —— 这段文本会被
  * 用户粘贴到聊天窗口里求助，任何一项泄露都等于把配对交出去。
  *
- * @param {{brokers?: unknown, online?: boolean, attempts?: number,
+ * @param {{brokers?: unknown, online?: boolean, pcStale?: boolean, attempts?: number,
  *   lastFailure?: object|null, lastOkAt?: number, lastAttemptAt?: number,
+ *   stats?: {rx?: number, tx?: number, err?: number, lastRxAt?: number},
+ *   pending?: number, restartCount?: number, sockets?: number,
  *   now?: number, pwa?: boolean, userAgent?: unknown}} [diag]
  * @returns {string}
  */
