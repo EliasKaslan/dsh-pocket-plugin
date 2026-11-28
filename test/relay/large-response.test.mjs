@@ -66,6 +66,9 @@ test('刚好在预算内的大响应：正常分片，不报错', () => {
   assert.ok(frames.every((frame) => frame.t === 'part'), '分片的每一帧都应是 part');
   assert.ok(frames.every((frame) => frame.id === frames[0].id), '同一批分片共用一个 chunk id');
   assert.equal(frames[0].total, sent.length, 'total 必须与实际片数一致');
+  // R5：每一片都要带「被拆那一帧的 id」，手机端据此把半包对回具体请求。
+  assert.ok(frames.every((frame) => frame.rid === 'big-2'),
+    `part 帧必须带 rid（实际 ${JSON.stringify(frames.map((frame) => frame.rid))}）`);
 
   // 拼回去应当还原成原始响应。
   const merged = frames

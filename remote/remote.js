@@ -84,8 +84,9 @@ const HELLO_MIN_GAP_MS = 10_000;
  *     1200 + 2400 + 3600 + 8000 = 15 200 ms
  *
  * 这组数字必须与 `web/lib/rpc-budget.js` 一致，并被 `test/domain/shell-rpc-budget`
- * 拿三条关系钉住：① 与纯逻辑模块的常量相同；② 总预算 < 应用侧
- * `DETAIL_TIMEOUT_MS`；③ 判死用的是**绝对截止时刻**，任何一条路径（心跳重发、
+ * 拿三条关系钉住：① 与纯逻辑模块的常量相同；② 总预算 **+ `DECOMPRESS_TIMEOUT_MS`
+ * 一起**小于应用侧 `DETAIL_TIMEOUT_MS`（否则"解压超时"这个原因永远显示不出来，
+ * 手机还白跑一整段解压）；③ 判死用的是**绝对截止时刻**，任何一条路径（心跳重发、
  * 重连重发、过期 attempt 的迟到失败）都不能把它拖长。
  *
  * 旧值 16_000 / [1_200, 2_400, 4_800] 一共 24 400 ms，已经比应用侧的 20 s 长 ——
@@ -295,10 +296,25 @@ function readInstallId() {
   return id;
 }
 
+/**
+ * 一次转成字符串的字节数。
+ *
+ * `String.fromCharCode.apply` 的参数个数有上限（各引擎 64K 级），8 KB 远在安全区内；
+ * 分块的意义不是"绕过上限"，而是让下面那个 `text +=` 只在 n/8192 次上加长，
+ * 而不是每个字节都重抄一遍整串。
+ */
+const B64_CHUNK_BYTES = 8 * 1024;
+
 function b64(bytes) {
-  let text = '';
   const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  for (let index = 0; index < view.length; index += 1) text += String.fromCharCode(view[index]);
+  // 旧实现是逐字节 `text += String.fromCharCode(...)`：71 KB 就是 72 704 次拼接
+  // （探针在手机端实测 10.1 ms，而同样体积的 `unb64` 只要 0.17 ms；桌面 V8 因为有
+  // cons string 只慢 2~3 倍，但机制一样，换到 WebKit 就是实打实的卡顿）。
+  // 改成按 8 KB 分块 `String.fromCharCode.apply` 之后只有 9 次拼接，O(n)。
+  let text = '';
+  for (let offset = 0; offset < view.length; offset += B64_CHUNK_BYTES) {
+    text += String.fromCharCode.apply(null, view.subarray(offset, offset + B64_CHUNK_BYTES));
+  }
   return btoa(text);
 }
 
@@ -1302,7 +1318,10 @@ class Relay {
     this.readyAt = 0;
     this.pcHello = null;
     this.pcStale = false;
-    this.parts.clear();
+    // 半包表**不在这里清**：清表要记账（"一次重连把正在拼的大响应清掉了"必须能在
+    // 诊断里看见），而记账点在 `abortTransport()` 里。旧实现先在上面 `parts.clear()`、
+    // 再调 `abortTransport()`，于是生产上的重连路径永远绕过记账，`partsIncomplete`
+    // 恒 0 —— "网络恢复了页面还不动"在手机侧一点痕迹都没有。
     // 重建不是终点：在途请求留着，连上之后按同一个 request id 重发。
     this.abortTransport('中继连接重建中');
     try { this.onstate('connecting'); } catch { /* 界面回调不该影响重建 */ }
@@ -1328,6 +1347,10 @@ class Relay {
       // 失败后必须排下一次重试：看门狗在 ready=false 时会跳过（避免重建风暴），
       // 如果这里不排，自愈链就断在原地 —— 界面停在「中继断开，正在重连…」其实没在连。
       //
+      // 死页不许再排定时器：`markSuperseded()` / `stop()` 之后这个 catch 仍会被唤醒
+      // （`connect()` 的失败是晚到一步的），旧实现照排 `fastRetryTimer` —— 于是被顶掉
+      // 的页面继续自我重建，还会反过来把新页面顶掉（防乒乓的另一半就在这里）。
+      if (this.superseded === true || this.disposed === true) return false;
       // 退避语义沿用原来的 1s→2s→4s→8s→16s（上限 15 s），**只**在上面叠 ±20%
       // 抖动：一群手机被同一个 broker / 同一台运营商设备同时掐断时，没有抖动
       // 它们会在同一毫秒一起回来，把刚恢复的中继再打趴一次（重连风暴）。
@@ -1532,8 +1555,9 @@ class Relay {
    */
   collectPart(message) {
     const result = this.parts.add(message);
-    if (result.evicted.length > 0) this.noteLostParts(result.evicted.length, 'evicted');
-    if (result.expired.length > 0) this.noteLostParts(result.expired.length, 'ttl');
+    // `*Rids` 与 `*` 按位置一一对应：那是"哪一组丢了"精确对上"哪条请求受害"的唯一凭据。
+    if (result.evicted.length > 0) this.noteLostParts(result.evicted.length, 'evicted', result.evictedRids ?? []);
+    if (result.expired.length > 0) this.noteLostParts(result.expired.length, 'ttl', result.expiredRids ?? []);
     return result.kind === 'complete' ? result.value : null;
   }
 
@@ -1548,35 +1572,67 @@ class Relay {
    * 行为与现在一致，不会更糟。
    */
   sweepParts(now = Date.now()) {
-    const expired = this.parts.sweep(now);
-    if (expired.length > 0) this.noteLostParts(expired.length, 'ttl');
+    // TTL 过期的组连 `rid` 一起交回（组一旦从表里删掉就再也查不到了）。
+    const expired = this.parts.expire(now);
+    if (expired.length > 0) this.noteLostParts(expired.length, 'ttl', expired.map((group) => group.rid));
     // 先判死再补片：已经超时的那几组没必要再 nack（它们的回包不会来了）。
     for (const id of this.parts.lost(now)) {
-      if (this.parts.drop(id)) this.noteLostParts(1, 'stall');
+      const rid = this.parts.ridOf(id);
+      if (this.parts.drop(id)) this.noteLostParts(1, 'stall', rid === '' ? [] : [rid]);
     }
     if (this.ready !== true || this.client === undefined) return;
-    for (const id of this.parts.nackDue(now)) {
+    const due = this.parts.nackDue(now);
+    for (const id of due) {
+      const rid = this.parts.ridOf(id);
       this.parts.markNacked(id, now);
       this.stats.partsNacked += 1;
       console.debug(`[pocket-diag] nack ${id}`);
       // ① 新桌面（≥1.0.4）：指名补片，一片一条，通常 2 秒内补齐。
-      void this.send({ t: 'nack', id, sid: this.sid, seq: this.nextSeq(), ts: this.serverNow() }).catch(() => {});
+      //    `rid` 一起带上：桌面据此能把"补这一组"与"哪条请求"对上（认不出的字段
+      //    会被老桌面忽略，安全）。`id` 仍是分片 id —— 补的是片，不是请求。
+      void this.send({
+        t: 'nack', id, ...(rid === '' ? {} : { rid }), sid: this.sid, seq: this.nextSeq(), ts: this.serverNow(),
+      }).catch(() => {});
       // ② 老桌面（1.0.3 及更早）：`nack` 会被 `default: break` 忽略。这时**同 id
       //    重发**是唯一的快速自救 —— 那帧响应已经在桌面的 120s 幂等缓存里，重发会让
       //    它把整条响应重新发一遍（含全部片）。放在这里而不是等 8 秒判失，是因为
       //    "卡住 2 秒"已经足够证明有片丢了，没必要再干等 6 秒。
       //    代价：每条请求每 5 秒最多多一帧（nack 自带同组间隔），而它救回的是
       //    用户正在盯着的那一屏。重复帧对桌面是幂等回放，不会重复执行。
-      this.healOldestPending();
     }
+    // ③ 自救额度是**每条请求唯一**的（`RPC_HEAL_RESENDS`），一个 tick 最多用掉一次。
+    //    旧实现把 `healOldestPending()` 写在上面那个 for 循环里：一个 2 s tick 里有
+    //    几个组要 nack，就会同时吃掉几条**无关请求**各自的额度 —— 真正卡住的那条
+    //    第二次 nack（≈7.5 s）时额度已空，8 s 判死只能直接 `parts_lost`。
+    if (due.length > 0) this.healOnce(due);
+  }
+
+  /**
+   * 一个 tick 只做一次自救，且**优先救"持有最老半包"那条请求**。
+   *
+   * 新桌面在 `part` 帧里给了 `rid`：受害者就是它，不用猜。
+   * 老桌面没有 `rid`：只能退回 `healOldestPending()`（挑最老的在途请求）。
+   * 两种情况的共同上限都是"每 tick 一次"，把救错的代价压到"一帧重复请求"。
+   *
+   * @param {string[]} ids 本 tick 要 nack 的组
+   * @returns {boolean} 是否真的重发了
+   */
+  healOnce(ids = []) {
+    const rid = typeof this.parts.oldestRid === 'function' ? this.parts.oldestRid(ids) : '';
+    if (rid !== '') {
+      const victim = this.pending.get(rid);
+      // rid 精确命中一条在途请求：只救它。额度用尽也**不**转去救别人 ——
+      // 那正是"救错对象"，这里宁可留给 nack 补片和 8 s 判死。
+      return victim !== undefined && typeof victim.heal === 'function' && victim.heal() === true;
+    }
+    return this.healOldestPending();
   }
 
   /**
    * 用同一个 request id 重发**最老的在途请求**（桌面命中幂等缓存 → 回放整份响应）。
    *
-   * 为什么只能"近似挑最老的"：`part` 帧里只有 12 位 chunkId，没有 request id，
-   * 收方无法把半包精确映射回请求。典型场景只有 1~2 条在途请求，这个近似够用；
-   * 挑错时的代价也只是一帧重复请求（幂等，不会重复执行）。
+   * 这条启发式现在只服务**老桌面**（`part` 帧里没有 `rid`）：收方无法把半包映射回
+   * 请求，只能近似挑一条。新桌面走 `healOnce()` / `settleVictim()` 的精确路径。
    *
    * @returns {boolean} 是否真的重发了
    */
@@ -1590,6 +1646,26 @@ class Relay {
   }
 
   /**
+   * 对"确认为受害者"的那条请求做处置：先自救（同 id 重放），额度用尽就**立刻判死**。
+   *
+   * 这是 C1 的落点：谁是受害者由 `rid` 说了算，不再靠"谁最老"猜。判死带
+   * `parts_lost`，`web/lib/net.js` 据此换一个新的 request id 重试（重新切一份响应）。
+   *
+   * @param {string} rid 被丢那一组的 `rid`
+   * @param {number} lost 这一批丢了几组（只用于错误里的计数）
+   * @returns {boolean} 是否处理了它（`false` = 这不是一条在途请求）
+   */
+  settleVictim(rid, lost) {
+    const id = typeof rid === 'string' ? rid : '';
+    if (id === '') return false;
+    const entry = this.pending.get(id);
+    if (entry === undefined) return false;
+    if (typeof entry.heal === 'function' && entry.heal() === true) return true;
+    entry.reject?.(partsLostError(lost));
+    return true;
+  }
+
+  /**
    * 一组下行分片彻底丢了：大响应已经不可能拼齐。
    *
    * 两步走（顺序很重要）：
@@ -1598,15 +1674,29 @@ class Relay {
    *   2. 自救预算用完了就**立刻判死**这条请求（`parts_lost`），交给 `web/lib/net.js`
    *      换一个新的 request id 重试 —— 那会重新切一份响应，比原样重放更可能成功。
    *
-   * 分片帧里**没有** request id（只有 12 位 chunkId），所以只能近似地挑"最老的在途
-   * 请求"。这不是新问题（旧实现也这么挑），但它决定了大响应读不回来的恢复速度。
+   * `targets` 是丢掉的每一组自带的 `rid`（= 被拆那一帧的 request id）。**有 rid 时
+   * 只处理 rid 指向的那条请求**：旧实现一律挑"最老的在途请求"，而 `entry.at` 每次
+   * attempt 都会刷新，"最老"其实是"最近没发过的"，于是丢片的受害者一路挂到预算
+   * 耗尽（15.2 s）拿 `relay_timeout`，被误救的那条白拉一整份响应。
+   *
+   * @param {number} count 丢了几个半包（诊断计数）
+   * @param {string} reason `evicted` / `ttl` / `stall`
+   * @param {string[]} [targets] 每个丢失组自带的 `rid`（老桌面缺省为空串）
    */
-  noteLostParts(count, reason) {
+  noteLostParts(count, reason, targets = []) {
     const lost = Math.max(0, Number(count) || 0);
     if (lost === 0) return;
     this.stats.partsIncomplete += lost;
     this.stats.err += lost;
     console.debug(`[pocket-diag] parts lost=${lost} (${reason}) open=${this.parts.size}`);
+    // ① 精确路径：只看 rid 指向的那条请求。救不到（请求已经结束）就**什么都不做** ——
+    //    绝不许退回启发式去误伤旁边那条无关请求，那正是"自救救错对象"的病灶。
+    const precise = (Array.isArray(targets) ? targets : []).filter((rid) => typeof rid === 'string' && rid !== '');
+    if (precise.length > 0) {
+      for (const rid of precise) this.settleVictim(rid, lost);
+      return;
+    }
+    // ② 老桌面（分片帧里没有 rid）：只能近似挑"最老的在途请求"。
     if (this.healOldestPending()) return;
     let oldest = null;
     for (const [, entry] of this.pending) {
@@ -1848,7 +1938,13 @@ class Relay {
     // `retry()` 在 attempt 用尽后是空操作 —— 而那恰恰是最需要它的一次
     // （半包被 `abortTransport()` 清掉、回包永远拼不齐，见 RPC_HEAL_RESENDS）。
     // 每条请求只多给一次，避免弱网来回抖动时把上行刷成风暴。
-    for (const [, entry] of this.pending) (entry.heal ?? entry.retry)?.();
+    //
+    // 但 heal 额度用尽时**必须回退到 retry**：两者是"优先/兜底"而不是"二选一"。
+    // 旧写法 `(entry.heal ?? entry.retry)?.()` 在 heal 存在但返回 false 时什么都不做 ——
+    // 探针里"2→2 帧"：明明还剩 attempt 预算，却一帧都没重发。
+    for (const [, entry] of this.pending) {
+      if (entry.heal?.() !== true) entry.retry?.();
+    }
     for (const [, entry] of this.controlRequests) entry.resend?.();
     console.debug(`[pocket-diag] resendPending ${reason} pending=${this.pending.size} control=${this.controlRequests.size}`);
   }
@@ -2127,6 +2223,10 @@ class Relay {
  */
 async function decompressGzip(bytes, timeoutMs = DECOMPRESS_TIMEOUT_MS) {
   const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  // 必须留一份 response 的引用：`Promise.race` 只是**不再等**那条流，而它背后的
+  // reader 与已解出的缓冲（一条大响应 45~108 KB）会一直常驻，且每次超时都能叠加
+  // 一份。留了引用才能在 catch 里把它真的取消掉（见下）。
+  const response = new Response(stream);
   let timer;
   const guard = new Promise((_resolve, reject) => {
     timer = setTimeout(() => {
@@ -2136,9 +2236,13 @@ async function decompressGzip(bytes, timeoutMs = DECOMPRESS_TIMEOUT_MS) {
     }, Math.max(1, Number(timeoutMs) || DECOMPRESS_TIMEOUT_MS));
   });
   try {
-    const buffer = await Promise.race([new Response(stream).arrayBuffer(), guard]);
+    const buffer = await Promise.race([response.arrayBuffer(), guard]);
     return new Uint8Array(buffer);
   } catch (error) {
+    // 超时/坏字节都要把底层流取消掉：不取消的话这条 `DecompressionStream` 永远
+    // 半开着（浏览器里表现为"解压一次卡一次"，内存只涨不落）。
+    // `cancel()` 自己也可能抛（流已关闭 / 平台不支持），绝不能再盖掉原始错误。
+    try { await response.body?.cancel?.(); } catch { /* 已关闭或平台不支持 */ }
     // 解压失败（坏字节 / 流卡住）都归成同一类：拿到的 body 不可用。
     if (error?.pocketCode === 'decompress') throw error;
     const failure = new Error(`大响应解压失败：${String(error?.message ?? error)}`);

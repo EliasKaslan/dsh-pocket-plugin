@@ -124,13 +124,26 @@ test('/api/v1/health：200、只暴露公开字段、端口是实际监听端口
   const body = jsonResponse(response, 200, 'GET /api/v1/health');
   assert.equal(body.ok, true);
   assert.deepEqual(Object.keys(body.data).sort(), [
-    'bootId', 'ok', 'port', 'protocol', 'ready', 'requiresLogin', 'started', 'uptimeMs', 'version',
+    'bootId', 'build', 'ok', 'port', 'protocol', 'ready', 'requiresLogin', 'started', 'uptimeMs', 'version',
   ]);
   assert.equal(body.data.port, ctx.port);
   assert.equal(body.data.protocol, 1);
   assert.equal(body.data.requiresLogin, true, '手机端唯一的进门方式是账号 + 口令登录');
-  // bootId：每次 apply 换一个，用来确认「关掉再打开插件确实换了实例/新代码」。
+  // bootId：每次 apply 换一个，用来确认「关掉再打开插件确实换了实例」。
   assert.match(String(body.data.bootId), /^[0-9a-f]{8}$/u, 'bootId 必须是 8 位十六进制');
+  // build：模块求值标记，只在 lib/index.mjs 顶层生成一次。它是「新代码到底跑没跑」
+  // 的硬判据 —— bootId 变了但 build.evalId 没变，就是宿主只重新 apply 了旧模块。
+  // 本用例直接 new BridgeCore/Server（没经 apply），所以 evalId 按设计是 null；
+  // 真值（8 位十六进制）由 hot-reload.test.mjs 端到端断言，这里只钉字段形状。
+  assert.equal(body.data.build.version, PKG_VERSION, 'build.version 必须等于包版本');
+  assert.equal(body.data.build.pid, process.pid, 'build.pid 必须是当前进程');
+  for (const field of ['evalId', 'evalAt', 'processStartedAt']) {
+    assert.ok(field in body.data.build, `build.${field} 必须存在（形状恒定，只增不改）`);
+  }
+  assert.ok(
+    body.data.build.evalId === null || /^[0-9a-f]{8}$/u.test(String(body.data.build.evalId)),
+    'build.evalId 必须是 8 位十六进制或 null',
+  );
   // 不要写死版本号：每次发版都得改测试，改漏了就是一条假红。以 package.json 为准，
   // 这样真正要钉的是「health 报的版本 = 包版本」，而不是某个具体数字。
   assert.equal(body.data.version, PKG_VERSION);

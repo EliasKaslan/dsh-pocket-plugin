@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
-  DETAIL_TIMEOUT_MS, RPC_ATTEMPTS, RPC_BACKOFF_MS, RPC_TIMEOUT_MS, STALL_HINT_AFTER_MS,
+  DECOMPRESS_TIMEOUT_MS, DETAIL_TIMEOUT_MS, RPC_ATTEMPTS, RPC_BACKOFF_MS, RPC_TIMEOUT_MS, STALL_HINT_AFTER_MS,
   detailFailureText, loadingText, rpcWorstCaseMs, waitText,
 } from '../../web/lib/rpc-budget.js';
 
@@ -39,6 +39,24 @@ test('预算必须落在应用侧超时之内，且留足余量（两个数不�
     `余量 ${DETAIL_TIMEOUT_MS - budget}ms 太小：外壳判死到应用层放弃之间要留出收尾（读 body/解压）的空间`);
   // 反向也要有下限：预算太短会把"电脑端正在忙"误判成丢包（大响应 + 解压要时间）。
   assert.ok(RPC_TIMEOUT_MS >= 5_000, '最后一次 attempt 的预算至少 5 s，否则慢路由直接被砍');
+});
+
+test('C3：详情超时必须盖住「外壳最坏 + 解压上限」，否则 decompress 的原因永远显示不出来', () => {
+  // 一条详情最坏能走多远（两段串行，不是并行的）：
+  //   ① 外壳按同 id 重放，跑完自己的预算（15 200 ms）才判死 → 带 pocketCode；
+  //   ② 回包到了还要解 gzip，这一步自己有 10 000 ms 的截止时刻 → pocketCode=decompress。
+  // 应用侧超时必须比两者之和更晚到点，否则用户看到的永远是笼统的「请求超时」，
+  // 手机还白跑一段 ≤10 s 的解压（旧值 20 000 < 25 200，实测就是这样）。
+  const worstCase = rpcWorstCaseMs() + DECOMPRESS_TIMEOUT_MS;
+  assert.equal(worstCase, 15_200 + 10_000);
+  assert.ok(DETAIL_TIMEOUT_MS > worstCase,
+    `详情超时 ${DETAIL_TIMEOUT_MS}ms 必须大于「外壳最坏 ${rpcWorstCaseMs()}ms + 解压上限 `
+    + `${DECOMPRESS_TIMEOUT_MS}ms」= ${worstCase}ms，否则 decompress 这个原因到不了界面`);
+  // 但也不许无限放大：多出来的只是收尾余量。
+  assert.ok(DETAIL_TIMEOUT_MS - worstCase <= 5_000,
+    `余量 ${DETAIL_TIMEOUT_MS - worstCase}ms 太大：用户要为空等买单`);
+  // 解压上限本身要有意义（0 会让解压必然失败，比外壳预算还大就失去"截止"的意义）。
+  assert.ok(DECOMPRESS_TIMEOUT_MS > 0 && DECOMPRESS_TIMEOUT_MS < rpcWorstCaseMs());
 });
 
 test('超过 3 秒才打扰用户，且文案带着"等多久 + 第几次重试"', () => {

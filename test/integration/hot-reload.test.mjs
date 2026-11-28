@@ -87,6 +87,7 @@ async function waitUp(port, timeoutMs = 4000) {
 
 test('apply → dispose → apply 三轮：每次都起来、每次都是新实例、结束后端口释放', async () => {
   const bootIds = new Set();
+  const evalIds = new Set();
 
   for (let cycle = 1; cycle <= 3; cycle += 1) {
     const world = makeCtx();
@@ -109,6 +110,12 @@ test('apply → dispose → apply 三轮：每次都起来、每次都是新实�
     assert.ok(status.bootId.length > 0, 'health 必须带 bootId');
     bootIds.add(status.bootId);
 
+    // build.evalId 在模块顶层生成：同一进程内重复 apply 不会重跑顶层代码，
+    // 所以它三轮必然相同 —— 这正是「apply 换了实例 ≠ 换了代码」的机器可读证据，
+    // 也是真实宿主里判断「要不要重启 DSH」的同一根指针。
+    assert.match(String(status.build?.evalId), /^[0-9a-f]{8}$/u, 'health.build.evalId 必须是 8 位十六进制');
+    evalIds.add(status.build.evalId);
+
     world.dispose();
 
     // 卸载之后端口必须真的放手（否则下一次加载会顺延到下一个端口）。
@@ -123,6 +130,9 @@ test('apply → dispose → apply 三轮：每次都起来、每次都是新实�
   }
 
   assert.equal(bootIds.size, 3, `三轮必须是三个不同实例，实际 ${[...bootIds].join(',')}`);
+  // 同一进程内从没重新 import 过模块，evalId 必须唯一：它变了才说明宿主真的
+  // 把模块从 ESM 缓存里摘掉重求值了（即 lib/** 的改动已生效）。
+  assert.equal(evalIds.size, 1, `同一进程内 build.evalId 不该变，实际 ${[...evalIds].join(',')}`);
 });
 
 test('卸载是幂等的：连着 dispose 两次不抛，也不会让端口更难释放', async () => {

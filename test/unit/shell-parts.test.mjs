@@ -126,3 +126,65 @@ test('parsePartFrame：合法帧给出 id / seq / total / 字节，超长片直�
   assert.equal(parsePartFrame({ t: 'part', id: 'aaaaaaaaaaaa', seq: 0, total: 2, d: huge }), null);
   assert.equal(parsePartFrame(part('aaaaaaaaaaaa', 0, 2, 'x'), { maxTotal: 0 }), null);
 });
+
+/* ----------------- 组记录里的 rid（C1 的纯逻辑那一半） ----------------- */
+
+test('C1：组记录必须保存 rid（= 被拆那一帧的 request id），后到的片也能补上', () => {
+  let clock = 0;
+  const table = new PartTable({ now: () => (clock += 1) });
+  const withRid = (id, seq, total, text, rid) => ({ t: 'part', id, seq, total, d: b64(text), rid });
+  // 第 0 片带 rid：第一片就记下来。
+  table.add(withRid('aaaaaaaaaaaa', 0, 3, '{"a":', '0123456789abcdef'));
+  assert.equal(table.incomplete()[0].rid, '0123456789abcdef', '组记录要带上 rid');
+  assert.equal(table.ridOf('aaaaaaaaaaaa'), '0123456789abcdef', '被淘汰/过期之前要能按 chunkId 查回 rid');
+  // 后续片没带 rid：不能把已知的 rid 擦成空（片是同一组，rid 只有一份）。
+  table.add({ t: 'part', id: 'aaaaaaaaaaaa', seq: 1, total: 3, d: b64('1') });
+  assert.equal(table.ridOf('aaaaaaaaaaaa'), '0123456789abcdef');
+  // 老桌面的帧（没有 rid）：`ridOf` 给空串，上层据此退回启发式。
+  table.add(part('cccccccccccc', 0, 2, '{"c":'));
+  assert.equal(table.ridOf('cccccccccccc'), '', '老桌面没有 rid：必须是空串，不能编造');
+  assert.equal(table.ridOf('nosuchgroup'), '', '查不到也要给空串（不许抛）');
+  // 认不出的 rid 只当"没给"，不许因此把整组分片丢掉。
+  table.add({ t: 'part', id: 'dddddddddddd', seq: 0, total: 2, d: b64('{"d":'), rid: { evil: true } });
+  assert.equal(table.ridOf('dddddddddddd'), '', 'rid 畸形不该拒帧，只当没给');
+  assert.equal(table.size, 3, '三组都还在表里（畸形 rid 没有把新组拒之门外）');
+});
+
+test('C1/C2：oldestRid 按「创建时刻」挑最老的那一组（并支持只在给定的几组里挑）', () => {
+  let clock = 1_000;
+  const table = new PartTable({ now: () => clock });
+  const withRid = (id, rid, seq = 0, total = 3) => ({ t: 'part', id, seq, total, d: b64('{"x":'), rid });
+  table.add(withRid('aaaaaaaaaaaa', 'rid-oldest'));
+  clock += 10;
+  table.add(withRid('bbbbbbbbbbbb', 'rid-newer'));
+  assert.equal(table.oldestRid(), 'rid-oldest', '默认在全表里挑最老的');
+  assert.equal(table.oldestRid(['bbbbbbbbbbbb']), 'rid-newer', '限定范围时只看给定那几组');
+  assert.equal(table.oldestRid(['nosuchgroup']), '', '挑不出就给空串（上层退回启发式）');
+  // `at` 被新片刷新过也不影响"谁最老"：判据是 createdAt。
+  clock += 1_000;
+  table.add({ t: 'part', id: 'aaaaaaaaaaaa', seq: 1, total: 3, d: b64('1') });
+  assert.equal(table.oldestRid(), 'rid-oldest', '刚收到过新片的组仍然可能是"最老的那组"');
+  // 老桌面（没有 rid）：整表都没有可用 rid。
+  const bare = new PartTable();
+  bare.add({ t: 'part', id: 'eeeeeeeeeeee', seq: 0, total: 2, d: b64('{"e":') });
+  assert.equal(bare.oldestRid(), '');
+});
+
+test('C1：淘汰/过期要连 rid 一起交回（组一删就从表里查不到了）', () => {
+  // ① TTL 过期：`expired` 仍是 chunkId 列表，`expiredRids` 按位置一一对应。
+  let clock = 0;
+  const expiring = new PartTable({ now: () => (clock += 1), maxOpen: 4, ttlMs: 5 });
+  expiring.add({ t: 'part', id: 'aaaaaaaaaaaa', seq: 0, total: 2, d: b64('{"a":'), rid: 'rid-a' });
+  clock += 100;
+  const expired = expiring.add({ t: 'part', id: 'bbbbbbbbbbbb', seq: 0, total: 2, d: b64('{"b":'), rid: 'rid-b' });
+  assert.deepEqual(expired.expired, ['aaaaaaaaaaaa'], 'expired 仍是 chunkId 列表（既有门禁靠它）');
+  assert.deepEqual(expired.expiredRids, ['rid-a'], '同一批组的 rid 必须一一对应地交回');
+  // ② 被迫淘汰（表满）：同样要把被淘汰那组的 rid 交回。
+  let tick = 0;
+  const full = new PartTable({ now: () => (tick += 1), maxOpen: 2, ttlMs: 60_000 });
+  full.add({ t: 'part', id: 'cccccccccccc', seq: 0, total: 2, d: b64('{"c":'), rid: 'rid-c' });
+  full.add({ t: 'part', id: 'dddddddddddd', seq: 0, total: 2, d: b64('{"d":'), rid: 'rid-d' });
+  const evicted = full.add({ t: 'part', id: 'eeeeeeeeeeee', seq: 0, total: 2, d: b64('{"e":'), rid: 'rid-e' });
+  assert.deepEqual(evicted.evicted, ['cccccccccccc']);
+  assert.deepEqual(evicted.evictedRids, ['rid-c']);
+});

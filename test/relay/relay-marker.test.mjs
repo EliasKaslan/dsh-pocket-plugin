@@ -112,6 +112,37 @@ test('端到端：被转发的请求头里带真实 nonce，手机伪造的值�
   }
 });
 
+test('R2a：转发时注入本端 request id（x-pocket-id），手机自带的同名头被丢弃', async () => {
+  const { link } = makeLink({ relayNonce: 'n'.repeat(43) });
+
+  // 手机自带一份：必须被丢掉，否则等于让客户端自选下游幂等键。
+  const spoofed = link.buildForwardHeaders({ 'x-pocket-id': 'spoofed-by-phone' });
+  assert.equal(spoofed['x-pocket-id'], undefined, '没有真实 id 时不许透传客户端给的值');
+
+  const stub = stubFetch();
+  try {
+    await link.handleRequest({
+      id: 'req-abc',
+      method: 'POST',
+      path: '/api/v1/tasks',
+      body: Buffer.from('{"prompt":"hi"}', 'utf8').toString('base64'),
+      headers: { 'x-pocket-id': 'spoofed-by-phone' },
+    });
+    assert.equal(stub.calls.length, 1);
+    const forwarded = stub.calls[0].init.headers;
+    assert.equal(forwarded['x-pocket-id'], 'req-abc', '必须把手机的 request id 原样交给本地桥');
+    assert.ok(!JSON.stringify(forwarded).includes('spoofed-by-phone'), '手机伪造的同名头不许漏过去');
+  } finally {
+    stub.restore();
+  }
+
+  // 形状不认识的 id 退化成完整 sha256：宁可多一次哈希，也不许截断/替换成可能撞的键。
+  const weird = link.buildForwardHeaders({}, 'id with spaces & punctuation!');
+  assert.match(weird['x-pocket-id'], /^[0-9a-f]{64}$/u);
+  const other = link.buildForwardHeaders({}, 'id with spaces & punctuation?');
+  assert.notEqual(weird['x-pocket-id'], other['x-pocket-id'], '两个不同的 id 不许算出同一个键');
+});
+
 /* ------------------------------------------------------------------------- */
 /* 真实 BridgeCore + BridgeServer：isLoopbackRequest / stripRelayHeader      */
 /* ------------------------------------------------------------------------- */

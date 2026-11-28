@@ -18,7 +18,8 @@
  *      「加载中…」一停就是几十秒，这正是"偶尔点进会话半天没有内容"。
  *
  * 所以两个数由**同一份数据**推导，并被用例钉住关系：
- * `rpcWorstCaseMs() < DETAIL_TIMEOUT_MS`（见 `test/domain/shell-rpc-budget`）。
+ * `rpcWorstCaseMs() + DECOMPRESS_TIMEOUT_MS < DETAIL_TIMEOUT_MS`
+ * （见 `test/unit/rpc-budget.test.mjs` / `test/domain/shell-rpc-budget`）。
  *
  * 注意：`remote/remote.js` 里那几个常量仍是**数字字面量**（`relay-restart`
  * 的门禁按 `const RPC_TIMEOUT_MS = <数字>;` 解析源码），两边必须一致 ——
@@ -46,13 +47,28 @@ export const RPC_TIMEOUT_MS = 8_000;
 export const RPC_BACKOFF_MS = [1_200, 2_400, 3_600];
 
 /**
+ * 一条 gzip 大响应的解压上限。
+ *
+ * 与 `remote/remote.js` 的 `DECOMPRESS_TIMEOUT_MS` 是同一个数（外壳里必须是数字字面量，
+ * 所以两边各写一份，由 `test/domain/shell-rpc-budget` 逐字段比对）。它之所以要出现在
+ * 这个模块里：应用侧的超时**必须把它算进去**，否则"解压超时"这个原因永远到不了界面
+ * （见 `DETAIL_TIMEOUT_MS`）。
+ */
+export const DECOMPRESS_TIMEOUT_MS = 10_000;
+
+/**
  * 应用侧详情（含翻页）的**总**超时。
  *
- * 必须**明显大于** `rpcWorstCaseMs()`：让失败时抛出来的是外壳自己的原因
- * （带 `pocketCode`，界面能给出可操作的话），而不是应用层笼统的「请求超时」。
- * 20 s - 15.2 s = 4.8 s 的余量留给"外壳判死后 net.js 还在读 body"这类收尾。
+ * 必须**明显大于** `rpcWorstCaseMs() + DECOMPRESS_TIMEOUT_MS`：
+ *   - 外壳按同 id 重放的最坏耗时是 15 200 ms（跑完才轮到自己判死，带 `pocketCode`）；
+ *   - 外壳判死/回包之后还有一步解压，最坏 10 000 ms，那一步的 `pocketCode` 是
+ *     `decompress`（界面据此给"回包到了但解不开"的话术）。
+ *
+ * 旧值 20 000 ms 比 15 200 + 10 000 = 25 200 ms 还小：先到点的永远是应用侧的笼统
+ * 「请求超时」，外壳辛苦归类的 `decompress` 原因**永远显示不出来**，手机还白跑
+ * ≤10 s 的解压。26 000 ms - 25 200 ms = 800 ms 留给收尾（读 body / 取消流）。
  */
-export const DETAIL_TIMEOUT_MS = 20_000;
+export const DETAIL_TIMEOUT_MS = 26_000;
 
 /** 详情加载超过这么久还没内容，就把"到底在干什么"写到界面上（而不是静止转圈）。 */
 export const STALL_HINT_AFTER_MS = 3_000;

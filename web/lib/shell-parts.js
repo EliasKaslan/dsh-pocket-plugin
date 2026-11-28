@@ -39,17 +39,28 @@ export const PART_NACK_GAP_MS = 5_000;
 /** 同时最多为几个半包发 `nack`。 */
 export const PART_NACK_MAX_OPEN = 4;
 /**
- * 一个半包**这么久还没集齐**就判定"这一组回包再也拼不齐了"。
+ * 一个半包**从开始拼起，这么久还没集齐**就判定"这一组回包再也拼不齐了"。
  *
  * 取两个心跳周期：电脑端每 8 s 一跳 beat，而心跳会用**同一个 request id**
- * 触发一次重发（桌面命中幂等缓存重放整条响应）。所以 8 s 内既没有新片、
+ * 触发一次重发（桌面命中幂等缓存重放整条响应）。所以 8 s 内既没有集齐、
  * 也没有被重放的完整响应，就只剩"我们等的东西不存在了"这一种解释 ——
  * 与其让用户干等到请求预算耗尽，不如立刻把这条请求送去自救/重试。
+ *
+ * 计时起点是 `createdAt` 而不是"最后一片到达"，见 `PartTable.lost()`。
  */
 export const PART_LOST_MS = 8_000;
 
 /** 分片 id 的形状：12 位小写十六进制（桌面 `randomBytes(6).toString('hex')`）。 */
 const ID_PATTERN = /^[0-9a-f]{12}$/u;
+
+/**
+ * 分片帧可选的 `rid`（= 被拆那一帧的 request id）的形状。
+ *
+ * 桌面 `publish()` 拆帧时把 `object.id` 写进每一片（`lib/cloud.mjs`）。它的宽度
+ * 由桌面决定（现在是 16 位十六进制），这里**故意放宽**：只要能当 Map 键用就行，
+ * 格式不认识就当"老桌面没给"，绝不允许因为一个字段长得奇怪就把整组分片丢掉。
+ */
+const RID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/u;
 
 /** 浏览器 / Node 都有 atob；这里只把结果摊成字节，不碰 DOM。 */
 function decodeBase64(text) {
@@ -60,9 +71,12 @@ function decodeBase64(text) {
 }
 
 /**
- * 校验一条 `part` 帧并取出 (id, seq, total, 字节)。
+ * 校验一条 `part` 帧并取出 (id, seq, total, 字节, rid)。
  *
- * @returns {{id: string, seq: number, total: number, chunk: Uint8Array}|null}
+ * `rid` 是**可选的**：新桌面会带上"被拆那一帧的 request id"，老桌面没有 —— 缺失时
+ * 返回空串，上层据此退回启发式（见 `PartTable.oldestRid()`）。
+ *
+ * @returns {{id: string, seq: number, total: number, chunk: Uint8Array, rid: string}|null}
  */
 export function parsePartFrame(message, { maxTotal = PART_MAX_TOTAL, maxFrame = MAX_FRAME } = {}) {
   if (message === null || typeof message !== 'object') return null;
@@ -74,6 +88,8 @@ export function parsePartFrame(message, { maxTotal = PART_MAX_TOTAL, maxFrame = 
   if (total < 1 || total > maxTotal || seq < 0 || seq >= total) return null;
   if (typeof message.d !== 'string') return null;
   if (message.d.length > Math.ceil(maxFrame / 3) * 4) return null;
+  // 认不出的 rid 当作"没给"：它只用来定位受害者，不值得为它拒掉整组分片。
+  const rid = typeof message.rid === 'string' && RID_PATTERN.test(message.rid) ? message.rid : '';
   let chunk;
   try {
     chunk = decodeBase64(message.d);
@@ -81,7 +97,7 @@ export function parsePartFrame(message, { maxTotal = PART_MAX_TOTAL, maxFrame = 
     return null;
   }
   if (chunk.length > maxFrame) return null;
-  return { id, seq, total, chunk };
+  return { id, seq, total, chunk, rid };
 }
 
 /**
@@ -106,7 +122,14 @@ export class PartTable {
     this.maxTotal = maxTotal;
     this.maxFrame = maxFrame;
     this.now = now;
-    /** key(`part:<id>`) -> { chunks, total, at }。Map 的插入序不是使用序，LRU 另有判据。 */
+    /**
+     * key(`part:<id>`) -> `{ chunks, total, at, createdAt, rid, nacks?, nackedAt? }`。
+     *
+     * 三个时刻的语义**不能混**：
+     *   - `at`：最后一片到达的时刻（NACK 判据 = "这一组有多久没动静了"）；
+     *   - `createdAt`：这一组**开始拼**的时刻（判失判据 = "还没集齐多久了"）；
+     *   - Map 的插入序不是使用序，LRU 另有判据（见 `add()`）。
+     */
     this.parts = new Map();
     /** 累计被迫淘汰的半包数（诊断用）。 */
     this.dropped = 0;
@@ -133,12 +156,26 @@ export class PartTable {
    * @returns {string[]} 被清掉的 chunkId
    */
   sweep(now = this.now()) {
+    return this.expire(now).map((group) => group.id);
+  }
+
+  /**
+   * 与 `sweep()` 同一判据，但**连 `rid` 一起交回**。
+   *
+   * 为什么需要另一个方法：分组一旦从表里删掉，`rid` 就再也查不到了 —— 而上层要靠
+   * 它把"哪一组丢了"精确对上"哪条在途请求"。只交回 id 的话，上层只能再退回
+   * "挑最老在途请求"的启发式（那正是丢片自救救错对象的根因）。
+   *
+   * @param {number} [now]
+   * @returns {{id: string, rid: string}[]}
+   */
+  expire(now = this.now()) {
     const gone = [];
     for (const [key, entry] of this.parts) {
       if (now - entry.at > this.ttlMs) {
         this.parts.delete(key);
         this.expired += 1;
-        gone.push(key.slice('part:'.length));
+        gone.push({ id: key.slice('part:'.length), rid: entry.rid ?? '' });
       }
     }
     return gone;
@@ -156,7 +193,12 @@ export class PartTable {
         id: key.slice('part:'.length),
         total: entry.total,
         missing,
+        /** 被拆那一帧的 request id（老桌面没有 → 空串）。 */
+        rid: entry.rid ?? '',
+        /** 距最后一片到达多久（NACK 判据）。 */
         ageMs: Math.max(0, now - entry.at),
+        /** 这一组还没集齐多久了（判失判据，见 `lost()`）。 */
+        aliveMs: Math.max(0, now - (entry.createdAt ?? entry.at)),
         nacks: entry.nacks ?? 0,
         nackedAt: entry.nackedAt ?? 0,
       });
@@ -200,14 +242,51 @@ export class PartTable {
    * 已经超过 `lostMs` 还没集齐的组：这组回包不可能再拼齐了。
    * 上层据此把组丢掉，并把等它的请求送去自救/重试。
    *
+   * **计时起点是 `createdAt`（开始拼的那一刻），不是最后一片到达时刻。**
+   * 旧实现用的是后者，于是"每 8 秒内来一片"的组**永远**不会被判失 —— 它既不走
+   * 更快的 `parts_lost`，又长期占着表位（`PART_MAX_OPEN` 只有 8 个）。而注释一直
+   * 写的是"还没集齐"，实现量的却是"距最后一片"。
+   *
    * @param {number} [now]
    * @param {{lostMs?: number}} [options]
-   * @returns {string[]} chunkId
+   * @returns {string[]} chunkId（最老的先，便于上层一次只救一条）
    */
   lost(now = this.now(), { lostMs = PART_LOST_MS } = {}) {
-    return this.incomplete(now)
-      .filter((group) => group.ageMs >= lostMs)
-      .map((group) => group.id);
+    const gone = [];
+    for (const [key, entry] of this.parts) {
+      const aliveMs = now - (entry.createdAt ?? entry.at);
+      if (aliveMs >= lostMs) gone.push({ id: key.slice('part:'.length), aliveMs });
+    }
+    gone.sort((left, right) => right.aliveMs - left.aliveMs);
+    return gone.map((group) => group.id);
+  }
+
+  /** 这一组半包属于哪条请求（老桌面 / 没带 rid 时返回空串）。 */
+  ridOf(id) {
+    const entry = this.parts.get(`part:${String(id ?? '')}`);
+    const rid = entry?.rid;
+    return typeof rid === 'string' ? rid : '';
+  }
+
+  /**
+   * 在给定的几组里挑"**半包最老**"那一组，返回它的 `rid`。
+   *
+   * 为什么按 `createdAt` 挑而不是按 `at`：`at` 会被 NACK 补回来的片刷新，
+   * "创建最早"才是"用户最可能正盯着的那一条"。选不出（没给 rid / 没有组）时返回
+   * 空串，上层据此退回启发式。
+   *
+   * @param {string[]|null} [ids] 限定在这几组里挑（`null` = 全部）
+   * @returns {string}
+   */
+  oldestRid(ids = null) {
+    const wanted = Array.isArray(ids) ? new Set(ids.map((id) => String(id))) : null;
+    let best = null;
+    for (const [key, entry] of this.parts) {
+      if (wanted !== null && !wanted.has(key.slice('part:'.length))) continue;
+      if (best === null || (entry.createdAt ?? entry.at) < (best.createdAt ?? best.at)) best = entry;
+    }
+    const rid = best?.rid;
+    return typeof rid === 'string' ? rid : '';
   }
 
   /** 丢掉一组半包（返回是否真的删掉了）。 */
@@ -219,15 +298,24 @@ export class PartTable {
    * 吃掉一条分片。
    *
    * @param {object} message 已解密的分片帧
-   * @returns {{kind: 'invalid'|'incomplete'|'complete', value?: unknown, evicted: string[], expired: string[]}}
+   * @returns {{kind: 'invalid'|'incomplete'|'complete', value?: unknown,
+   *   evicted: string[], expired: string[], evictedRids: string[], expiredRids: string[]}}
+   *   `evicted` / `expired` 是被淘汰 / 过期的 chunkId（既有门禁钉着这两个字段）；
+   *   `evictedRids` / `expiredRids` 是**同一批组的 rid**（按位置一一对应，没给时是
+   *   空串）—— 上层要靠它精确找到受害者，而不是"挑最老的在途请求"。
    */
   add(message) {
     const parsed = parsePartFrame(message, { maxTotal: this.maxTotal, maxFrame: this.maxFrame });
     const evicted = [];
     const expired = [];
-    if (parsed === null) return { kind: 'invalid', evicted, expired };
+    const evictedRids = [];
+    const expiredRids = [];
+    if (parsed === null) return { kind: 'invalid', evicted, expired, evictedRids, expiredRids };
     const now = this.now();
-    for (const id of this.sweep(now)) expired.push(id);
+    for (const group of this.expire(now)) {
+      expired.push(group.id);
+      expiredRids.push(group.rid);
+    }
     const key = `part:${parsed.id}`;
     let entry = this.parts.get(key);
     if (entry === undefined) {
@@ -243,18 +331,21 @@ export class PartTable {
           }
         }
         if (oldestKey === null) break;
+        evicted.push(oldestKey.slice('part:'.length));
+        evictedRids.push(this.parts.get(oldestKey)?.rid ?? '');
         this.parts.delete(oldestKey);
         this.dropped += 1;
-        evicted.push(oldestKey.slice('part:'.length));
       }
-      entry = { chunks: new Array(parsed.total), total: parsed.total, at: now };
+      entry = { chunks: new Array(parsed.total), total: parsed.total, at: now, createdAt: now, rid: parsed.rid };
       this.parts.set(key, entry);
     }
-    if (entry.total !== parsed.total) return { kind: 'invalid', evicted, expired };
+    if (entry.total !== parsed.total) return { kind: 'invalid', evicted, expired, evictedRids, expiredRids };
+    // 后续片可能不带 rid（或带重复的）；带了就以它为准 —— 同一组只属于一条请求。
+    if (parsed.rid !== '') entry.rid = parsed.rid;
     entry.chunks[parsed.seq] = parsed.chunk;
     entry.at = now;
     for (const chunk of entry.chunks) {
-      if (chunk === undefined) return { kind: 'incomplete', evicted, expired };
+      if (chunk === undefined) return { kind: 'incomplete', evicted, expired, evictedRids, expiredRids };
     }
     this.parts.delete(key);
     let length = 0;
@@ -266,9 +357,9 @@ export class PartTable {
       offset += chunk.length;
     }
     try {
-      return { kind: 'complete', value: JSON.parse(new TextDecoder().decode(merged)), evicted, expired };
+      return { kind: 'complete', value: JSON.parse(new TextDecoder().decode(merged)), evicted, expired, evictedRids, expiredRids };
     } catch {
-      return { kind: 'invalid', evicted, expired };
+      return { kind: 'invalid', evicted, expired, evictedRids, expiredRids };
     }
   }
 }

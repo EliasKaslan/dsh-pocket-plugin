@@ -29,7 +29,7 @@ import { after, before, test } from 'node:test';
 import { promisify } from 'node:util';
 
 import {
-  DETAIL_TIMEOUT_MS, RPC_ATTEMPTS, RPC_BACKOFF_MS, RPC_TIMEOUT_MS, rpcWorstCaseMs,
+  DECOMPRESS_TIMEOUT_MS, DETAIL_TIMEOUT_MS, RPC_ATTEMPTS, RPC_BACKOFF_MS, RPC_TIMEOUT_MS, rpcWorstCaseMs,
 } from '../../web/lib/rpc-budget.js';
 import {
   readRepoFile, runSlices, sliceConst, sliceFunction,
@@ -98,6 +98,8 @@ test('常量门禁：remote/remote.js 的字面量必须与 web/lib/rpc-budget.j
   };
   assert.equal(pickNumber('RPC_TIMEOUT_MS'), RPC_TIMEOUT_MS, 'RPC_TIMEOUT_MS 两边必须相同');
   assert.equal(pickNumber('RPC_ATTEMPTS'), RPC_ATTEMPTS, 'RPC_ATTEMPTS 两边必须相同');
+  assert.equal(pickNumber('DECOMPRESS_TIMEOUT_MS'), DECOMPRESS_TIMEOUT_MS,
+    'DECOMPRESS_TIMEOUT_MS 两边必须相同：应用侧超时要把它算进"最坏耗时"里');
   assert.deepEqual(pickList('RPC_BACKOFF_MS'), RPC_BACKOFF_MS, 'RPC_BACKOFF_MS 两边必须相同');
   // 关系本身（最坏耗时 < 应用侧超时）由 test/unit/rpc-budget.test.mjs 钉住；
   // 这里顺带算一遍，好让"改了外壳常量"的失败信息直接指出现场。
@@ -293,6 +295,49 @@ test('解压流卡住时必须超时收场（否则界面永久停在「加载�
   assert.ok(elapsed < 2_000, `超时判定必须贴着传入的窗口（实际 ${elapsed}ms）`);
 });
 
+test('C5：解压超时/失败必须取消底层流（旧实现只 reject，45~108 KB 缓冲常驻且可叠加）', async () => {
+  // `Promise.race` 只是**不再等**那条流：不留引用、不 cancel 的话，reader 与已解出的
+  // 缓冲会跟着这个永远不 resolve 的 promise 一起常驻，每失败一次叠一份。
+  const cancelled = { count: 0 };
+  const bodyOf = () => ({
+    cancel: async () => { cancelled.count += 1; },
+  });
+  // ① 卡住的流 → 超时 → 必须 cancel。
+  const stalled = {
+    Blob: class { constructor(parts) { this.parts = parts; } stream() { return { pipeThrough: () => ({ stalled: true }) }; } },
+    DecompressionStream: class { constructor(format) { this.format = format; } },
+    Response: class {
+      constructor(stream) { this.stream = stream; this.body = bodyOf(); }
+      arrayBuffer() { return new Promise(() => {}); }
+    },
+  };
+  let caught = null;
+  try {
+    await loadDecompress(stalled).decompressGzip(new Uint8Array([1, 2, 3]), 120);
+  } catch (error) {
+    caught = error;
+  }
+  assert.equal(caught?.pocketCode, 'decompress');
+  assert.equal(cancelled.count, 1, '超时后必须 response.body.cancel()，否则缓冲永远不释放');
+
+  // ② 坏字节 → arrayBuffer() 直接 reject → 同样必须 cancel（catch 里统一释放）。
+  const broken = {
+    ...stalled,
+    Response: class {
+      constructor(stream) { this.stream = stream; this.body = bodyOf(); }
+      arrayBuffer() { return Promise.reject(new Error('invalid gzip data')); }
+    },
+  };
+  caught = null;
+  try {
+    await loadDecompress(broken).decompressGzip(new Uint8Array([9, 9, 9]), 3_000);
+  } catch (error) {
+    caught = error;
+  }
+  assert.equal(caught?.pocketCode, 'decompress');
+  assert.equal(cancelled.count, 2, '解压失败的路径也要释放底层流');
+});
+
 test('坏字节与正常 gzip：区分得开，且失败都标 pocketCode=decompress（不许被当成"连不上"）', async () => {
   const { decompressGzip } = loadDecompress({ Blob, Response, DecompressionStream });
   const original = encoder.encode(JSON.stringify({ ok: true, pad: 'x'.repeat(2048) }));
@@ -367,34 +412,184 @@ test('半包卡住 2 秒就发 nack 指名补片（老桌面忽略它，行为�
   void tail;
 });
 
-test('半包判定丢失：立刻同 id 自救（命中幂等缓存），额度用完就带原因失败', async () => {
+test('半包判失走生产真实路径：2 s 看门狗先花掉自救额度，8 s 判死时只能 parts_lost', async () => {
+  // 【为什么这条用例被改写过】旧版本只调一次 `sweepParts(Date.now()+8_100)`，跳过了
+  // 2 s 的看门狗 tick，于是它断言"判失时还来得及同 id 自救"。但生产上
+  // `startStaleWatch()` 每 2 s 就跑一次 `sweepParts()`，那条 8 s 路径上的 heal 额度
+  // 在 2 s 就已经被花掉 —— 旧断言描述的是一条**生产上跑不到的路径**（探针证据：
+  // 受害者从丢片起一路挂到 15.2 s 预算耗尽，最后拿 `relay_timeout`）。改成按真实
+  // 时序走两拍，钉住"2 s 自救一次 → 8 s 直接 parts_lost"这条真的会发生的路。
   const { relay, published } = harness();
-  const state = track(relay.request({ method: 'GET', path: '/api/v1/tasks/big', headers: {}, gzip: false, attempts: 1, timeout: 30_000 }));
+  const state = track(relay.request({ method: 'GET', path: '/api/v1/tasks/big', headers: {}, gzip: false, attempts: 4, timeout: 30_000 }));
   await tick();
   const requestId = published[0].id;
   const chunkId = 'abcdefabcdef';
-  await deliver(relay, { t: 'part', id: chunkId, seq: 0, total: 2, d: b64('{"half":') });
+  // 桌面把这条大响应拆成两片，`rid` 指向被拆的那条请求（新桌面才有；老桌面缺省）。
+  await deliver(relay, { t: 'part', id: chunkId, seq: 0, total: 2, d: b64('{"half":'), rid: requestId });
   assert.equal(relay.parts.size, 1);
 
-  // 8 秒还没集齐 → 判定丢失 → 同 id 自救（桌面命中幂等缓存，回的是缓存里那份完整响应）。
-  const resentBefore = published.filter((frame) => frame.t === 'req').length;
+  // ① 第 1 拍：2 s 看门狗（生产上先跑的永远是这一拍）。
+  relay.sweepParts(Date.now() + 2_500);
+  await tick();
+  assert.equal(published.filter((frame) => frame.t === 'nack').length, 1, '2 s 就该 nack 补片');
+  assert.equal(published.filter((frame) => frame.t === 'req').length, 2, '2 s 也该同 id 自救一次（老桌面不认 nack）');
+  assert.equal(state.kind, 'pending', '自救期间请求还活着');
+
+  // ② 第 2 拍：8 s 还没集齐 → 判失。补片没回来，而 heal 额度已经在第 1 拍用掉。
   relay.sweepParts(Date.now() + 8_100);
   await tick();
   assert.equal(relay.parts.size, 0, '丢了就别再占着表位');
   assert.equal(relay.stats.partsIncomplete, 1, '要计入诊断（快照里的 partsIncomplete）');
-  const resent = published.filter((frame) => frame.t === 'req');
-  assert.equal(resent.length, resentBefore + 1, '先自救：同 id 再要一次');
-  assert.equal(resent.at(-1).id, requestId, '同一个 request id（幂等）');
-  assert.equal(state.kind, 'pending', '自救期间请求还活着');
-
-  // 再来一组又丢了：自救额度已用尽 → 立刻失败，带 pocketCode=parts_lost（net.js 据此换新 id 重试）。
-  await deliver(relay, { t: 'part', id: '111111111111', seq: 0, total: 2, d: b64('{"half":') });
-  relay.sweepParts(Date.now() + 8_200);
-  await tick();
-  assert.equal(state.kind, 'rejected', '不许让用户干等到预算耗尽');
-  assert.equal(state.error?.pocketCode, 'parts_lost');
+  assert.equal(state.kind, 'rejected', '额度已空：不许让用户干等到预算耗尽');
+  assert.equal(state.error?.pocketCode, 'parts_lost', 'net.js 据此换一个新 id 重试');
   assert.match(String(state.error?.message), /分片没到齐/u);
-  assert.equal(relay.stats.partsIncomplete, 2);
+});
+
+/* -------- 5.6) C1：丢片自救/判死必须精确到"受害者"那条请求 -------- */
+
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+
+/**
+ * 两条在途请求 + 一组"只到了第 0 片"的大响应（`rid` 指向**后发**的那条 B）。
+ *
+ * 为什么必须两条：C1 的病灶就是"救错对象"——而旧实现挑的是**最老**的在途请求。
+ * 只有让"最老的那条"和"丢片受害者"是两条不同的请求，用例才能在救错时变红。
+ */
+async function twoPendingWithVictimParts() {
+  const { relay, published } = harness();
+  const older = track(relay.request({
+    method: 'GET', path: '/api/v1/tasks/list', headers: {}, gzip: false, attempts: 4, timeout: 30_000,
+  }));
+  await tick();
+  const olderId = published.at(-1).id;
+  // 让两条请求的 `entry.at` 真的错开（旧实现的"最老"判据就是它）。
+  await sleep(8);
+  const victim = track(relay.request({
+    method: 'GET', path: '/api/v1/tasks/big', headers: {}, gzip: false, attempts: 4, timeout: 30_000,
+  }));
+  await tick();
+  const victimId = published.at(-1).id;
+  assert.notEqual(olderId, victimId, '两条请求各有自己的 request id');
+  const chunkId = 'abcdefabcdef';
+  await deliver(relay, { t: 'part', id: chunkId, seq: 0, total: 2, d: b64('{"half":'), rid: victimId });
+  assert.equal(relay.parts.size, 1);
+  const reqFramesFrom = (id) => published.filter((frame) => frame.t === 'req' && frame.id === id).length;
+  assert.equal(reqFramesFrom(olderId), 1);
+  assert.equal(reqFramesFrom(victimId), 1);
+  return { relay, published, older, victim, olderId, victimId, chunkId, reqFramesFrom };
+}
+
+test('C1：2 s 看门狗的自救必须给「丢片的那条请求」（按 rid 精确），而不是最老的那条', async () => {
+  const ctx = await twoPendingWithVictimParts();
+  const { relay, published, older, victim, olderId, victimId, chunkId, reqFramesFrom } = ctx;
+  // 断言失败也必须把 Relay 停下来：断链的实例会自己排重连，`node --test` 的进程
+  // 就永远不退出（这也是"用例变红"和"用例把整套门禁挂死"的区别）。
+  try {
+    relay.sweepParts(Date.now() + 2_500);
+    await tick();
+
+    const nacks = published.filter((frame) => frame.t === 'nack');
+    assert.equal(nacks.length, 1, '卡住 2 s 要补片');
+    assert.equal(nacks[0].id, chunkId, 'nack 指的仍是分片 id（补的是片，不是请求）');
+    assert.equal(nacks[0].rid, victimId, 'nack 要带 rid：桌面据此把"补这一组"与"哪条请求"对上');
+
+    // 这两条断言就是 C1 的核心：救的必须是受害者，而不能是"最老的那条"。
+    assert.equal(reqFramesFrom(victimId), 2, '受害者必须被同 id 重发一次（桌面幂等回放整份响应）');
+    assert.equal(reqFramesFrom(olderId), 1, '旁观者一帧都不许多发：旧实现救的就是它（谁最老救谁）');
+    assert.equal(older.kind, 'pending');
+    assert.equal(victim.kind, 'pending');
+  } finally {
+    relay.stop('用例收尾');
+  }
+});
+
+test('C1：8 s 判失要判死「受害者」，不许误杀最老那条（旧实现挑最老 → 杀错）', async () => {
+  const ctx = await twoPendingWithVictimParts();
+  const { relay, older, victim, olderId, victimId, reqFramesFrom } = ctx;
+  try {
+    // 第 1 拍先花掉受害者那唯一一次 heal 额度（生产上 2 s 看门狗必然先跑）。
+    relay.sweepParts(Date.now() + 2_500);
+    await tick();
+    assert.equal(reqFramesFrom(victimId), 2);
+    assert.equal(victim.kind, 'pending');
+
+    // 第 2 拍：8 s 还没集齐 → 判失 → 自救额度已空 → 判死的就是受害者。
+    relay.sweepParts(Date.now() + 8_100);
+    await tick();
+    assert.equal(relay.parts.size, 0, '判失的组必须真的从表里删掉');
+    assert.equal(relay.stats.partsIncomplete, 1);
+    assert.equal(victim.kind, 'rejected', '受害者必须立刻拿到结论，而不是挂到 15.2 s 预算耗尽拿 relay_timeout');
+    assert.equal(victim.error?.pocketCode, 'parts_lost', 'net.js 据此换一个新的 request id 重试');
+    assert.equal(older.kind, 'pending', '旁观者不许被误杀：旧实现在这里挑最老，杀的就是它');
+    assert.equal(reqFramesFrom(olderId), 1, '旁观者也不该被"救"');
+  } finally {
+    relay.stop('用例收尾');
+  }
+});
+
+test('C2：一个 2 s tick 最多只花掉一条请求的自救额度（旧实现一次吞掉 4 条）', async () => {
+  const { relay, published } = harness();
+  try {
+    for (let index = 0; index < 3; index += 1) {
+      track(relay.request({
+        method: 'GET', path: `/api/v1/tasks/t${index}`, headers: {}, gzip: false, attempts: 4, timeout: 30_000,
+      }));
+      await tick();
+    }
+    const before = published.filter((frame) => frame.t === 'req').length;
+    assert.equal(before, 3);
+    // 三组都卡住（老桌面：分片帧没有 rid，只能走启发式）。
+    for (const chunk of ['111111111111', '222222222222', '333333333333']) {
+      await deliver(relay, partFrame(chunk, 0, 2, '{"half":'));
+    }
+    relay.sweepParts(Date.now() + 2_500);
+    await tick();
+    assert.equal(published.filter((frame) => frame.t === 'nack').length, 3, '三组都该补片');
+    // heal 额度是**每条请求唯一**的：一个 tick 只能花一条。旧实现把这个调用写在
+    // nack 循环里，一次 tick 就吃掉三条无关请求各自的额度 —— 真正卡住的那条第二次
+    // nack（≈7.5 s）时额度已空，8 s 判死只能直接 parts_lost。
+    const resent = published.filter((frame) => frame.t === 'req').length - before;
+    assert.equal(resent, 1, `一个 tick 只能自救一次（实际重发了 ${resent} 帧）`);
+  } finally {
+    relay.stop('用例收尾');
+  }
+});
+
+test('C2：多组同时卡住时，自救优先给「持有最老半包」那条请求的 rid（而不是最老的请求）', async () => {
+  const { relay, published } = harness();
+  try {
+    const olderReq = track(relay.request({
+      method: 'GET', path: '/api/v1/tasks/older', headers: {}, gzip: false, attempts: 4, timeout: 30_000,
+    }));
+    await tick();
+    const olderId = published.at(-1).id;
+    await sleep(8);
+    const newerReq = track(relay.request({
+      method: 'GET', path: '/api/v1/tasks/newer', headers: {}, gzip: false, attempts: 4, timeout: 30_000,
+    }));
+    await tick();
+    const newerId = published.at(-1).id;
+    assert.notEqual(olderId, newerId);
+    // 第 1 组（创建更早）属于**后发的** newer；第 2 组（创建更晚）属于**先发的** older。
+    // 于是"挑最老的请求"和"挑持有最老半包的请求"给出完全相反的答案。
+    await deliver(relay, { t: 'part', id: 'aaaa11111111', seq: 0, total: 2, d: b64('{"x":'), rid: newerId });
+    await sleep(6);
+    await deliver(relay, { t: 'part', id: 'bbbb22222222', seq: 0, total: 2, d: b64('{"y":'), rid: olderId });
+    assert.equal(relay.parts.size, 2);
+
+    relay.sweepParts(Date.now() + 2_500);
+    await tick();
+    assert.equal(published.filter((frame) => frame.t === 'nack').length, 2, '两组都要补片');
+    const reqs = published.filter((frame) => frame.t === 'req');
+    assert.equal(reqs.filter((frame) => frame.id === newerId).length, 2,
+      '自救要按"持有最老半包"那组的 rid 走');
+    assert.equal(reqs.filter((frame) => frame.id === olderId).length, 1,
+      '"在途最老"在这里恰恰是错的那条（旧实现会挑它）');
+    assert.equal(olderReq.kind, 'pending');
+    assert.equal(newerReq.kind, 'pending');
+  } finally {
+    relay.stop('用例收尾');
+  }
 });
 
 test('换链路把半包清掉时也要记账（旧实现静默 clear）', async () => {
@@ -406,6 +601,50 @@ test('换链路把半包清掉时也要记账（旧实现静默 clear）', async
   relay.ready = false;
   relay.abortTransport('重连中');
   assert.equal(relay.stats.partsIncomplete, 1, '跨链路作废的半包必须计入诊断，否则"网络恢复了页面还不动"没有痕迹');
+});
+
+test('C4：restart() 不许自己先清半包表 —— 记账必须落在 abortTransport 上', async () => {
+  const { relay } = harness();
+  track(relay.request({ method: 'GET', path: '/api/v1/tasks/big', headers: {}, gzip: false, attempts: 2, timeout: 30_000 }));
+  await tick();
+  await deliver(relay, { t: 'part', id: '333333333333', seq: 0, total: 2, d: b64('{"half":') });
+  assert.equal(relay.parts.size, 1);
+  // 让这次重建注定失败：真实的 `connect()` 要连 broker，这里只需要走到 catch。
+  relay.connect = async () => { throw new Error('broker 连不上'); };
+  try {
+    const ok = await relay.restart('用例：重建失败');
+    assert.equal(ok, false);
+    assert.equal(relay.parts.size, 0, '半包仍然要清（跨链路的那份已经废了）');
+    assert.equal(relay.stats.partsIncomplete, 1,
+      '记账必须由 abortTransport 完成：restart() 里先 parts.clear() 的话，生产重连路径永远绕过记账，'
+      + 'partsIncomplete 恒 0 —— "网络恢复了页面还不动"在手机侧一点痕迹都没有');
+  } finally {
+    // 重建失败会排下一次重连；断言失败时不停掉它，`node --test` 会永远等这个自愈环。
+    relay.stop('用例收尾');
+  }
+});
+
+test('C6：heal 额度用尽要回退到 retry（旧实现是"二选一"，一帧都不再发）', async () => {
+  const { relay, published } = harness();
+  try {
+    track(relay.request({ method: 'GET', path: '/api/v1/tasks/heal-then-retry', headers: {}, gzip: false, attempts: 3, timeout: 30_000 }));
+    await tick();
+    const id = published.at(-1).id;
+    const entry = relay.pending.get(id);
+    assert.equal(entry.heal(), true, '第一次自救（重连补发）应当成功');
+    await tick();
+    assert.equal(published.filter((frame) => frame.t === 'req').length, 2);
+    assert.equal(entry.heal(), false, 'heal 额度只有一次');
+    // 再有一次重连：heal 已经用尽，但 attempt 预算还剩 —— 必须回退到 retry。
+    const before = published.filter((frame) => frame.t === 'req').length;
+    relay.resendPending('用例：再连一次');
+    await tick();
+    const resent = published.filter((frame) => frame.t === 'req');
+    assert.equal(resent.length, before + 1, 'heal 用尽时必须回退 retry，而不是什么都不做（探针：2→2 帧）');
+    assert.equal(resent.at(-1).id, id, '同一个 request id（桌面按 id 幂等回放）');
+  } finally {
+    relay.stop('用例收尾');
+  }
 });
 
 test('诊断快照里有分片三件套（partsOpen / partsIncomplete / partsNacked）', async () => {

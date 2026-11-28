@@ -8,8 +8,10 @@
  * 等满 30 s 分片 TTL，或者等 8 s 心跳用同 id 重发触发幂等回放。生产统计
  * `replays=43 / rx=94` 就是这个静默丢失的指纹。
  *
- * 协议（两端共用）：上行 `{ t:'nack', id:<chunkId>, sid, seq, ts }`；桌面若该组仍在
- * 短期缓存里就重发**全部**片，否则回 `{ t:'reject', id, code:'part-gone' }`。
+ * 协议（两端共用）：上行 `{ t:'nack', id:<chunkId>, missing?:[seq...], sid, seq, ts }`；
+ * 桌面若该组仍在短期缓存里就重发**缺失的片**（没有 `missing` 时整组重发，向后兼容），
+ * 否则回 `{ t:'reject', id, code:'part-gone' }`。下行 `part` 帧带 `rid`（被拆那一帧的
+ * 请求 id，R5），手机端靠它把半包对回具体请求。
  * 手机侧在本文件里用 `makePeer()` 的镜像 CloudLink 真实模拟（同一把钥匙、反向主题）。
  */
 import assert from 'node:assert/strict';
@@ -92,6 +94,7 @@ test('NACK：故意丢弃第 2 片，nack 之后手机侧能把整帧集齐', ()
     '重发的是**全部**片：nack 只带 chunkId，手机不知道丢的是哪一片');
   assert.ok(resent.every((frame) => frame.t === 'part' && frame.id === chunkId && frame.total === 2),
     '重发的每一帧都必须属于原分片组');
+  assert.ok(resent.every((frame) => frame.rid === 'detail-1'), 'R5：整组重发时 rid 也要原样带上');
   assert.equal(link.stats.nackRepairs, 1, '修复次数要计数（status() 里能读到）');
 
   for (const entry of sent.slice(2)) mobile.receive(entry.payload);
@@ -115,9 +118,14 @@ test('NACK 限流：同一 chunkId 连发 10 次只重发一次，其余计入 n
 
 test('NACK 限流：全局每秒最多 10 次重发（超限丢弃，不把桌面变成放大器）', () => {
   const { link, sent } = makeLink();
+  // 用**很小**的合成分片组来单独测「次数闸」：真实的一组必然 ≥64 KiB，
+  // 10 组一定撞上 256 KiB/s 的字节闸（见下一条用例），两条闸就分不开了。
   const ids = [];
-  for (let index = 0; index < 15; index += 1) ids.push(publishGroup(link, sent, `burst-${index}`));
-  assert.equal(new Set(ids).size, 15, '15 组各自一个 chunkId');
+  for (let index = 0; index < 15; index += 1) {
+    const id = index.toString(16).padStart(12, '0');
+    link.rememberPartGroup(id, [Buffer.from(JSON.stringify({ t: 'part', id, seq: 0, total: 1, rid: 'r', d: 'x' }), 'utf8')]);
+    ids.push(id);
+  }
 
   // 15 条 nack 全部落在同一个 1 s 窗口里：全局预算只有 10 次。
   sent.length = 0;
@@ -126,10 +134,111 @@ test('NACK 限流：全局每秒最多 10 次重发（超限丢弃，不把桌�
   }
   assert.equal(link.stats.nackRepairs, 10, '全局每秒只放行 10 次重发');
   assert.equal(link.stats.nackDropped, 5);
-  assert.equal(sent.length, 20, `10 组 × 2 片；超限的一条都不许发（实际 ${sent.length} 条）`);
+  assert.equal(sent.length, 10, `10 组 × 1 片；超限的一条都不许发（实际 ${sent.length} 条）`);
 });
 
-/* ------------------------- 3. 鉴权 / 新鲜度闸 -------------------------- */
+/* ------------------------- 3. R4/R5：只补缺片 + rid --------------------- */
+
+test('R4 补片：nack 带 missing:[1] 时只重发第 2 片，chunkId 与 rid 都不变', () => {
+  const { link, sent } = makeLink();
+  const chunkId = publishGroup(link, sent, 'detail-missing');
+  const original = decodeAll(link, sent);
+
+  // R5：每一片都要带「被拆那一帧的 id」，否则手机端不知道这个半包属于哪条请求。
+  assert.ok(original.every((frame) => frame.rid === 'detail-missing'),
+    `part 帧必须带 rid（实际 ${JSON.stringify(original.map((frame) => frame.rid))}）`);
+
+  sent.length = 0;
+  feed(link, { ...nackFor(chunkId), missing: [1] });
+
+  assert.equal(sent.length, 1, '只补缺失的那一片，不再整组重发（R4 的带宽修复）');
+  const [resent] = decodeAll(link, sent);
+  assert.equal(resent.t, 'part');
+  assert.equal(resent.seq, 1, 'missing:[1] 要的是第 2 片（seq 从 0 起）');
+  assert.equal(resent.id, chunkId, '重发必须沿用原 chunkId，手机侧才能对回半包表');
+  assert.equal(resent.total, 2);
+  assert.equal(resent.rid, 'detail-missing', '重发时 rid 要原样带上，不能重新生成');
+  assert.equal(resent.d, original[1].d, '补的片必须与原片逐字节一致');
+  assert.equal(link.stats.nackRepairs, 1);
+  assert.equal(link.stats.nackInvalid, 0);
+});
+
+test('R4 补片：missing 片号越界/非整数/空数组 → 整帧丢弃并计数，且不烧掉同组 5 s 修复窗口', () => {
+  const { link, sent } = makeLink();
+  const chunkId = publishGroup(link, sent, 'detail-bad');
+  sent.length = 0;
+
+  let seq = 0;
+  // 越界（total=2）、负数、非整数、非数字、空数组、长度超过总片数。
+  for (const missing of [[2], [-1], [0.5], ['1x'], [], [0, 1, 2], 'not-an-array']) {
+    seq += 1;
+    feed(link, { ...nackFor(chunkId, { seq }), missing });
+  }
+  assert.equal(sent.length, 0, '畸形 missing 一条都不许换来重发');
+  assert.equal(link.stats.nackRepairs, 0);
+  assert.equal(link.stats.nackInvalid, 7, '每一帧都要计数（7 种畸形）');
+  assert.equal(link.stats.nackDropped, 0, '畸形帧不该消耗限流预算');
+
+  // 关键：畸形帧没有把这一组的 5 s 修复窗口点亮，紧接着的合法 nack 必须照常修。
+  feed(link, { ...nackFor(chunkId, { seq: seq + 1 }), missing: [0] });
+  assert.equal(link.stats.nackRepairs, 1, '合法补片不该被前面的畸形帧挡住');
+  assert.equal(decodeAll(link, sent)[0]?.seq, 0);
+});
+
+test('R4 兼容：没有 missing 字段时仍然整组重发（老手机行为不变）', () => {
+  const { link, sent } = makeLink();
+  const chunkId = publishGroup(link, sent, 'detail-legacy');
+  sent.length = 0;
+  feed(link, nackFor(chunkId)); // 老外壳：{ t, id, sid, seq, ts }
+  const resent = decodeAll(link, sent);
+  assert.deepEqual(resent.map((frame) => frame.seq), [0, 1], '没有 missing 就整组重发');
+  assert.ok(resent.every((frame) => frame.id === chunkId && frame.rid === 'detail-legacy'));
+});
+
+test('R3 字节闸：1 秒内重发总量超过 256 KiB 就丢弃并计数，窗口过后恢复', () => {
+  const { link, sent } = makeLink();
+  const ids = [];
+  // 三个各 100 KiB 的合成组：前两次 200 KiB 放行，第三次会到 300 KiB。
+  for (let index = 0; index < 3; index += 1) {
+    const id = (index + 1).toString(16).padStart(12, '0');
+    link.rememberPartGroup(id, [Buffer.alloc(100 * 1024, 0x40)]);
+    ids.push(id);
+  }
+
+  sent.length = 0;
+  for (let index = 0; index < ids.length; index += 1) {
+    feed(link, nackFor(ids[index], { seq: index + 1 }));
+  }
+  assert.equal(link.stats.nackRepairs, 2, '256 KiB/s 的字节预算只够两次 100 KiB');
+  assert.equal(link.stats.nackDropped, 1, '超预算的那一条要计数');
+  assert.equal(sent.length, 2);
+
+  // 模拟窗口过去（nackBudget 按 windowAt 记 1 s 窗口）：同一组补片应当恢复。
+  // 退 2 s 而不是 1 s：同毫秒内跑完时 `now - windowAt` 恰好等于 1000，不满足 >。
+  link.nackBudget.windowAt -= 2000;
+  feed(link, nackFor(ids[2], { seq: 10 }));
+  assert.equal(link.stats.nackRepairs, 3);
+  assert.equal(sent.length, 3);
+});
+
+test('R3：part-gone 计数在限流闸之后才累加（持钥方刷随机 chunkId 刷不出假曲线）', () => {
+  const { link, sent } = makeLink();
+  // 先把全局 10 次/秒的预算用光（用小组合成帧，避免撞上字节闸）。
+  for (let index = 0; index < 10; index += 1) {
+    const id = index.toString(16).padStart(12, '0');
+    link.rememberPartGroup(id, [Buffer.from(JSON.stringify({ t: 'part', id, seq: 0, total: 1, rid: 'r', d: 'x' }), 'utf8')]);
+    feed(link, nackFor(id, { seq: index + 1 }));
+  }
+  assert.equal(link.stats.nackRepairs, 10);
+
+  sent.length = 0;
+  feed(link, nackFor('ffffffffffff', { seq: 11 }));
+  assert.equal(link.stats.partGone, 0, '被限流丢掉的 part-gone 不许计入 partGone');
+  assert.equal(link.stats.nackDropped, 1);
+  assert.equal(sent.length, 0);
+});
+
+/* ------------------------- 4. 鉴权 / 新鲜度闸 -------------------------- */
 
 test('NACK 闸门：未授权 / 陈旧 ts / seq 回退的 nack 不重发、不抛错', () => {
   // ① 未授权：持钥不等于有权限，而重发是纯下行放大动作。
@@ -173,7 +282,7 @@ test('NACK 闸门：未授权 / 陈旧 ts / seq 回退的 nack 不重发、不�
   assert.equal(rolled.stats.nackDropped, 1);
 });
 
-/* --------------------------- 4. 淘汰后 part-gone ----------------------- */
+/* --------------------------- 5. 淘汰后 part-gone ----------------------- */
 
 test('NACK：组已被淘汰 → 回 part-gone，并计入 stats.partGone', () => {
   const { link, sent } = makeLink();
@@ -198,7 +307,7 @@ test('NACK：组已被淘汰 → 回 part-gone，并计入 stats.partGone', () =
   assert.equal(reply.code, 'part-gone');
 });
 
-/* ----------------------------- 5. 缓存上限 ----------------------------- */
+/* ----------------------------- 6. 缓存上限 ----------------------------- */
 
 test('NACK 缓存上限：超过 32 组后淘汰最旧的，字节有界且账目自洽', () => {
   const { link, sent } = makeLink();
@@ -224,7 +333,7 @@ test('NACK 缓存上限：超过 32 组后淘汰最旧的，字节有界且账�
   assert.equal(decodeAll(link, sent)[0]?.code, 'part-gone');
 });
 
-/* --------------------------- 6. 向后兼容 ------------------------------- */
+/* --------------------------- 7. 向后兼容 ------------------------------- */
 
 test('兼容：未知帧与畸形 nack 一律忽略——不抛错、不重发、不断链', () => {
   const { link, sent } = makeLink();

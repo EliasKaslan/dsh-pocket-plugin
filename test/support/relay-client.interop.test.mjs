@@ -42,6 +42,11 @@ function shellEnv() {
   return runSlices({
     declarations: [
       { name: 'b64', source: sliceFunction(shell, 'b64') },
+      // 外壳的 b64 改成 8 KB 分块拼接（逐字符 += 在 71 KB 上要 10 ms），
+      // 分块大小是模块级常量，切函数时必须一起带进来，否则 runSlices 里
+      // `B64_CHUNK_BYTES is not defined` —— 这正是本文件存在的意义：外壳改了
+      // 而测试替身没跟上，必须红。
+      { name: 'B64_CHUNK_BYTES', source: sliceConst(shell, 'B64_CHUNK_BYTES') },
       { name: 'unb64', source: sliceFunction(shell, 'unb64') },
       { name: 'unb64u', source: sliceFunction(shell, 'unb64u') },
       { name: 'randomId', source: sliceFunction(shell, 'randomId') },

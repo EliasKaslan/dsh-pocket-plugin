@@ -92,6 +92,26 @@ test('TTL 清理要把被清掉的 id 交回去（旧实现是静默 delete）',
   assert.equal(table.dropped, 0, 'TTL 清理不算被迫淘汰（既有门禁钉着这条）');
 });
 
+test('C7：判失按「还没集齐多久」计时，不是「距最后一片」—— 每 7 s 来一片也必须被判失', () => {
+  const { table, advance, now } = makeTable();
+  // total=5，只补 seq 1..3：这一组永远差第 4 片（永远拼不完的最坏形态）。
+  table.add(openPart(chunkId(0), 5));
+  for (let step = 1; step <= 3; step += 1) {
+    advance(PART_LOST_MS - 1_000); // 每次都在"判失"前一刻补一片，把 `at` 一直刷新
+    table.add({ t: 'part', id: chunkId(0), seq: step, total: 5, d: b64('"x":') });
+    if (step === 1) assert.deepEqual(table.lost(now()), [], `距创建才 ${PART_LOST_MS - 1_000}ms，还不到 ${PART_LOST_MS}ms`);
+  }
+  // 此刻距**最后一片**只有 0 ms，但距**开始拼**已经 21 s —— 旧实现按前者计时，
+  // 于是这种组永远不会被判失：既不飞快地 `parts_lost`，还长期占着 8 个表位之一。
+  assert.deepEqual(table.lost(now()), [chunkId(0)],
+    '判失必须按 createdAt：否则"每 8 秒内来一片"的组永远判不失，请求只能干等 relay_timeout');
+  // NACK 仍按最后活动时间：刚来过片，说明链路是通的，不该补片。
+  assert.deepEqual(table.nackDue(now()), [], '刚收到过新片，不该 NACK');
+  // 判失之后丢掉它，表位要回归。
+  assert.equal(table.drop(chunkId(0)), true);
+  assert.equal(table.size, 0);
+});
+
 test('incomplete()：缺哪几片要说得出来（诊断要能指出卡在哪）', () => {
   const { table, now } = makeTable();
   table.add(openPart(chunkId(0), 3));
