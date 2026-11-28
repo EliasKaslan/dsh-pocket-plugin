@@ -56,8 +56,7 @@ import {
  * 谁被淘汰），而不是"某个字符串还在不在"。
  */
 import { CONTROL_RESEND_DELAYS, connectWithRetry, wakeDecision } from './lib/shell-retry.js';
-import { PartTable } from './lib/shell-parts.js';
-import { adoptScope, scopeVerdict } from './lib/shell-session.js';
+import { PartTable } from './lib/shell-parts.js';import { adoptScope, scopeVerdict } from './lib/shell-session.js';
 
 /* ------------------------------- constants ------------------------------ */
 
@@ -78,8 +77,22 @@ const HELLO_MIN_GAP_MS = 10_000;
  * so a slow route is not cut off while a lost frame still gets repaired fast.
  * The desktop caches replies by request id, so a retry replays the answer
  * instead of re-running the request.
+ *
+ * **一条请求的总预算 = Σ backoff + 这一次的 timeout**（不是 timeout × attempts：
+ * 每次 attempt 都会清掉上一个计时器，`entry.timer` 是单个的）：
+ *
+ *     1200 + 2400 + 3600 + 8000 = 15 200 ms
+ *
+ * 这组数字必须与 `web/lib/rpc-budget.js` 一致，并被 `test/domain/shell-rpc-budget`
+ * 拿三条关系钉住：① 与纯逻辑模块的常量相同；② 总预算 < 应用侧
+ * `DETAIL_TIMEOUT_MS`；③ 判死用的是**绝对截止时刻**，任何一条路径（心跳重发、
+ * 重连重发、过期 attempt 的迟到失败）都不能把它拖长。
+ *
+ * 旧值 16_000 / [1_200, 2_400, 4_800] 一共 24 400 ms，已经比应用侧的 20 s 长 ——
+ * 于是先到点的永远是应用层：用户看到笼统的「请求超时」，外壳的同 id 重放还没跑完
+ * 就被取消，net.js 再从头重试一轮，界面上的「加载中…」一停就是几十秒。
  */
-const RPC_TIMEOUT_MS = 16_000;
+const RPC_TIMEOUT_MS = 8_000;
 /**
  * 未就绪时发送前的等待窗口。
  *
@@ -90,7 +103,80 @@ const RPC_TIMEOUT_MS = 16_000;
  */
 const SEND_READY_WAIT_MS = 8_000;
 const RPC_ATTEMPTS = 4;
-const RPC_BACKOFF_MS = [1_200, 2_400, 4_800];
+const RPC_BACKOFF_MS = [1_200, 2_400, 3_600];
+/**
+ * 重连成功后**额外**允许的重发次数（不受 `RPC_ATTEMPTS` 约束）。
+ *
+ * 为什么需要它：一次多片响应在重组途中遇到重连时，`abortTransport()` 会清掉
+ * 半包表但保留在途请求。此时如果四次 attempt 已经用尽，`entry.retry()` 是个
+ * **空操作** —— 桌面按同一个 id 重放的完整回包再也拼不出来，只能干等预算耗尽。
+ * 重连一次就多给一次重发（桌面命中幂等缓存，不会重复执行），把这条路救回来。
+ */
+const RPC_HEAL_RESENDS = 1;
+/** 在途 RPC 面包屑的条数上限（只给诊断块读，不参与任何决策）。 */
+const RPC_LOG_MAX = 8;
+/**
+ * 解压一条 gzip 大响应的上限。
+ *
+ * `new Response(stream).arrayBuffer()` **没有**任何超时：解压流一旦卡住（手机端
+ * 解密出的字节被截断、或 WebKit 的 DecompressionStream 半死），这个 promise
+ * 永远不 resolve，而应用侧的 AbortSignal 已经传不进来了（外壳的 request 早就
+ * resolve 了）—— 界面于是**永久**停在「加载中…」。这是整条链上唯一没有兜底的
+ * 一步，所以单独给它一个截止时刻。
+ */
+const DECOMPRESS_TIMEOUT_MS = 10_000;
+
+/**
+ * 一条请求的最坏耗时。**必须与 `web/lib/rpc-budget.js` 的 `rpcWorstCaseMs()` 同义**
+ * （那边有用例逐字段比对）：前 `attempts-1` 次各等一个 backoff，最后一次等满 `timeout`。
+ */
+function rpcBudgetMs(attempts = RPC_ATTEMPTS, timeout = RPC_TIMEOUT_MS) {
+  let total = Math.max(1, Number(timeout) || RPC_TIMEOUT_MS);
+  for (let index = 0; index < Math.max(1, attempts) - 1; index += 1) {
+    const value = Number(RPC_BACKOFF_MS[index]);
+    total += Number.isFinite(value) && value >= 0 ? value : 2_000;
+  }
+  return total;
+}
+
+/**
+ * 判死用的错误：带上 `pocketCode`，让 `web/lib/net.js` 能把它原样翻给界面，
+ * 而不是一律说成「连不上电脑」（链路明明是通的，只是回包没送到）。
+ */
+function rpcTimeoutError(timeout) {
+  const error = new Error('中继请求超时');
+  error.pocketCode = 'relay_timeout';
+  error.timeoutMs = Number(timeout) || RPC_TIMEOUT_MS;
+  return error;
+}
+
+/**
+ * 下行分片凑不齐（这一组回包不可能再拼回来了）。
+ *
+ * 与"超时"分开是因为**处置不同**：超时说明"回声慢/可能还在路上"，而同 id 重放
+ * 已经跑完就该认输；丢片则是"这一份响应的字节再也凑不齐了"，换一个新的请求
+ * （重新切一份响应）更可能成功 —— `web/lib/net.js` 把它当**可重试**处理。
+ */
+function partsLostError(count) {
+  const error = new Error('大响应的分片没到齐（下行丢了片）');
+  error.pocketCode = 'parts_lost';
+  error.partsLost = Math.max(1, Number(count) || 1);
+  return error;
+}
+
+/**
+ * 面包屑里的路径：只留 pathname 并截断。
+ *
+ * query 里是游标 / 分页参数，对"为什么没回包"没有解释力；而诊断文本会被用户
+ * 复制粘贴出去，能少一个字段就少一个泄露面（房间密钥、设备令牌、链接里的
+ * `r`/`t` 一个都不许进快照 —— 见 `test/domain/shell-relay-diag`）。
+ */
+function breadcrumbPath(path) {
+  const text = String(path ?? '');
+  const cut = text.indexOf('?');
+  const only = cut >= 0 ? text.slice(0, cut) : text;
+  return only.slice(0, 48);
+}
 /** Desktop beats every 8 s; keep 3x headroom for mobile network jitter. */
 const PC_STALE_MS = 26_000;
 /**
@@ -852,8 +938,14 @@ class Relay {
      * 「这个界面已失效」；这个只是"这一轮引导不要再往前跑了"，不该画任何覆盖层。
      */
     this.disposed = false;
-    /** 连续离线多久：分片表被迫淘汰半包的次数（诊断用）。 */
-    this.partsDropped = 0;
+    /**
+     * 在途 RPC 面包屑（环形，只留最近 `RPC_LOG_MAX` 条）。
+     *
+     * 只给诊断读：`__POCKET_DIAG__.snapshot()` 与界面的"重试第几次"。
+     * 事故现场最缺的正是这一层 —— 桌面侧有 `rx/rpc/replays` 计数器，手机侧却只有
+     * 一个 `pending` 数字，看不出"哪条请求发了几次、有没有收到过回包"。
+     */
+    this.rpcLog = [];
     /** 共享就绪等待器（null = 无人等待）。 */
     this.readyWaiters = new Set();
     /**
@@ -902,7 +994,13 @@ class Relay {
     this.authRequired = false;
     this.authUser = null;
     this.controlRequests = new Map();
-    this.stats = { rx: 0, tx: 0, err: 0, stale: 0, lastError: '', lastRxAt: 0 };
+    this.stats = {
+      rx: 0, tx: 0, err: 0, stale: 0, lastError: '', lastRxAt: 0,
+      /** RPC 次数 / 超时未收到 res 的次数 / 收到 res 但已放弃的次数。 */
+      rpc: 0, timeouts: 0, resMiss: 0,
+      /** 分片：累计没集齐的组数 / 累计发出的 nack 数（诊断三件套，见 partsStats）。 */
+      partsIncomplete: 0, partsNacked: 0,
+    };
   }
 
   nextSeq() {
@@ -1259,6 +1357,11 @@ class Relay {
   startStaleWatch() {
     if (this.staleTimer !== undefined) return;
     this.staleTimer = setInterval(() => {
+      // 半包扫描放在最前面：与"链路是否就绪"无关（过期组总要清掉、总要记账），
+      // 而补片只在就绪时发（`sweepParts` 内部判断）。
+      // `?.` 不是防御性编程的口癖：这段代码跑在 2 秒一次的看门狗里，任何一步抛错
+      // 都会连带打断后面的保活判断（浏览器里就是每 2 秒一条未捕获异常）。
+      this.sweepParts?.();
       if (!this.ready) {
         // 未就绪也要管：重建失败后靠这里兜底（冷却期内不打扰）。
         if (Date.now() - this.lastRestartAt > RESTART_COOLDOWN_MS) void this.restart('未就绪兜底');
@@ -1318,7 +1421,10 @@ class Relay {
       }
       case 'res': {
         const entry = this.pending.get(String(message.id ?? ''));
-        if (entry === undefined) return;
+        // 迟到的 `res`（请求已经判死 / 页面已放弃）**不报错也不重放**，但要计数：
+        // "回包其实到了、只是我们早就不等了"与"回包根本没到"是两种完全不同的故障，
+        // 以前两者在手机侧看起来一模一样（都是静默）。
+        if (entry === undefined) { this.stats.resMiss += 1; return; }
         this.pending.delete(entry.id);
         clearTimeout(entry.timer);
         // Expired/revoked token: the desktop answers 401, so drop the local
@@ -1417,33 +1523,80 @@ class Relay {
    * 重组一条下行分片；null 表示"还没拼完 / 这一片不可用"。
    *
    * 具体规则在 `web/lib/shell-parts.js`（可被 Node 直接 import 并测行为）。
-   * 这里只负责两件外壳才知道的事：
-   *   1. 表满时被淘汰的那组半包要**记进诊断**（否则"手机收不到大响应"永远查不出来）；
-   *   2. 淘汰发生时立刻把最老的在途请求重发一次 —— 那条大响应永远拼不齐了，
-   *      与其让用户干等 16 秒预算超时，不如按同一个 id 让电脑端重放一份。
+   * 这里只负责外壳才知道的三件事：
+   *   1. 有半包**被迫淘汰 / TTL 过期 / 判定丢失**时记进诊断（旧实现是静默
+   *      `delete`，于是"手机收不到大响应"在两边都查不出来）；
+   *   2. 丢了就立刻把等它的那条请求送去自救（同 id 重发 → 桌面幂等重放）或重试，
+   *      而不是让用户干等预算耗尽；
+   *   3. 半包卡住超过 `PART_STALL_MS` 就发 `nack` 让电脑端补片（见 `sweepParts`）。
    */
   collectPart(message) {
     const result = this.parts.add(message);
-    if (result.evicted.length > 0) this.noteDroppedParts(result.evicted.length);
+    if (result.evicted.length > 0) this.noteLostParts(result.evicted.length, 'evicted');
+    if (result.expired.length > 0) this.noteLostParts(result.expired.length, 'ttl');
     return result.kind === 'complete' ? result.value : null;
   }
 
   /**
-   * 分片表被迫淘汰了半包：大响应已经不可能拼齐。
+   * 每 2 秒的看门狗 tick 顺手扫一遍半包：该 `nack` 的 `nack`，该判死的判死。
    *
-   * 下行大帧都是某个 `req` 的回包（任务列表 / 会话 detail），所以挑最老的
-   * 在途请求重发是最贴近真实原因的一步 —— 它要么拿到重放的回包，要么自己
-   * 在预算内超时，两种都比"静默等 30 秒 TTL"快。
+   * 为什么必须在这里做（而不是等请求超时）：
+   * 电脑端 `publishSealed()` 的重发**只在 PUBACK 报错时触发** —— "broker 收下了
+   * 但订阅方没收到"这种丢法它完全感知不到（实测 `publishRetries/publishLost/errors`
+   * 全是 0）。所以补片只能由**收方**发起：手机端发现某个 chunk 卡住，就发一条
+   * `nack` 指名要它。老桌面不认识 `nack` 会忽略（`lib/cloud.mjs` 的 `default: break`），
+   * 行为与现在一致，不会更糟。
    */
-  noteDroppedParts(count) {
-    const dropped = Math.max(0, Number(count) || 0);
-    this.partsDropped += dropped;
-    this.stats.err += dropped;
+  sweepParts(now = Date.now()) {
+    const expired = this.parts.sweep(now);
+    if (expired.length > 0) this.noteLostParts(expired.length, 'ttl');
+    // 先判死再补片：已经超时的那几组没必要再 nack（它们的回包不会来了）。
+    for (const id of this.parts.lost(now)) {
+      if (this.parts.drop(id)) this.noteLostParts(1, 'stall');
+    }
+    if (this.ready !== true || this.client === undefined) return;
+    for (const id of this.parts.nackDue(now)) {
+      this.parts.markNacked(id, now);
+      this.stats.partsNacked += 1;
+      console.debug(`[pocket-diag] nack ${id}`);
+      void this.send({ t: 'nack', id, sid: this.sid, seq: this.nextSeq(), ts: this.serverNow() }).catch(() => {});
+    }
+  }
+
+  /**
+   * 一组下行分片彻底丢了：大响应已经不可能拼齐。
+   *
+   * 两步走（顺序很重要）：
+   *   1. **先自救**：按同一个 request id 重发。桌面按 id 幂等，回的是缓存里那份
+   *      完整响应，不会重复执行；比重试更快、更省。
+   *   2. 自救预算用完了就**立刻判死**这条请求（`parts_lost`），交给 `web/lib/net.js`
+   *      换一个新的 request id 重试 —— 那会重新切一份响应，比原样重放更可能成功。
+   *
+   * 分片帧里**没有** request id（只有 12 位 chunkId），所以只能近似地挑"最老的在途
+   * 请求"。这不是新问题（旧实现也这么挑），但它决定了大响应读不回来的恢复速度。
+   */
+  noteLostParts(count, reason) {
+    const lost = Math.max(0, Number(count) || 0);
+    if (lost === 0) return;
+    this.stats.partsIncomplete += lost;
+    this.stats.err += lost;
+    console.debug(`[pocket-diag] parts lost=${lost} (${reason}) open=${this.parts.size}`);
     let oldest = null;
     for (const [, entry] of this.pending) {
       if (oldest === null || entry.at < oldest.at) oldest = entry;
     }
-    oldest?.retry?.();
+    if (oldest === null) return;
+    if (typeof oldest.heal === 'function' && oldest.heal() === true) return;
+    oldest.reject?.(partsLostError(lost));
+  }
+
+  /** 半包表现状（诊断）：在途组数 / 累计没集齐 / 累计 nack。 */
+  partsStats() {
+    return {
+      partsOpen: this.parts.size,
+      partsIncomplete: this.stats.partsIncomplete,
+      partsNacked: this.stats.partsNacked,
+    };
   }
 
   /** 等中继就绪；所有等待者共享同一个 promise，就绪时一次性放行。 */
@@ -1487,7 +1640,10 @@ class Relay {
     };
     // The token rides on every uplink message: the desktop validates each one
     // statelessly, so a relay restart cannot lose the login.
-    const needsSession = object.t === 'auth' || object.t === 'req' || object.t.startsWith('ws.');
+    //
+    // `nack` 也在这里：桌面 `lib/cloud.mjs` 的 `authorized()` 是**逐帧**验令牌的，
+    // 不带 token 的补片请求会被当成未授权丢掉（而它就白发了）。
+    const needsSession = object.t === 'auth' || object.t === 'req' || object.t === 'nack' || object.t.startsWith('ws.');
     const payload = needsSession && this.session !== null && object.token === undefined
       ? { ...object, token: this.session.token }
       : { ...object };
@@ -1644,6 +1800,11 @@ class Relay {
    */
   abortTransport(reason) {
     for (const ready of this.readyWaiters) ready(false);
+    // 跨链路的半包一律作废。**必须计入诊断**：旧实现在这里静默 clear，于是
+    // "一次重连把正在拼的大响应清掉了"在手机侧完全不可见（而那正是
+    // "网络恢复了、页面还是不动"的现场之一）。重发由 resendPending() 负责，
+    // 这里只记账、不额外触发。
+    if (this.parts.size > 0) this.stats.partsIncomplete += this.parts.size;
     this.parts.clear();
     for (const [, socket] of this.sockets) socket._close(1001, reason);
   }
@@ -1657,7 +1818,11 @@ class Relay {
    */
   resendPending(reason = '中继已恢复') {
     if (this.ready !== true || this.superseded === true || this.disposed === true) return;
-    for (const [, entry] of this.pending) entry.retry?.();
+    // 走 `heal()` 而不是 `retry()`：重连是"链路换了"，不是"第 N 次重试"。
+    // `retry()` 在 attempt 用尽后是空操作 —— 而那恰恰是最需要它的一次
+    // （半包被 `abortTransport()` 清掉、回包永远拼不齐，见 RPC_HEAL_RESENDS）。
+    // 每条请求只多给一次，避免弱网来回抖动时把上行刷成风暴。
+    for (const [, entry] of this.pending) (entry.heal ?? entry.retry)?.();
     for (const [, entry] of this.controlRequests) entry.resend?.();
     console.debug(`[pocket-diag] resendPending ${reason} pending=${this.pending.size} control=${this.controlRequests.size}`);
   }
@@ -1710,11 +1875,20 @@ class Relay {
     let encoded = '';
     if (typeof body === 'string') encoded = b64(encoder.encode(body));
     else if (body instanceof Uint8Array) encoded = b64(body);
+    // 预算必须是**绝对截止时刻**，不能只是"每段等待各管各的"：旧实现里
+    // ① 心跳重发与 reconnect 重发都会重新装配计时器，② 过期 attempt 的失败
+    // 回调还会 clearTimeout 掉当前这次 attempt 的计时器 —— 两条路都能把总耗时
+    // 拖过应用侧超时，且没有任何地方能证明"它一定会在 X 毫秒内结束"。
+    const budget = rpcBudgetMs(attempts, timeout);
+    const deadline = Date.now() + budget;
+    const crumb = this.openCrumb({ id, path, method });
     return new Promise((resolve, reject) => {
       let attempt = 0;
+      let healed = 0;
+      let generation = 0;
       let settled = false;
       const controller = new AbortController();
-      const entry = { id, at: Date.now(), sessionToken: this.session?.token, deviceToken: this.deviceToken, timer: undefined, resolve: undefined, reject: undefined, retry: undefined };
+      const entry = { id, at: Date.now(), sessionToken: this.session?.token, deviceToken: this.deviceToken, timer: undefined, resolve: undefined, reject: undefined, retry: undefined, heal: undefined };
       const finish = (fn, value) => {
         if (settled) return;
         settled = true;
@@ -1724,9 +1898,16 @@ class Relay {
         controller.abort();
         fn(value);
       };
-      entry.resolve = (message) => finish(resolve, message);
-      entry.reject = (error) => finish(reject, error);
+      entry.resolve = (message) => {
+        this.noteCrumbRes(crumb, message);
+        finish(resolve, message);
+      };
+      entry.reject = (error) => {
+        this.noteCrumbEnd(crumb, error);
+        finish(reject, error);
+      };
       this.pending.set(id, entry);
+      this.stats.rpc += 1;
 
       const abort = () => entry.reject(new DOMException('请求已取消', 'AbortError'));
       if (signal !== undefined && signal !== null) {
@@ -1734,13 +1915,31 @@ class Relay {
         signal.addEventListener('abort', abort, { once: true });
       }
 
-      // 前几次重发要快：首个请求常常正好撞上电脑端重连，4 s 才重试会把冷启动拖到 20 s+。
-      const attemptOnce = () => {
-        attempt += 1;
-        entry.at = Date.now();
-        // Single timer per request: the old build left the previous timeout
-        // armed and burned through the attempt budget.
+      /**
+       * 装一个**不超过绝对截止时刻**的计时器。
+       *
+       * 所有路径（backoff 到点、传输层失败补兜底、重连重发后）都走这里，
+       * 于是"这条请求最晚什么时候结束"只由 `deadline` 决定。
+       */
+      const arm = (delay, fire) => {
         clearTimeout(entry.timer);
+        const left = Math.max(0, deadline - Date.now());
+        entry.timer = setTimeout(fire, Math.min(Math.max(0, delay), left));
+      };
+      const dieByDeadline = () => {
+        if (settled) return;
+        const left = deadline - Date.now();
+        if (left > 0) { arm(left, dieByDeadline); return; }
+        entry.reject(rpcTimeoutError(timeout));
+      };
+
+      // 前几次重发要快：首个请求常常正好撞上电脑端重连，4 s 才重试会把冷启动拖到 20 s+。
+      const attemptOnce = (reason = 'backoff') => {
+        attempt += 1;
+        generation += 1;
+        const myGeneration = generation;
+        entry.at = Date.now();
+        this.noteCrumbTry(crumb, attempt, reason);
         this.send({
           t: 'req',
           id,
@@ -1753,29 +1952,114 @@ class Relay {
           body: encoded,
           gzip,
         }, controller.signal).catch((error) => {
-          // 传输层暂时不可用（断线 / 客户端换代）：**不判死**。请求还活着等
-          // resendPending() 用同一个 id 重发；这里只需要补一个计时器，让既有的
-          // 16 秒预算继续生效 —— 否则这条请求再没有任何东西能结束它。
-          if (error?.transient !== true) { entry.reject(error); return; }
           if (settled) return;
-          clearTimeout(entry.timer);
-          entry.timer = setTimeout(() => {
-            if (!settled) entry.reject(new Error('中继请求超时'));
-          }, timeout);
+          // **过期 attempt 的失败不是结论**：它已经被后面那次 attempt 取代了。
+          // 旧实现在这里无条件 `clearTimeout(entry.timer)` 再补一个 16 s 计时器，
+          // 等于把当前 attempt 的退避链打断、剩余重发预算作废，判死时刻还随
+          // "迟到的 catch 什么时候到"漂移（最长能比预算多出十几秒）。
+          if (myGeneration !== generation) return;
+          // 传输层暂时不可用（断线 / 客户端换代）：**不判死**。请求还活着等
+          // resendPending() 用同一个 id 重发；这条 catch 只保证"即使没人再重发，
+          // 也有东西能在截止时刻结束它"。
+          if (error?.transient !== true) { entry.reject(error); return; }
+          arm(timeout, dieByDeadline);
         });
         // Early duplicates repair a lost frame in a second or two; the *last*
         // attempt still gets the full per-request budget, because a slow route
         // (a long task list, a POST that spawns an agent) is not a lost frame.
         const delay = attempt < attempts ? (RPC_BACKOFF_MS[attempt - 1] ?? 2_000) : timeout;
-        entry.timer = setTimeout(() => {
+        arm(delay, () => {
           if (settled) return;
-          if (attempt < attempts) attemptOnce();
-          else entry.reject(new Error('中继请求超时'));
-        }, delay);
+          if (attempt < attempts) { attemptOnce(); return; }
+          dieByDeadline();
+        });
       };
-      entry.retry = () => { if (!settled && attempt < attempts) attemptOnce(); };
-      attemptOnce();
+      entry.retry = () => { if (!settled && attempt < attempts) attemptOnce('beat'); };
+      /**
+       * 重连后的重发：允许**越过** `attempts` 上限一次（见 `RPC_HEAL_RESENDS`）。
+       *
+       * 典型现场：一条 45 KB 的回包被切成 2 片，第 1 片到了、第 2 片撞上重连，
+       * `abortTransport()` 清掉半包表。此时只剩这条路能让桌面按同一 id 再放一遍，
+       * 否则就只能干等预算耗尽 —— 用户看到的是"网络明明恢复了，页面还是不动"。
+       *
+       * @returns {boolean} 是否真的发出了这一帧（`false` = 额度已用尽）
+       */
+      entry.heal = () => {
+        if (settled || healed >= RPC_HEAL_RESENDS) return false;
+        healed += 1;
+        attemptOnce('heal');
+        return true;
+      };
+      attemptOnce('first');
     });
+  }
+
+  /* ------------------------ 在途 RPC 面包屑（诊断用） ------------------------ */
+
+  /**
+   * 开一条面包屑。
+   *
+   * 只记"这条请求到底走到哪一步了"：谁、要什么、发了几次、有没有收到过 `res`、
+   * 最后那条 `res` 的 id / 体积 / 时刻、以及怎么结束的。**环形**只留最近
+   * `RPC_LOG_MAX` 条，给 `__POCKET_DIAG__.snapshot()` 读。
+   *
+   * `path` 只留 pathname：query 里是游标、`limit` 之类的参数，没有诊断价值，
+   * 而诊断文本是要用户复制给别人看的 —— 少一个字段就少一次泄露机会。
+   */
+  openCrumb({ id, path, method }) {
+    const crumb = {
+      id: String(id ?? ''),
+      verb: String(method ?? 'GET').toUpperCase().slice(0, 6),
+      path: breadcrumbPath(path),
+      at: Date.now(),
+      tries: 0,
+      resends: 0,
+      sawRes: false,
+      resId: '',
+      resBytes: 0,
+      resAt: 0,
+      end: '',
+      ms: 0,
+    };
+    this.rpcLog.push(crumb);
+    if (this.rpcLog.length > RPC_LOG_MAX) this.rpcLog.splice(0, this.rpcLog.length - RPC_LOG_MAX);
+    return crumb;
+  }
+
+  noteCrumbTry(crumb, tries, reason) {
+    crumb.tries = tries;
+    if (reason === 'beat' || reason === 'heal') crumb.resends += 1;
+  }
+
+  noteCrumbRes(crumb, message) {
+    const body = typeof message?.body === 'string' ? message.body : '';
+    crumb.sawRes = true;
+    crumb.resId = String(message?.id ?? '');
+    // base64 → 原始字节数（诊断里要的是"那条大响应到底有多大"）。
+    crumb.resBytes = Math.round((body.length * 3) / 4);
+    crumb.resAt = Date.now();
+  }
+
+  noteCrumbEnd(crumb, error) {
+    const timeout = error?.pocketCode === 'relay_timeout';
+    crumb.end = timeout ? 'timeout' : (error?.name === 'AbortError' ? 'aborted' : 'error');
+    crumb.ms = Math.max(0, Date.now() - crumb.at);
+    if (timeout) this.stats.timeouts += 1;
+  }
+
+  /** 面包屑快照（只读副本；诊断块与界面进度都用它）。 */
+  rpcBreadcrumbs() {
+    return this.rpcLog.map((crumb) => ({ ...crumb }));
+  }
+
+  /** 在途请求的**极简**视图：界面拿它显示"正在重试第几次"。 */
+  inflight() {
+    const out = [];
+    for (const crumb of this.rpcLog) {
+      if (crumb.end !== '') continue;
+      out.push({ path: crumb.path, verb: crumb.verb, tries: crumb.tries, ms: Math.max(0, Date.now() - crumb.at) });
+    }
+    return out;
   }
 
   openSocket(id, path) {
@@ -1796,6 +2080,68 @@ class Relay {
 }
 
 /* -------------------------------- shims --------------------------------- */
+
+/**
+ * 解开一条回包的 body（必要时先解 gzip），**带截止时刻**。
+ *
+ * 为什么必须抽出来单独测（`test/domain/shell-rpc-budget` 用 `sliceFunction()` 在
+ * vm 里真跑）：`new Response(stream).arrayBuffer()` 是整条链上唯一没有兜底的一步。
+ * 一旦解压流卡住（回包字节被截断、WebKit 的 DecompressionStream 半死），这个
+ * promise 永远不 resolve；而应用侧那个 AbortSignal 早就传不进来了（外壳的
+ * `request()` 已经 resolve，监听器也摘了）。结果就是界面**永久**停在「加载中…」，
+ * 刷新才恢复 —— 这比"超时报错"糟得多，因为它没有任何出路。
+ *
+ * 失败时打 `pocketCode: 'decompress'`：它既不是"连不上"（`network`）也不是
+ * "读响应失败"（`read`），`web/lib/net.js` 据此**不再**用新的 request id 把整条
+ * 108 KB 的响应重拉一遍（桌面日志里那些"同一会话被完整请求多次"就是那么来的）。
+ *
+ * @param {Uint8Array} bytes 回包原始字节（已是二进制，不是 base64）
+ * @param {number} [timeoutMs]
+ * @returns {Promise<Uint8Array>}
+ */
+async function decompressGzip(bytes, timeoutMs = DECOMPRESS_TIMEOUT_MS) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  let timer;
+  const guard = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error('大响应解压超时');
+      error.pocketCode = 'decompress';
+      reject(error);
+    }, Math.max(1, Number(timeoutMs) || DECOMPRESS_TIMEOUT_MS));
+  });
+  try {
+    const buffer = await Promise.race([new Response(stream).arrayBuffer(), guard]);
+    return new Uint8Array(buffer);
+  } catch (error) {
+    // 解压失败（坏字节 / 流卡住）都归成同一类：拿到的 body 不可用。
+    if (error?.pocketCode === 'decompress') throw error;
+    const failure = new Error(`大响应解压失败：${String(error?.message ?? error)}`);
+    failure.pocketCode = 'decompress';
+    throw failure;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 把外壳这一侧的错误翻译成"能被 `web/lib/net.js` 认出原因"的形状。
+ *
+ * 旧实现里外壳抛什么都长一个样，于是 net.js 一律当成「连不上电脑」
+ * （`code: 'network'`）→ **可重试** → 换一个新的 request id 把整棵请求重来一遍。
+ * 用户因此从"一次 15 秒"变成"两次 15 秒"，而链路明明是通的。
+ *
+ * 只标两类：
+ *   - `relay_timeout`：外壳自己的同 id 重放已经跑完预算（带 `timeoutMs`）；
+ *   - `relay`：其它外壳侧结论（例如中继拒绝了这条帧）。
+ * `AbortError` 原样放行 —— 那是**应用侧**取消的，翻译权在 net.js。
+ */
+function tagRelayFailure(error) {
+  if (error === null || typeof error !== 'object') return error;
+  if (error.name === 'AbortError') return error;
+  if (typeof error.pocketCode === 'string' && error.pocketCode !== '') return error;
+  error.pocketCode = Number(error.timeoutMs) > 0 ? 'relay_timeout' : 'relay';
+  return error;
+}
 
 function installFetch(relay) {
   const nativeFetch = window.fetch.bind(window);
@@ -1819,18 +2165,22 @@ function installFetch(relay) {
     const request = new Request(isRequest ? input : url, init);
     const method = request.method;
     const body = request.body === null ? undefined : new Uint8Array(await request.arrayBuffer());
-    const reply = await relay.request({
-      method,
-      path: `${url.pathname}${url.search}`,
-      headers: Object.fromEntries(request.headers),
-      body,
-      signal: request.signal,
-      gzip: typeof DecompressionStream === 'function',
-    });
+    let reply;
+    try {
+      reply = await relay.request({
+        method,
+        path: `${url.pathname}${url.search}`,
+        headers: Object.fromEntries(request.headers),
+        body,
+        signal: request.signal,
+        gzip: typeof DecompressionStream === 'function',
+      });
+    } catch (error) {
+      throw tagRelayFailure(error);
+    }
     let bytes = unb64(reply.body ?? '');
     if (reply.enc === 'gzip' && typeof DecompressionStream === 'function') {
-      const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
-      bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+      bytes = await decompressGzip(bytes);
     }
     const outHeaders = new Headers();
     for (const [name, value] of Object.entries(reply.headers ?? {})) {
@@ -2201,32 +2551,51 @@ async function main() {
    * 快照**只**含非敏感字段：没有房间密钥、没有设备令牌、没有链接里的 `r`/`t`。
    * 连接页「复制诊断信息」会把 `snapshot()` 的结果直接交给 `buildDiagText()`，
    * 那之后一个字节都不会再回到这里。
+   *
+   * 字段为什么是这些（事故里最缺的一层）：
+   *   - 与 `online` 分开的 `pcStale`：中继在线 ≠ 电脑端在说话。同屏"一边在线、
+   *     一边显示电脑端已离线"的矛盾就是这两件事挤在一个字段里造成的。
+   *   - `stats`：只有 `online` 判断不了"手机收不到下行"这种坏法 —— 真实链路
+   *     自认为在线、实际一帧都收不进来，收发计数与最后收帧时刻是唯一证据。
+   *   - `crumb`：最近 8 条 RPC 走到哪一步（id / pathname / 发起时刻 / 发了几次 /
+   *     有没有收到过 res / 最后那条 res 的 id·字节·时刻 / 怎么结束的）。桌面侧有
+   *     `rx / rpc / replays` 三个计数器，手机侧以前只有一个 `pending` 数字，于是
+   *     "回包丢了"和"我们早就不等了"在两边看起来一模一样。
+   *   - `timeouts`：**超时未收到 res 的次数**；`resMiss`：收到了 res 但 pending 里
+   *     已经没有它了（迟到的回包）。前者高 → 下行慢或丢；后者高 → 我们放弃得太早；
+   *     两者都低而界面仍卡 → 去看解压（`decompressGzip`）。
+   *   - `rpcBudget`：一条请求的**总**预算，用来和应用侧超时对账。
    */
   globalThis.__POCKET_DIAG__ = {
     snapshot: () => ({
       brokers: relay.brokers,
       online: relay.ready === true,
-      // 与 online 分开：中继在线 ≠ 电脑端在说话。同屏"一边在线、一边显示电脑端
-      // 已离线"的矛盾就是这两件事挤在一个字段里造成的。
       pcStale: relay.pcStale === true,
       attempts: relay.failureStreak,
       lastFailure: relay.lastFailure,
       lastOkAt: relay.lastOkAt,
       lastAttemptAt: relay.lastAttemptAt,
-      // 只有 online 判断不了"手机收不到下行"这种坏法：真实链路自认为在线、
-      // 实际一帧都收不进来。收 / 发 / 错与最后收帧时刻是唯一的证据。
       stats: { rx: relay.stats.rx, tx: relay.stats.tx, err: relay.stats.err, lastRxAt: relay.stats.lastRxAt },
       pending: relay.pending.size,
       restartCount: relay.restartCount,
       sockets: relay.sockets.size,
       now: Date.now(),
+      crumb: relay.rpcBreadcrumbs(),
+      timeouts: relay.stats.timeouts,
+      resMiss: relay.stats.resMiss,
+      rpcBudget: rpcBudgetMs(),
+      partsOpen: relay.parts.size,
+      partsIncomplete: relay.stats.partsIncomplete,
+      partsNacked: relay.stats.partsNacked,
     }),
     describeFailure,
+    diagRows,
+    buildDiagText,
     describeFailureShort,
     describeBrokerChoice,
     describeAdvice,
-    diagRows,
-    buildDiagText,
+    /** 在途请求的极简视图：应用层拿它显示"正在重试第几次"（不含任何 id）。 */
+    inflight: () => relay.inflight(),
   };
 
   relay.onpc = (pc) => setSplash(`已连接 ${pc.name}`, '正在同步任务…');

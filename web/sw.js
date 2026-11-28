@@ -36,6 +36,7 @@ const ASSETS = [
   './lib/markdown.js',
   './lib/net.js',
   './lib/perf.js',
+  './lib/rpc-budget.js',
   './lib/shell-fresh.js',
   './lib/shell-session.js',
   './lib/sprite.js',

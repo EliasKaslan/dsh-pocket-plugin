@@ -411,6 +411,27 @@ export function diagRows(diag) {
     { key: 'tx', label: '发出上行', value: `${countOf(stats.tx)} 帧` },
     { key: 'err', label: '解析 / 传输错误', value: `${countOf(stats.err)} 次` },
     { key: 'pending', label: '在途请求', value: `${countOf(source.pending)} 条` },
+    /*
+     * 这两行是 1.0.3 之后补的：`pending` 只能说明"还有几条没回来"，分不清是
+     *   ① 回包真的没到（下行丢帧 / 电脑端没回），还是
+     *   ② 回包到了、但我们早就不等了（迟到）。
+     * 两个数一起看才有判据：`timeouts` 高 = 下行慢或丢；`resMiss` 高 = 我们放弃得太早
+     * （预算/超时配错了）；两个都是 0 而界面仍卡 = 去看大响应解压（`decompressGzip`）。
+     */
+    { key: 'rpctimeout', label: 'RPC 超时未回包', value: `${countOf(source.timeouts)} 次` },
+    { key: 'resmiss', label: '迟到的回包', value: `${countOf(source.resMiss)} 次` },
+    /*
+     * 分片三件套：大响应（>64 KiB 封帧后拆片）在手机端丢了片时，以前两边都没有
+     * 任何痕迹 —— 电脑端的 `publishRetries/publishLost` 对这种丢法是 0（broker
+     * 收下了、订阅方没收到），手机端只表现为"一直没内容"。
+     *   - `partsOpen`：现在有几组半包在拼（>0 且界面卡住 = 正在等一个不会来的片）；
+     *   - `partsIncomplete`：累计没集齐（TTL 过期 / 被淘汰 / 判定丢失 / 重连作废）；
+     *   - `partsNacked`：累计发过几次补片请求（老桌面会忽略，所以它涨而
+     *     `partsIncomplete` 不降 = 对端还不支持补片）。
+     */
+    { key: 'partsopen', label: '半包在拼', value: `${countOf(source.partsOpen)} 组` },
+    { key: 'partslost', label: '分片没集齐', value: `${countOf(source.partsIncomplete)} 次` },
+    { key: 'partsnack', label: '已发补片请求', value: `${countOf(source.partsNacked)} 次` },
     { key: 'sockets', label: '实时通道', value: `${countOf(source.sockets)} 条` },
     { key: 'restart', label: '连接重建', value: `${countOf(source.restartCount)} 次` },
     {
@@ -427,18 +448,71 @@ export function diagRows(diag) {
 }
 
 /**
+ * 一条 RPC 面包屑 → 一行可粘贴的文本。
+ *
+ * 白名单式读取：只碰 `verb / path / tries / resends / sawRes / resBytes / resAt /
+ * ms / end / id` 这几个**外壳自己写进去**的字段。就算有人把别的字段塞进来
+ * （房间密钥、设备令牌），这段文本也不会读它 —— 「复制诊断」是要发出去的。
+ *
+ * `id` 是手机端自己生成的 8 位 request id（不是凭据），必须留着：电脑端日志里
+ * 记的是**同一个 id**，两边对不上的时候只有它能把"这条请求在电脑那边到底发生了什么"
+ * 接起来（桌面统计里 `replays` 也是按它数的）。
+ *
+ * @param {object} crumb `Relay#rpcBreadcrumbs()` 的一项
+ * @param {number} [now]
+ * @returns {string}
+ */
+export function crumbText(crumb, now = Date.now()) {
+  const source = crumb !== null && typeof crumb === 'object' ? crumb : {};
+  const verb = snippet(String(source.verb ?? 'GET'), 6) || 'GET';
+  const path = snippet(String(source.path ?? ''), 48) || '（无路径）';
+  const tries = Number(source.tries);
+  const resends = Number(source.resends);
+  const sent = Number.isFinite(tries) ? Math.max(0, Math.trunc(tries)) : 0;
+  const extra = Number.isFinite(resends) && resends > 0 ? `（其中重连补发 ${Math.trunc(resends)} 次）` : '';
+  const id = snippet(String(source.id ?? ''), 12);
+  const end = String(source.end ?? '');
+  let tail;
+  if (source.sawRes === true) {
+    const bytes = Number(source.resBytes);
+    const size = Number.isFinite(bytes) && bytes > 0 ? `${Math.round(bytes / 1024 * 10) / 10} KB` : '空';
+    tail = `已收到回包 ${size}`;
+  } else if (end === 'timeout') {
+    tail = '没收到回包 · 已判死（超时）';
+  } else if (end === 'aborted') {
+    tail = '没收到回包 · 已取消';
+  } else if (end === 'error') {
+    tail = '没收到回包 · 出错了';
+  } else {
+    tail = '还没回包（还在等）';
+  }
+  const resAt = Number(source.resAt);
+  const at = Number.isFinite(resAt) && resAt > 0 ? formatClock(resAt) : '';
+  const ms = Number(source.ms);
+  const waited = Number.isFinite(ms) && ms > 0
+    ? (ms < 1_000 ? `${Math.round(ms)} ms` : `${(ms / 1_000).toFixed(1)} s`)
+    : formatAgo(Number(source.at), now, '');
+  const parts = [`${verb} ${path}`, `发 ${sent} 次${extra}`, waited, tail];
+  if (at !== '') parts.push(at);
+  if (id !== '') parts.push(`#${id}`);
+  return parts.filter((part) => part !== '').join(' · ');
+}
+
+/**
  * 「复制诊断信息」按钮真正复制的那段文本。
  *
  * 只输出白名单字段：中继地址（已剥掉 userinfo/query）、中继与电脑端两个状态、
- * 连续失败次数、最后成功 / 最后尝试时刻、收发帧计数、在途请求 / 实时通道 / 重建
- * 次数、最后失败原因与原始 code、是否 PWA、UA。
+ * 连续失败次数、最后成功 / 最后尝试时刻、收发帧计数、在途请求 / 超时未回包 /
+ * 迟到回包 / 实时通道 / 重建次数、最后失败原因与原始 code、最近几条 RPC 面包屑、
+ * 是否 PWA、UA。
  * **不含**房间密钥 `k`、设备令牌、链接里的 `r`/`t`、房间号 —— 这段文本会被
  * 用户粘贴到聊天窗口里求助，任何一项泄露都等于把配对交出去。
  *
  * @param {{brokers?: unknown, online?: boolean, pcStale?: boolean, attempts?: number,
  *   lastFailure?: object|null, lastOkAt?: number, lastAttemptAt?: number,
  *   stats?: {rx?: number, tx?: number, err?: number, lastRxAt?: number},
- *   pending?: number, restartCount?: number, sockets?: number,
+ *   pending?: number, restartCount?: number, sockets?: number, timeouts?: number,
+ *   resMiss?: number, crumb?: object[], rpcBudget?: number,
  *   now?: number, pwa?: boolean, userAgent?: unknown}} [diag]
  * @returns {string}
  */
@@ -453,6 +527,14 @@ export function buildDiagText(diag) {
   ];
   for (const row of diagRows(snapshot)) {
     lines.push(`${row.label}：${row.value}`);
+  }
+  // 最近几条 RPC：只留 5 条（再多也没人看，而复制出来的文本会变长）。
+  const crumbs = Array.isArray(source.crumb) ? source.crumb.filter((item) => item !== null && typeof item === 'object') : [];
+  if (crumbs.length > 0) {
+    const budget = Number(source.rpcBudget);
+    const head = Number.isFinite(budget) && budget > 0 ? `（单条预算 ${Math.round(budget)} ms）` : '';
+    lines.push(`最近在途 RPC${head}：`);
+    for (const crumb of crumbs.slice(-5)) lines.push(`  ${crumbText(crumb, now)}`);
   }
   lines.push(`运行方式：${source.pwa === true ? 'PWA（从桌面图标打开）' : '浏览器标签页'}`);
   lines.push(`UA：${snippet(source.userAgent ?? '未知', 120)}`);

@@ -25,6 +25,29 @@ export const PART_MAX_TOTAL = 64;
 /** 单片明文上限（与桌面 `MAX_FRAME` 对齐）。 */
 export const MAX_FRAME = 64 * 1024;
 
+/**
+ * 一个半包**超过这么久没有新片**就算"可能丢了"，可以发 `nack` 让电脑端补。
+ *
+ * 依据：电脑端实测 4~14 ms 就回完一条详情，分片之间是同一个 `for` 循环里连续
+ * `publish()` 的（`lib/cloud.mjs` 的 `publishSealed`），正常间隔是毫秒级。2 s
+ * 还没到下一片，就只可能是"broker 收下但订阅方没收到"——桌面侧的 `publishRetries`
+ * / `publishLost` 对这种丢法**全 0**，它自己完全感知不到。
+ */
+export const PART_STALL_MS = 2_000;
+/** 同一个 chunkId 两次 `nack` 的最小间隔（防止弱网时把上行刷成风暴）。 */
+export const PART_NACK_GAP_MS = 5_000;
+/** 同时最多为几个半包发 `nack`。 */
+export const PART_NACK_MAX_OPEN = 4;
+/**
+ * 一个半包**这么久还没集齐**就判定"这一组回包再也拼不齐了"。
+ *
+ * 取两个心跳周期：电脑端每 8 s 一跳 beat，而心跳会用**同一个 request id**
+ * 触发一次重发（桌面命中幂等缓存重放整条响应）。所以 8 s 内既没有新片、
+ * 也没有被重放的完整响应，就只剩"我们等的东西不存在了"这一种解释 ——
+ * 与其让用户干等到请求预算耗尽，不如立刻把这条请求送去自救/重试。
+ */
+export const PART_LOST_MS = 8_000;
+
 /** 分片 id 的形状：12 位小写十六进制（桌面 `randomBytes(6).toString('hex')`）。 */
 const ID_PATTERN = /^[0-9a-f]{12}$/u;
 
@@ -87,6 +110,8 @@ export class PartTable {
     this.parts = new Map();
     /** 累计被迫淘汰的半包数（诊断用）。 */
     this.dropped = 0;
+    /** 累计因 TTL 过期被清掉的半包数（诊断用；与 `dropped` 分开，语义不同）。 */
+    this.expired = 0;
   }
 
   get size() {
@@ -97,25 +122,112 @@ export class PartTable {
     this.parts.clear();
   }
 
-  /** 清掉超过 TTL 的半包。 */
+  /**
+   * 清掉超过 TTL 的半包，**并把清掉的 id 交回去**。
+   *
+   * 为什么必须交回去：清掉的半包意味着"这一组回包永远拼不齐了"，而上层
+   * （`remote/remote.js`）要据此计入诊断、并让等它的那条请求立刻自救/重试。
+   * 旧实现是静默 `delete` —— 用户和诊断都看不到任何痕迹。
+   *
+   * @param {number} [now]
+   * @returns {string[]} 被清掉的 chunkId
+   */
   sweep(now = this.now()) {
+    const gone = [];
     for (const [key, entry] of this.parts) {
-      if (now - entry.at > this.ttlMs) this.parts.delete(key);
+      if (now - entry.at > this.ttlMs) {
+        this.parts.delete(key);
+        this.expired += 1;
+        gone.push(key.slice('part:'.length));
+      }
     }
+    return gone;
+  }
+
+  /** 当前所有没集齐的组（诊断 / NACK 判据都读它）。 */
+  incomplete(now = this.now()) {
+    const out = [];
+    for (const [key, entry] of this.parts) {
+      const missing = [];
+      for (let index = 0; index < entry.total; index += 1) {
+        if (entry.chunks[index] === undefined) missing.push(index);
+      }
+      out.push({
+        id: key.slice('part:'.length),
+        total: entry.total,
+        missing,
+        ageMs: Math.max(0, now - entry.at),
+        nacks: entry.nacks ?? 0,
+        nackedAt: entry.nackedAt ?? 0,
+      });
+    }
+    // 最老的先处理：它最可能是"用户正在等的那条大响应"。
+    out.sort((left, right) => right.ageMs - left.ageMs);
+    return out;
+  }
+
+  /**
+   * 现在该给哪几组发 `nack`。
+   *
+   * 判据：这一组超过 `stallMs` 没有新片、距上次 `nack` 已过 `gapMs`、
+   * 且同时最多 `maxOpen` 个 —— 弱网抖动时不许把上行刷成风暴。
+   *
+   * @param {number} [now]
+   * @param {{stallMs?: number, gapMs?: number, maxOpen?: number}} [options]
+   * @returns {string[]} 要发 `nack` 的 chunkId
+   */
+  nackDue(now = this.now(), { stallMs = PART_STALL_MS, gapMs = PART_NACK_GAP_MS, maxOpen = PART_NACK_MAX_OPEN } = {}) {
+    const due = [];
+    for (const group of this.incomplete(now)) {
+      if (due.length >= Math.max(0, maxOpen)) break;
+      if (group.ageMs < stallMs) continue;
+      if (group.nackedAt > 0 && now - group.nackedAt < gapMs) continue;
+      due.push(group.id);
+    }
+    return due;
+  }
+
+  /** 记下"已经为这一组发过 nack"（下次要等 `gapMs` 才允许再发）。 */
+  markNacked(id, now = this.now()) {
+    const entry = this.parts.get(`part:${id}`);
+    if (entry === undefined) return false;
+    entry.nacks = (entry.nacks ?? 0) + 1;
+    entry.nackedAt = now;
+    return true;
+  }
+
+  /**
+   * 已经超过 `lostMs` 还没集齐的组：这组回包不可能再拼齐了。
+   * 上层据此把组丢掉，并把等它的请求送去自救/重试。
+   *
+   * @param {number} [now]
+   * @param {{lostMs?: number}} [options]
+   * @returns {string[]} chunkId
+   */
+  lost(now = this.now(), { lostMs = PART_LOST_MS } = {}) {
+    return this.incomplete(now)
+      .filter((group) => group.ageMs >= lostMs)
+      .map((group) => group.id);
+  }
+
+  /** 丢掉一组半包（返回是否真的删掉了）。 */
+  drop(id) {
+    return this.parts.delete(`part:${id}`);
   }
 
   /**
    * 吃掉一条分片。
    *
    * @param {object} message 已解密的分片帧
-   * @returns {{kind: 'invalid'|'incomplete'|'complete', value?: unknown, evicted: string[]}}
+   * @returns {{kind: 'invalid'|'incomplete'|'complete', value?: unknown, evicted: string[], expired: string[]}}
    */
   add(message) {
     const parsed = parsePartFrame(message, { maxTotal: this.maxTotal, maxFrame: this.maxFrame });
     const evicted = [];
-    if (parsed === null) return { kind: 'invalid', evicted };
+    const expired = [];
+    if (parsed === null) return { kind: 'invalid', evicted, expired };
     const now = this.now();
-    this.sweep(now);
+    for (const id of this.sweep(now)) expired.push(id);
     const key = `part:${parsed.id}`;
     let entry = this.parts.get(key);
     if (entry === undefined) {
@@ -138,11 +250,11 @@ export class PartTable {
       entry = { chunks: new Array(parsed.total), total: parsed.total, at: now };
       this.parts.set(key, entry);
     }
-    if (entry.total !== parsed.total) return { kind: 'invalid', evicted };
+    if (entry.total !== parsed.total) return { kind: 'invalid', evicted, expired };
     entry.chunks[parsed.seq] = parsed.chunk;
     entry.at = now;
     for (const chunk of entry.chunks) {
-      if (chunk === undefined) return { kind: 'incomplete', evicted };
+      if (chunk === undefined) return { kind: 'incomplete', evicted, expired };
     }
     this.parts.delete(key);
     let length = 0;
@@ -154,9 +266,9 @@ export class PartTable {
       offset += chunk.length;
     }
     try {
-      return { kind: 'complete', value: JSON.parse(new TextDecoder().decode(merged)), evicted };
+      return { kind: 'complete', value: JSON.parse(new TextDecoder().decode(merged)), evicted, expired };
     } catch {
-      return { kind: 'invalid', evicted };
+      return { kind: 'invalid', evicted, expired };
     }
   }
 }

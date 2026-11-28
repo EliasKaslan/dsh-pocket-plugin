@@ -17,6 +17,9 @@ export class ApiError extends Error {
   }
 }
 
+/** 一次 RPC 的最坏耗时 / 详情超时都来自同一份数据，见 `./rpc-budget.js` 的长注释。 */
+import { DETAIL_TIMEOUT_MS } from './rpc-budget.js';
+
 /** Normalise the shell origin: add a scheme when missing, drop a trailing slash. */
 export function normalizeBase(input) {
   let text = String(input ?? '').trim();
@@ -25,7 +28,14 @@ export function normalizeBase(input) {
   return text.replace(/\/+$/u, '');
 }
 
-const DEFAULT_TIMEOUT = 20_000;
+/**
+ * 默认超时：外壳（`remote/remote.js`）那条链的**总预算之上**留足余量。
+ *
+ * 见 `./rpc-budget.js`：外壳同 id 重放的最坏耗时是 `Σ backoff + 最后一次 timeout`
+ * （15.2 s），应用侧必须比它长，否则先到点的总是这里 —— 用户拿到的是笼统的
+ * 「请求超时」，外壳那套幂等重放还没跑完就被取消。
+ */
+const DEFAULT_TIMEOUT = DETAIL_TIMEOUT_MS;
 
 /**
  * 有界重试：首次之外最多再试 2 次，间隔 400 ms / 800 ms。
@@ -52,17 +62,55 @@ function defaultSleep(ms) {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
 
+/**
+ * 哪些错误码允许"换一个新的 request id 再试一次"。
+ *
+ * - `network` / `read`：真正的传输层失败（链路抖动），换新 id 无害。
+ * - `parts_lost`：外壳明确说"这一份响应的分片再也凑不齐了"（下行丢片）。
+ *   换一个新 id 会让服务端**重新切一份响应**，比原样重放更可能成功 ——
+ *   所以这里**可重试**，但只限 GET/HEAD/OPTIONS 与写明幂等的写方法（见下）。
+ *
+ * 其余码（`relay_timeout` / `decompress` / `relay`）一律不重试：外壳已经按
+ * **同一个 request id** 跑完了一整个重放预算，再来一轮只是把用户等待翻倍。
+ */
+const RETRYABLE_CODES = new Set(['network', 'read', 'parts_lost']);
+
 /** 这条请求在失败之后还能不能再试一次。 */
 function canRetry({ method, options, error, attempt, attempts, signal }) {
   if (attempt >= attempts) return false;
   if (signal?.aborted === true) return false;
   if (options?.signal?.aborted === true) return false;
-  // 自己的超时 / 用户取消 / 协议层错误（401、坏 body）重试只会重复同一结果。
-  if (error?.code !== 'network' && error?.code !== 'read') return false;
+  // 外壳已经给过**定论**的失败（同一个 id 的幂等重放跑完了）不许再来一轮。
+  // （`parts_lost` 不算定论：那不是"回声慢"，是"这一份字节凑不齐了"。）
+  if (error?.relayConfirmed === true) return false;
+  if (!RETRYABLE_CODES.has(error?.code)) return false;
   const verb = String(method ?? 'GET').toUpperCase();
   if (verb === 'GET' || verb === 'HEAD' || verb === 'OPTIONS') return true;
   if (options?.idempotent === true) return true;
   return error?.beforeSend === true;
+}
+
+/**
+ * 把外壳的错误翻成一句人能看懂的话。
+ *
+ * 为什么不让它继续落进「连不上电脑」：链路明明是通的（横幅显示在线、桌面 4~14 ms
+ * 就回了），用户被那句错话带去看路由器，真正的原因（回包没送到手机 / 回包解不开）
+ * 反而消失了。
+ */
+function relayFailureMessage(error) {
+  const raw = String(error?.message ?? '').trim();
+  switch (error?.pocketCode) {
+    case 'relay_timeout':
+      return raw.length > 0
+        ? `${raw}（电脑端已按同一请求重放，回包没送到手机）`
+        : '电脑端已按同一请求重放，回包没送到手机';
+    case 'decompress':
+      return raw.length > 0 ? raw : '回包到了但解不开（大响应解压失败）';
+    case 'parts_lost':
+      return raw.length > 0 ? raw : '大响应的分片没到齐（下行丢了片）';
+    default:
+      return raw.length > 0 ? raw : '中继没能完成这次请求';
+  }
 }
 
 /**
@@ -129,6 +177,18 @@ export function createApi({ getBase, getToken, onUnauthorized }, retry = {}) {
       options.signal?.removeEventListener?.('abort', abort);
       if (options.signal?.aborted === true) throw new ApiError('已取消', { code: 'aborted' });
       if (error?.name === 'AbortError') throw new ApiError('请求超时，电脑端可能正忙', { code: 'timeout' });
+      // 外壳自己给的结论（`pocketCode`）：它已经按**同一个 request id** 重放过
+      // 一整个预算了。这类失败不能再说成「连不上电脑」，更不能换个新 id 再重试
+      // 一遍 —— 那等于把用户的等待翻倍，而刚刚证明的恰恰是"重放没用"。
+      // 典型：`relay_timeout`（回包没送到手机）、`decompress`（回包到了但解不开）。
+      if (typeof error?.pocketCode === 'string' && error.pocketCode !== '') {
+        const confirmed = new ApiError(relayFailureMessage(error), { code: error.pocketCode });
+        // 显式标记"这是外壳跑完自己的重放预算后给出的结论"，`canRetry` 认这个标。
+        // **`parts_lost` 例外**：那不是"回声慢"，而是"这一份响应的字节凑不齐了"，
+        // 换一个新 id 会重新切一份响应 —— 该重试。
+        if (error.pocketCode !== 'parts_lost') confirmed.relayConfirmed = true;
+        throw confirmed;
+      }
       const failure = new ApiError('连不上电脑，请检查网络与插件状态', { code: 'network' });
       // 外壳在"这条请求一次都没发出去"时打的标记：中继未就绪 / 客户端换代。
       // 保留它，写方法才敢重试（见 canRetry）。

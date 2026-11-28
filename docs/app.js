@@ -17,6 +17,8 @@ import './lib/perf.js';
 import { relTime } from './lib/format.js';
 // 外壳自检的判据（纯函数，单测直接 import；这段逻辑以前内联在这里并被 catch 吞掉过）。
 import { parseShellBuild, shellCacheBuilds, staleShellBuilds } from './lib/shell-fresh.js';
+// 详情请求的预算与"等太久了"的文案：与外壳的重试预算同源（见该文件的长注释）。
+import { DETAIL_TIMEOUT_MS, detailFailureText, waitText } from './lib/rpc-budget.js';
 // 解除配对要清的外壳侧键名。
 import { unpairStorageKeys } from './lib/shell-session.js';
 import { toast } from './lib/ui.js';
@@ -32,7 +34,7 @@ import { mountTasks } from './views/tasks.js';
 
 // 与 package.json / lib/util.mjs 的 PLUGIN_VERSION 三处必须一致
 // （test/domain/shell-realtime.test.mjs 会核对；漏改会让设置页显示旧版本号）。
-const APP_VERSION = '1.0.3';
+const APP_VERSION = '1.0.4';
 // 设置页要显示「前端版本」。它读的是 store，而 context 上的 appVersion 到不了那里，
 // 所以直接暴露一个全局值——比在 store 里再加一个字段更不容易被后续重构漏掉。
 globalThis.__POCKET_APP_VERSION__ = APP_VERSION;
@@ -366,11 +368,73 @@ function mergeTailInto(previous, data) {
   };
 }
 
+/* ---------------- 详情加载的进度（"别对着静止的加载中干等"） ---------------- */
+
+/** 进度刷新令牌：新的加载会顶掉旧的，旧的 `stop()` 不许误停新的。 */
+let detailProgressSeq = 0;
+let detailProgressTimer = null;
+
+/**
+ * 外壳面包屑里这条详情请求**已经发出几次**。
+ *
+ * 为什么读外壳而不是自己数：真正在重发的是外壳（同一个 request id 最多 4 次 +
+ * 重连补 1 次），应用层一次 `api()` 只看到"还没回来"。没有外壳时（局域网布局
+ * / 老壳）降级成 1，文案就退化成"还在等电脑端回包"，不编造数字。
+ */
+function detailTries(path) {
+  try {
+    const list = globalThis.__POCKET_DIAG__?.inflight?.();
+    if (Array.isArray(list)) {
+      const hit = list.find((item) => typeof item?.path === 'string' && item.path.startsWith(path));
+      if (hit !== undefined && Number(hit.tries) > 0) return Math.trunc(Number(hit.tries));
+    }
+  } catch { /* 诊断永远不该影响主流程 */ }
+  return 1;
+}
+
+/**
+ * 开始"等详情"的计时。
+ *
+ * 用户报的是"点进去半天没内容"，而旧界面只有一句静止的「加载中…」——分不清是
+ * 卡死、在重试、还是电脑端没响应。超过 3 秒就把**等了多久 + 第几次重试**写出来
+ * （文案是纯函数 `waitText()`，见 `web/lib/rpc-budget.js`，单测直接跑它）。
+ */
+function startDetailProgress(id) {
+  const token = ++detailProgressSeq;
+  const startedAt = Date.now();
+  const path = `/api/v1/tasks/${encodeURIComponent(id)}`;
+  store.detailWaiting = true;
+  store.detailWaitedMs = 0;
+  store.detailTries = 1;
+  store.detailWaitText = '';
+  const tick = () => {
+    if (detailProgressSeq !== token) return;
+    const elapsedMs = Math.max(0, Date.now() - startedAt);
+    store.detailWaitedMs = elapsedMs;
+    store.detailTries = detailTries(path);
+    store.detailWaitText = waitText({ elapsedMs, tries: store.detailTries });
+    // 只在"页面上还没有内容"时重绘：静默刷新不该动正在读的对话。
+    if (store.screen === 'detail' && store.detailId === id && store.detail === null) view?.paintChat?.();
+  };
+  tick();
+  if (detailProgressTimer !== null) clearInterval(detailProgressTimer);
+  detailProgressTimer = setInterval(tick, 1_000);
+  return {
+    stop() {
+      if (detailProgressSeq !== token) return; // 已经被更新的一次加载接管
+      if (detailProgressTimer !== null) { clearInterval(detailProgressTimer); detailProgressTimer = null; }
+      store.detailWaiting = false;
+      store.detailWaitText = '';
+    },
+  };
+}
+
 async function loadDetail(id, { silent = false } = {}) {
   const seq = ++viewSeq;
   if (!silent) { store.detail = null; store.detailError = ''; }
+  const progress = silent ? null : startDetailProgress(id);
   try {
-    const data = await api(`/api/v1/tasks/${encodeURIComponent(id)}`, { timeout: 25_000 });
+    const data = await api(`/api/v1/tasks/${encodeURIComponent(id)}`, { timeout: DETAIL_TIMEOUT_MS });
     if (seq !== viewSeq || store.detailId !== id) return;
     const previous = silent ? store.detail : null;
     store.detail = previous === null || previous === undefined
@@ -380,7 +444,10 @@ async function loadDetail(id, { silent = false } = {}) {
     if (data?.task) upsertTask(data.task, { repaint: false });
   } catch (error) {
     if (seq !== viewSeq || store.detailId !== id) return;
-    store.detailError = error?.message ?? '读取会话失败';
+    // 失败必须**离开加载态**并给出下一步（重试 / 返回列表），不许停在「加载中…」。
+    store.detailError = detailFailureText({ message: error?.message, code: error?.code });
+  } finally {
+    progress?.stop();
   }
   if (store.screen === 'detail') {
     view?.paint();
@@ -403,7 +470,7 @@ async function loadOlder(id) {
   store.detailLoadingOlder = true;
   try {
     const query = `?before=${encodeURIComponent(cursor)}&limit=${LIMITS.detailPage}`;
-    const data = await api(`/api/v1/tasks/${encodeURIComponent(id)}${query}`, { timeout: 25_000 });
+    const data = await api(`/api/v1/tasks/${encodeURIComponent(id)}${query}`, { timeout: DETAIL_TIMEOUT_MS });
     // 期间切走了会话 / 列表被换掉：这一页直接丢弃，别写进别人的详情。
     if (store.detailId !== id || store.detail !== detail) return 0;
     const older = Array.isArray(data?.messages) ? data.messages : [];

@@ -76,6 +76,17 @@ export const store = {
   detailId: null,
   detail: null,
   detailError: '',
+  /*
+   * 详情"还在等"的可见状态（不是业务数据，只给详情页的加载占位用）。
+   *
+   * 为什么要有：旧界面在详情回来之前只有一句静止的「加载中…」，用户分不清是
+   * 卡死、在重试、还是电脑端没响应 —— 而真实故障下这一等是十几秒。超过 3 秒
+   * 由 `web/lib/rpc-budget.js` 的 `waitText()` 算出「已等待 N 秒 · 正在重试第 K 次」。
+   */
+  detailWaiting: false,
+  detailWaitedMs: 0,
+  detailTries: 1,
+  detailWaitText: '',
   /* 「往上翻加载更早」是否有请求在飞：防止快速滑动打出并发重复页。 */
   detailLoadingOlder: false,
   /** 正在追新（`?after=` 增量），避免同一时刻并发多个增量请求。 */

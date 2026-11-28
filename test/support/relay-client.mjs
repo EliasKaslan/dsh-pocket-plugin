@@ -50,8 +50,15 @@ export const CLOUD_PROTOCOL = 2;
 export const MAX_FRAME = 64 * 1024;
 /** 一次重组允许的最大分片数。 */
 export const PART_MAX_TOTAL = 64;
-/** 手机端默认 RPC 预算（remote/remote.js 的 RPC_TIMEOUT_MS）。 */
-export const RPC_TIMEOUT_MS = 16_000;
+/**
+ * 手机端默认 RPC 预算（`remote/remote.js` 的 `RPC_TIMEOUT_MS`）。
+ *
+ * 必须逐字跟随外壳：`relay-client.interop.test.mjs` 有"常量与外壳一致"的守卫，
+ * 外壳改了这里不改就会红。它现在是 8s 而不是更早的 16s —— 单条请求的**绝对截止**
+ * 是 `Σbackoff + 最后一次 timeout = 15.2s`（每次 attempt 都会重装计时器，不是叠加），
+ * 这个截止必须小于应用层详情超时，否则用户会对着静止的「加载中…」干等。
+ */
+export const RPC_TIMEOUT_MS = 8_000;
 /** hello 回声的限流窗口（电脑端 HELLO_MIN_GAP_MS）。 */
 export const HELLO_MIN_GAP_MS = 10_000;
 const PART_TTL_MS = 30_000;

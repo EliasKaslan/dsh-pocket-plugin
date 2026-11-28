@@ -3,6 +3,8 @@ import { $, h, icon, keyedList, raf } from '../lib/dom.js';
 import { answerPayload, buildAnswers, draftOf, questionsOf, setCustom, toggleChoice } from '../lib/answers.js';
 import { clock, clockSec, oneLine, relTime, shortModel, statusMeta } from '../lib/format.js';
 import { renderMarkdown } from '../lib/markdown.js';
+// 加载占位行显示哪一句（进度文案优先）—— 纯函数，单测直接跑它。
+import { loadingText } from '../lib/rpc-budget.js';
 import { actionSheet, confirmDialog, haptic, toast } from '../lib/ui.js';
 import { LIMITS, store } from '../store.js';
 
@@ -609,8 +611,17 @@ export function mountDetail(root, ctx) {
       case 'question':
         return questionNode(entry);
       case 'loading': {
+        // 文字必须是**可变**的：详情加载到第 4 秒时这里要变成「已等待 4 秒 · 正在
+        // 重试第 1 次」。旧实现写的是 `update: () => {}`（"占位行不会更新"），于是
+        // 界面上永远只有一句静止的「加载中…」，用户只能猜它是不是死了。
         const el = h('div', { class: 'msg msg-loading' }, h('span', { text: '加载中…' }));
-        return { el, update: () => { /* 占位行不会更新 */ } };
+        const update = (next) => {
+          const text = loadingText(next?.message);
+          const span = el.firstElementChild;
+          if (span !== null && span.textContent !== text) span.textContent = text;
+        };
+        update(entry);
+        return { el, update };
       }
       case 'divider': {
         const el = h('div', { class: 'divider' });
@@ -653,11 +664,22 @@ export function mountDetail(root, ctx) {
     const startedAt = perf === undefined ? 0 : perf.now();
     const detail = store.detail;
     if (detail === null || detail === undefined) {
-      // 还没拿到详情：给一个明确的「加载中…」占位，而不是一片空白。
-      // 读失败时不显示它（错误提示由下面的 notice 负责），避免同时出现两个提示。
+      // 还没拿到详情：给一个明确的占位，而不是一片空白。
+      // 读失败时不显示它（错误提示由上面的 notice 负责），避免同时出现两个提示 ——
+      // 但 notice 必须自己保证会画出来（见 `paintNotice()`：旧实现在没有缓存任务
+      // 时直接 return，失败就变成"整页空白、既没字也没按钮"）。
+      // 文案超过 3 秒会变成「已等待 N 秒 · 正在重试第 K 次」（`store.detailWaitText`），
+      // 让用户知道它还在动，而不是对着静止的「加载中…」干等。
+      // 文案超过 3 秒会变成「已等待 N 秒 · 正在重试第 K 次」：初始 `text` 保留
+      // 「加载中…」，进度放在 `wait` 里由 messageNode 覆盖（见下面的 case 'loading'）。
       const placeholder = store.detailError
         ? []
-        : [{ kind: 'loading', key: 'm:loading', message: { text: '加载中…' }, at: 0 }];
+        : [{
+            kind: 'loading',
+            key: 'm:loading',
+            message: { text: '加载中…', wait: String(store.detailWaitText ?? '') },
+            at: 0,
+          }];
       chatList.set(placeholder, messageNode);
       updateOlderHint();
       if (perf !== undefined) perf.record('detail.paint', startedAt, { messages: 0 });
@@ -723,10 +745,34 @@ export function mountDetail(root, ctx) {
     composerHint.textContent = running ? 'DSH 正在执行，新消息会在当前轮结束后处理' : '发送后电脑端会继续这个会话';
   }
 
+  /**
+   * 详情读失败时的提示条：一句人话 + 两个出口。
+   *
+   * **必须独立于 `updateHeader()` 的早退**：旧实现把它写在"有任务就画标题"那个
+   * 分支里，于是深链直接进会话（`store.tasks` 里还没有这个 id）读失败时，
+   * 标题分支提前 return → 提示条永远不画 → 界面是**一片空白，既没有字也没有
+   * 按钮**，用户只能退出去。这正是"点进某个会话加载半天也没有内容"的最后一环：
+   * 请求确实失败了，但屏幕上什么都没说。
+   */
+  function paintNotice() {
+    noticeRow.replaceChildren();
+    if (!store.detailError) return;
+    // 按钮直接挂在 `.notice` 下（`app.css` 的 `.notice span { flex: 1 }` 只让文字
+    // 抢占剩余宽度；套一层 wrapper 会把 `.notice-action` 的样式和 flex 布局打乱）。
+    noticeRow.append(h('div', { class: 'notice danger' }, icon('alert', { size: 16 }),
+      h('span', { text: store.detailError }),
+      h('button', { class: 'notice-action', type: 'button', text: '重试', on: { click: () => ctx.reloadDetail() } }),
+      // 第二个出口：失败时最容易做的事是退回列表看别的，而不是跟这条请求死磕。
+      h('button', { class: 'notice-action', type: 'button', text: '返回列表', on: { click: () => ctx.navigate('/tasks') } })));
+  }
+
   function updateHeader() {
+    // 先画提示条：它不能依赖"标题里拿到了任务"（见 paintNotice 的注释）。
+    paintNotice();
     const task = store.detail?.task ?? (store.detailId !== null ? store.tasks.get(store.detailId) : undefined);
     if (task === undefined || task === null) {
       titleEl.textContent = '任务详情';
+      updateComposer();
       return;
     }
     titleEl.textContent = oneLine(task.title || '未命名任务', 120);
@@ -745,12 +791,6 @@ export function mountDetail(root, ctx) {
     if (task.turn) metaRow.append(pill('refresh', `第 ${task.turn} 轮`));
     if (task.status === 'error' && task.statusReason) metaRow.append(pill('alert', oneLine(task.statusReason, 60)));
 
-    noticeRow.replaceChildren();
-    if (store.detailError) {
-      noticeRow.append(h('div', { class: 'notice danger' }, icon('alert', { size: 16 }),
-        h('span', { text: store.detailError }),
-        h('button', { class: 'notice-action', type: 'button', text: '重试', on: { click: () => ctx.reloadDetail() } })));
-    }
     updateComposer();
   }
 

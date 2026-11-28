@@ -204,7 +204,10 @@ test('A6：分片表满时淘汰最旧半包（而不是丢掉新片），并立
   const accepted = relay.collectPart(partFrame('cccccccccccc', 0, 2, '{"id":'));
   assert.equal(accepted, null, '还没拼完');
   assert.equal(relay.parts.size, 8, '表大小仍受上限约束');
-  assert.equal(relay.partsDropped, 1, '被淘汰的半包要记进诊断');
+  // 诊断三件套：淘汰 = 这一组回包永远拼不齐，必须记账（旧实现只清不留痕）。
+  assert.equal(relay.parts.dropped, 1, '分片表自己要记下被迫淘汰的次数');
+  assert.equal(relay.stats.partsIncomplete, 1, '被淘汰的半包要记进诊断（快照里的 partsIncomplete）');
+  assert.equal(relay.partsStats().partsOpen, 8, '在途半包数要能读出（快照里的 partsOpen）');
   assert.ok(relay.stats.err >= 1);
 
   // 淘汰 = 那条大响应永远拼不齐：立刻按同一个 id 重发最老的在途请求
