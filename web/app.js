@@ -11,7 +11,7 @@
  */
 import './lib/sprite.js';
 import { $, empty, h, icon, raf } from './lib/dom.js';
-import { ApiError, Realtime, createApi } from './lib/net.js';
+import { ApiError, Realtime, WsTicketCache, createApi } from './lib/net.js';
 // 性能探针：必须在渲染代码之前加载，否则前几帧量不到。
 import './lib/perf.js';
 import { relTime } from './lib/format.js';
@@ -36,7 +36,7 @@ import { mountTasks } from './views/tasks.js';
 
 // 与 package.json / lib/util.mjs 的 PLUGIN_VERSION 三处必须一致
 // （test/domain/shell-realtime.test.mjs 会核对；漏改会让设置页显示旧版本号）。
-const APP_VERSION = '1.0.8';
+const APP_VERSION = '1.0.9';
 // 设置页要显示「前端版本」。它读的是 store，而 context 上的 appVersion 到不了那里，
 // 所以直接暴露一个全局值——比在 store 里再加一个字段更不容易被后续重构漏掉。
 globalThis.__POCKET_APP_VERSION__ = APP_VERSION;
@@ -74,6 +74,18 @@ const api = createApi({
     toast(message || '登录已失效，请重新用口令登录', { tone: 'danger' });
     signOut();
   },
+});
+
+/**
+ * 一次性实时票的缓存（`WsTicketCache`，见 `./lib/net.js` 里那段长注释）。
+ *
+ * 建一条隧道要两次串行往返：`POST /api/v1/ws-ticket` → 升级 `/ws`。票 60 s 有效、
+ * 用掉即作废，所以"开机预热一张、用掉立刻补下一张"能把息屏唤醒/切网之后的
+ * 「进入实时」从 2 次往返压到 1 次（实测 1275 ms → 629 ms，单向 300 ms）。
+ * 票仍然只来自电脑端、仍然短时效 + 一次性 —— 这里只是不当场现取。
+ */
+const tickets = new WsTicketCache({
+  fetchTicket: () => api('/api/v1/ws-ticket', { method: 'POST' }),
 });
 
 /* ---------------- connection banner ---------------- */
@@ -144,6 +156,10 @@ function startRealtime() {
   stopRealtime();
   if (store.session === null) return;
   lastBeatAt = Date.now();
+  // 开机就把票预热起来（与首屏的 detail 并发，不占额外往返）：隧道一旦要重建，
+  // 票已经在手上，只需一次 `/ws` 升级。用掉之后 `Realtime` 会再补下一张。
+  tickets.start();
+  void tickets.prewarm();
   realtime = new Realtime({
     api,
     getBase: () => baseUrl(),
@@ -151,6 +167,8 @@ function startRealtime() {
     // 中继外壳里禁止退回 SSE：中继只搬离散帧，SSE 那种长连接流一定拿不到。
     // 一旦回退，实时通道就永久死掉，用户只会看到"一直在重连"。
     allowSse: !isRelayShell(),
+    // 预热好的票：重建隧道时省掉"换票"那一次往返（见 `tickets` 的注释）。
+    tickets,
     onFrame,
     onBeat: () => { lastBeatAt = Date.now(); },
     onState: (state) => {
@@ -450,6 +468,9 @@ async function loadDetail(id, { silent = false } = {}) {
       ? data
       : { ...data, ...mergeTailInto(previous, data) };
     store.detailError = '';
+    // 首屏详情里顺带下发的实时票（服务端 `wsTicket`）：直接收进缓存 ——
+    // 这一次开隧道不必再单独跑一次 `POST /ws-ticket`。
+    tickets.offer(data?.wsTicket);
     if (data?.task) upsertTask(data.task, { repaint: false });
   } catch (error) {
     if (seq !== viewSeq || store.detailId !== id) return;
@@ -856,6 +877,8 @@ function repaint() { repaintScheduled(); }
 
 function signOut() {
   stopRealtime();
+  // 退登要把预热中的票一起清掉：那张票还是有效凭据，不该在这个页面里留着。
+  tickets.stop();
   saveSession(null);
   store.tasks = new Map();
   store.summary = { total: 0, running: 0, done: 0, error: 0, today: 0, subagents: 0 };

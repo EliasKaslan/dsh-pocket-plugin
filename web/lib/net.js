@@ -364,8 +364,22 @@ export function reconnectDelay(failures, { hidden = false, random = Math.random 
  * `onState` where state is one of: connecting | online | polling | offline.
  */
 export class Realtime {
-  constructor({ api, getBase, getToken, onFrame, onState, onError, onBeat, allowSse = true }) {
+  /**
+   * @param {object} options
+   * @param {object} [options.tickets] 票据缓存（本文件的 `WsTicketCache`）：
+   *   有它就走"预热好的一张票"（重建隧道时 0 次额外往返），没有就退回**每次现取**。
+   * @param {() => Promise<string|null>} [options.getTicket] 更小的注入点（单测用），
+   *   返回票字符串或 `null`。`tickets` 优先，其次 `getTicket`，都没有就现取。
+   */
+  constructor({ api, getBase, getToken, onFrame, onState, onError, onBeat, allowSse = true, tickets = null, getTicket = null }) {
     this.api = api;
+    /**
+     * 票据缓存。**建隧道要两次串行往返**（换票 → 升级），其中换票那一次在重建时
+     * 完全可以省掉：票 60 s 有效、用掉即作废（见 `ws-ticket.js` 的长注释）。
+     * 这里只负责"给我一张票"，预热/刷新/一次性都在缓存里做。
+     */
+    this.tickets = tickets;
+    this.getTicket = getTicket;
     /**
      * 是否允许在 WebSocket 连续失败后退回 SSE 轮询。
      *
@@ -480,6 +494,28 @@ export class Realtime {
     void this.connect({ force: true });
   }
 
+  /**
+   * 取一张一次性票据。
+   *
+   * 优先用预热好的缓存（0 次额外往返）；没有缓存（老调用方/单测）就现取 —— 这是
+   * 原来唯一的那条路，行为完全不变。
+   *
+   * @returns {Promise<string>} 票字符串
+   */
+  async reserveTicket() {
+    let ticket = null;
+    if (this.tickets !== null && this.tickets !== undefined && typeof this.tickets.take === 'function') {
+      ticket = await this.tickets.take();
+    } else if (typeof this.getTicket === 'function') {
+      ticket = await this.getTicket();
+    } else {
+      const payload = await this.api('/api/v1/ws-ticket', { method: 'POST' });
+      ticket = typeof payload?.ticket === 'string' ? payload.ticket : null;
+    }
+    if (typeof ticket !== 'string' || ticket.length === 0) throw new ApiError('无法获取实时连接票据');
+    return ticket;
+  }
+
   async connect(options) {
     if (this.stopped) { console.debug('[pocket-diag] connect skipped: stopped'); return; }
     // 防重入：这个函数一进来就 teardown()，多调一次就等于把**健康**的隧道拆掉重开。
@@ -503,14 +539,11 @@ export class Realtime {
       return;
     }
     try {
-      const ticket = await this.api('/api/v1/ws-ticket', { method: 'POST' });
+      const ticket = await this.reserveTicket();
       if (this.stopped || this.generation !== generation) return;
-      if (typeof ticket?.ticket !== 'string' || ticket.ticket.length === 0) {
-        throw new ApiError('无法获取实时连接票据');
-      }
       const base = normalizeBase(this.getBase()).replace(/^http/iu, 'ws');
       const since = this.bootId || this.lastSeq > 0 ? `&since=${this.lastSeq}&boot=${encodeURIComponent(this.bootId)}` : '';
-      const socket = new WebSocket(`${base}/ws?ticket=${encodeURIComponent(ticket.ticket)}${since}`);
+      const socket = new WebSocket(`${base}/ws?ticket=${encodeURIComponent(ticket)}${since}`);
       this.socket = socket;
       // 连接超时：到点还没 open 就当作一次失败重来，绝不让状态吊在 connecting。
       this.connectStartedAt = Date.now();
@@ -532,6 +565,9 @@ export class Realtime {
         this.lastPong = Date.now();
         this.setState('online');
         this.startPing();
+        // 手里那张票已经用掉了：**后台**补下一张（票 60 s 有效，下一次重建就有货）。
+        // 这是条后台请求，不挡任何界面；失败只是下次重建多跑一次往返。
+        try { void this.tickets?.prewarm?.(); } catch { /* 缓存没装或已停 */ }
       };
       socket.onmessage = (event) => {
         if (this.socket !== socket || this.stopped) return;
@@ -642,5 +678,308 @@ export class Realtime {
       this.reconnectTimer = null;
       if (!this.stopped) void this.connect();
     }, delay);
+  }
+}
+
+/* ---------------------- 实时票的本地缓存（预热） ---------------------- */
+
+/**
+ * 建一条实时隧道要**两次串行往返**：先 `POST /api/v1/ws-ticket` 换票，再拿票去
+ * 升级 `/ws`。单向 300 ms（RTT ≈ 600 ms）下的实测（`test/support/bench-harness.mjs`，
+ * 真 CloudLink + 真 relay-client + 真 `ws.open`）：换票 p50 **648 ms**、升级 p50
+ * **632 ms**，即「息屏唤醒 / 切网之后重新进入实时」= **1275 ms**。
+ *
+ * 而票的有效期是 60 s（`lib/core.mjs` 的 `createWsTicket()`），重建之间的间隔通常
+ * 远小于 60 s —— 那就没必要每次都现取：**开机预热一张，用掉立刻补下一张**，重建时
+ * 票已在手上，只剩一次升级（实测同一口径 **629 ms**，省一次往返 ≈ 646 ms）。
+ * 首屏 detail 的应答里也会顺带下发一张（`wsTicket` 字段），`offer()` 直接收下即可。
+ *
+ * 安全边界（一个字都不许放宽）
+ * ---------------------------
+ * - 票**只**来自电脑端应答：`POST /api/v1/ws-ticket`，或首屏 detail 里那张
+ *   （两边是同一个 `createWsTicket()`，同一份 60 s TTL）；
+ * - **一次性**：`take()` 出票即从缓存删除，同一张票绝不会被发第二次 —— 电脑端
+ *   `consumeWsTicket()` 用过就删，缓存里留着再用只会拿一张死票去撞 401；
+ * - **快过期就不用**：离过期不足 `TICKET_SAFETY_MS` 的票一律丢弃重取，绝不把
+ *   "送到时已过期"的票塞进握手；没有 `expiresAt` 的票按过期处理（宁可多跑一次往返）；
+ * - 只做**内存**缓存：不写 storage、不进日志，票也不会出现在 URL 之外的地方
+ *   （握手 URL 里的 `?ticket=` 是原有协议，没改）。
+ *
+ * 缓存逻辑放在这里（而不是新开 `web/lib/*.js`）：`web/sw.js` 的离线预缓存清单要
+ * 与 `web/**` 的 import 图严格一致，新增文件就得改 SW（本次不在可改范围）。
+ */
+
+/** 出票安全余量：离过期不到这么久就不用它（≈ 一次往返 + 抖动）。 */
+export const TICKET_SAFETY_MS = 10_000;
+/** 在"过期 - 安全余量"的这个比例处补下一张（60 s 的票大约每 25 s 补一次）。 */
+export const TICKET_REFRESH_RATIO = 0.5;
+/** 取票失败后的重试间隔（后台补票，不打扰用户）。 */
+export const TICKET_RETRY_MS = 5_000;
+
+/** 把应答（`{ticket, expiresAt}`）归一成缓存条目；不合法就 `null`。 */
+function ticketEntry(payload) {
+  if (payload === null || typeof payload !== 'object') return null;
+  const ticket = typeof payload.ticket === 'string' ? payload.ticket : '';
+  const expiresAt = Number(payload.expiresAt);
+  if (ticket.length === 0) return null;
+  if (!Number.isFinite(expiresAt) || expiresAt <= 0) return null;
+  return { ticket, expiresAt };
+}
+
+/**
+ * 一次性实时票的缓存：**预热 + 按过期刷新 + 出票即作废**。
+ *
+ * `Realtime` 只问它要一张票（`take()`），握手路径不需要知道预热细节；这样预热
+ * 逻辑能注入时钟与定时器单测（`test/unit/ws-ticket.test.mjs`）。
+ */
+export class WsTicketCache {
+  #fetchTicket;
+  #now;
+  #safetyMs;
+  #refreshRatio;
+  #retryMs;
+  #setTimer;
+  #clearTimer;
+  #onError;
+
+  /** 当前备着的那张票（最多一张）。 */
+  #current = null;
+  /**
+   * 最近发出去过的票（只留 16 条、不含票内容以外的东西）。
+   *
+   * 为什么还要记这个：电脑端的**重放缓存**按 request id 回放整份应答 —— 一条
+   * 已经送达、票也已经用掉的 detail 若因故被同 id 重放一次，票又会被 `offer()`
+   * 收进来第二次。拿这张死票去握手只会白吃一次 401，所以出过手的票一律不许再进缓存。
+   */
+  #spent = new Set();
+  /** 单飞：同一时刻最多一条取票请求在飞（开机预热与 connect 会同时要票）。 */
+  #inflight = null;
+  #timer = null;
+  #stopped = false;
+  /** 串行化 `take()`：两次并发取票绝不能拿到同一张。 */
+  #chain = Promise.resolve();
+  #fetches = 0;
+
+  /**
+   * @param {object} options
+   * @param {() => Promise<{ticket?: string, expiresAt?: number}|null>} options.fetchTicket
+   *   真的去电脑端换票（一般是 `api('/api/v1/ws-ticket', { method: 'POST' })`）。
+   * @param {() => number} [options.now]        时钟（单测注入）。
+   * @param {number} [options.safetyMs]         出票安全余量。
+   * @param {number} [options.refreshRatio]     刷新点（相对"过期 - 余量"的比例）。
+   * @param {number} [options.retryMs]          取票失败后的重试间隔。
+   * @param {(fn: () => void, ms: number) => any} [options.setTimer]
+   * @param {(id: any) => void} [options.clearTimer]
+   * @param {(error: Error) => void} [options.onError] 取票失败（后台预热失败不该抛给界面）。
+   */
+  constructor({
+    fetchTicket,
+    now = () => Date.now(),
+    safetyMs = TICKET_SAFETY_MS,
+    refreshRatio = TICKET_REFRESH_RATIO,
+    retryMs = TICKET_RETRY_MS,
+    setTimer = (fn, ms) => setTimeout(fn, ms),
+    clearTimer = (id) => clearTimeout(id),
+    onError = () => {},
+  } = {}) {
+    if (typeof fetchTicket !== 'function') throw new TypeError('WsTicketCache 需要 fetchTicket()');
+    this.#fetchTicket = fetchTicket;
+    this.#now = now;
+    this.#safetyMs = Math.max(0, Number(safetyMs) || 0);
+    this.#refreshRatio = Math.min(0.9, Math.max(0.1, Number(refreshRatio) || TICKET_REFRESH_RATIO));
+    this.#retryMs = Math.max(1, Number(retryMs) || TICKET_RETRY_MS);
+    this.#setTimer = setTimer;
+    this.#clearTimer = clearTimer;
+    this.#onError = onError;
+  }
+
+  /** 诊断/单测用：缓存里有没有票、取过几次票。**不含票本身**。 */
+  get stats() {
+    return {
+      cached: this.#current !== null,
+      inflight: this.#inflight !== null,
+      fetches: this.#fetches,
+      stopped: this.#stopped,
+    };
+  }
+
+  /**
+   * 预热：缓存里没有**可用**的票时才去取一张，取到后按过期时间排一次刷新。
+   * 失败不抛（后台预热不该把界面搞坏）：走 `onError`，并按 `retryMs` 再试。
+   *
+   * @returns {Promise<boolean>} 现在手里有票吗
+   */
+  async prewarm() {
+    if (this.#stopped) return false;
+    const current = this.#current;
+    if (this.#usable(current)) {
+      // 手里有票：只把"该补下一张的时刻"重新校准一下（幂等），不白跑往返。
+      this.#scheduleRefresh(current);
+      return true;
+    }
+    if (current !== null) this.#current = null;
+    return this.#refreshOnce();
+  }
+
+  /**
+   * 取一张票（**用掉就没了**）。
+   *
+   * @returns {Promise<string|null>} 票字符串；取不到返回 `null`（调用方按"无法获取票据"处理）。
+   */
+  take() {
+    const run = this.#chain.then(() => this.#takeOnce());
+    // 链本身永远 resolve：一次失败不该把后续所有取票都带崩。
+    this.#chain = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /**
+   * 票随别的应答一起回来了（首屏 `GET /api/v1/tasks/:id` 的 `wsTicket`）：
+   * 直接收进缓存，**不额外跑一次往返**。
+   *
+   * @param {{ticket?: string, expiresAt?: number}|null|undefined} payload
+   * @returns {boolean} 收下了吗
+   */
+  offer(payload) {
+    if (this.#stopped) return false;
+    const entry = ticketEntry(payload);
+    if (entry === null) return false;
+    if (this.#now() + this.#safetyMs >= entry.expiresAt) return false;
+    // 这张已经用过了（同一条 detail 应答被重放一次就会这样）：收下只会变成死票。
+    if (this.#spent.has(entry.ticket)) return false;
+    const current = this.#current;
+    // 手里已经有一张更耐放的票就别换（换掉只是白丢一张好票）。
+    if (current !== null && this.#usable(current) && current.expiresAt >= entry.expiresAt) return false;
+    this.#current = entry;
+    this.#scheduleRefresh(entry);
+    return true;
+  }
+
+  /** 重新开始缓存（换设备 / 重新配对之后 `startRealtime()` 会调）。 */
+  start() {
+    this.#stopped = false;
+  }
+
+  /** 停掉后台刷新并丢掉缓存（退登 / 解除配对时调）。 */
+  stop() {
+    this.#stopped = true;
+    this.#cancel();
+    this.#current = null;
+  }
+
+  /* ------------------------------ 内部实现 ------------------------------ */
+
+  async #takeOnce() {
+    if (this.#stopped) return null;
+    const entry = await this.#ensure();
+    if (entry === null) return null;
+    // 出票即作废：电脑端一用就删，缓存留着再用只会拿一张死票去握手。
+    if (this.#current === entry) this.#current = null;
+    this.#cancel();
+    this.#remember(entry.ticket);
+    return entry.ticket;
+  }
+
+  /** 记下发过手的票（只留最近 16 条：够挡住重放，不会长成账本）。 */
+  #remember(ticket) {
+    this.#spent.add(ticket);
+    while (this.#spent.size > 16) {
+      const oldest = this.#spent.values().next().value;
+      if (oldest === undefined) break;
+      this.#spent.delete(oldest);
+    }
+  }
+
+  /** 有可用票就用它，否则取一张新的（取不到返回 null）。 */
+  async #ensure() {
+    const current = this.#current;
+    if (this.#usable(current)) return current;
+    if (current !== null) this.#current = null;
+    return this.#load();
+  }
+
+  /**
+   * 强制换一张新票（定时刷新与失败重试走这条）。
+   *
+   * 与 `#ensure()` 的区别：**不**看手里那张还能不能用 —— 刷新点的意义就是"在旧票
+   * 变成不能用之前先备好新的"，走 ensure 会看到旧票还能用、然后什么都不做，
+   * 缓存里的票就一路烂到过期（等于没预热）。
+   */
+  async #refreshOnce() {
+    const entry = await this.#load();
+    if (entry === null) {
+      this.#scheduleRetry();
+      return false;
+    }
+    this.#scheduleRefresh(entry);
+    return true;
+  }
+
+  #usable(entry) {
+    if (entry === null || entry === undefined) return false;
+    if (typeof entry.ticket !== 'string' || entry.ticket.length === 0) return false;
+    // 已经出过手的票不许再被当成可用的（重放缓存会把同一条应答再放一遍）。
+    if (this.#spent.has(entry.ticket)) return false;
+    const left = Number(entry.expiresAt) - this.#now();
+    return Number.isFinite(left) && left > this.#safetyMs;
+  }
+
+  /** 单飞取票：并发调用共享同一个 Promise，绝不因为并发多跑一次往返。 */
+  #load() {
+    if (this.#inflight !== null) return this.#inflight;
+    const promise = Promise.resolve()
+      .then(() => {
+        this.#fetches += 1;
+        return this.#fetchTicket();
+      })
+      .then((payload) => {
+        const entry = ticketEntry(payload);
+        // 应答里没有票：当作失败，别把 undefined 当票塞进握手 URL。
+        if (entry === null) throw new Error('取票应答里没有可用的 ticket/expiresAt');
+        // 重放回来的旧应答：当成一次失败（下一次重试会拿到一张新的）。
+        if (this.#spent.has(entry.ticket)) throw new Error('取票应答里是一张已经用过的票');
+        if (this.#stopped) return null;
+        this.#current = entry;
+        return entry;
+      })
+      .catch((error) => {
+        this.#onError(error instanceof Error ? error : new Error(String(error)));
+        return null;
+      })
+      .finally(() => { this.#inflight = null; });
+    this.#inflight = promise;
+    return promise;
+  }
+
+  /** 在"过期 - 余量"的一半处补一张新的：缓存里的票永远不会烂到不能用。 */
+  #scheduleRefresh(entry) {
+    this.#cancel();
+    if (this.#stopped) return;
+    const left = entry.expiresAt - this.#now() - this.#safetyMs;
+    if (!(left > 0)) return;
+    const delay = Math.max(1_000, Math.round(left * this.#refreshRatio));
+    this.#arm(() => { void this.#refreshOnce(); }, delay);
+  }
+
+  #scheduleRetry() {
+    this.#cancel();
+    if (this.#stopped) return;
+    this.#arm(() => { void this.#refreshOnce(); }, this.#retryMs);
+  }
+
+  #arm(fn, delay) {
+    this.#timer = this.#setTimer(() => {
+      this.#timer = null;
+      if (this.#stopped) return;
+      fn();
+    }, delay);
+    // 定时器不该把 Node 进程拴住（测试进程会因此不退）。
+    try { this.#timer?.unref?.(); } catch { /* 浏览器没有 unref */ }
+  }
+
+  #cancel() {
+    if (this.#timer === null) return;
+    this.#clearTimer(this.#timer);
+    this.#timer = null;
   }
 }
