@@ -196,7 +196,18 @@ test('配对页：中继设备不给「移除」按钮（它是本机凭据，�
   assert.ok(relayAt > 0 && buttonAt > relayAt, '「移除」按钮必须出现在 isRelay 判断之后（即中继设备走不到它）');
 
   // 前端刷新
+  //
+  // 判据跟着实现走：设备行的"是不是中继"在 `web/lib/pair-diff.js` 的行模型里算
+  // （`const relay = source.localRelay === true`），`web/pair.js` 拿到 `model.relay`
+  // 后走 tag 分支、根本不创建「移除」按钮。所以这里断言**两处接线**，而不是钉某一行
+  // 源码字符串——行模型已经抽成可 import 的模块，钉字符串会让合法重构变红。
+  const diff = read('web/lib/pair-diff.js');
+  assert.match(diff, /const relay = source\.localRelay === true/u, '前端行模型要识别中继设备');
+  assert.match(diff, /relay,/u, '行模型要把 relay 标志交给渲染层');
   const js = read('web/pair.js');
-  assert.match(js, /const isRelay = device\.localRelay === true/u, '前端刷新也要识别');
-  assert.match(js, /本机 · 不可移除/u);
+  assert.match(js, /model\.relay \? 'tag' : 'revoke'/u, '中继行走 tag 分支（不创建移除按钮）');
+  assert.match(js, /本机 · 不可移除/u, '要给出不可移除的说明');
+  const branchAt = js.indexOf('if (model.relay) {');
+  const frontButtonAt = js.indexOf("document.createElement('button')");
+  assert.ok(branchAt > 0 && frontButtonAt > branchAt, '「移除」按钮必须出现在 model.relay 分支之后（中继设备走不到它）');
 });

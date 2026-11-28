@@ -167,6 +167,103 @@ test('R2b：第一份还在执行时收到同 id 重发（30 s 超时场景）�
   }
 });
 
+test('D2：同键等待有上界 —— 默认 32 s（有限、且明显大于中继的 30 s 超时）', () => {
+  const wait = ctx.server.idempotentWaitMs;
+  assert.equal(typeof wait, 'number', '等待上限必须是可读的数字');
+  assert.ok(
+    Number.isFinite(wait) && wait >= 30_000 && wait <= 120_000,
+    `同键重发最多等第一份多久必须有上界（且要大于中继 30 s 的 requestTimeout，否则会先被自己的超时打断），实际 ${wait}`,
+  );
+});
+
+test('D2：第一份永久不返回时，第二份也在上限内拿到明确结果（不是永久挂起）', async () => {
+  const taskId = (await postTask('pocket-hang')).json.data.task.id;
+  const agent = ctx.fakes.agents.get(taskId);
+  assert.notEqual(agent, undefined);
+
+  const originalPrompt = ctx.core.index.promptTask.bind(ctx.core.index);
+  const originalWait = ctx.server.idempotentWaitMs;
+  const waitTimeoutsBefore = ctx.server.idempotentWaitTimeouts;
+  // 32 s 的缩微版：这条用例要证明的是「有超时 + 超时后给出明确答复」，不是等满 32 s。
+  ctx.server.idempotentWaitMs = 150;
+
+  let releaseFirst;
+  const gate = new Promise((resolve) => { releaseFirst = resolve; });
+  let calls = 0;
+  ctx.core.index.promptTask = async (id, prompt, options) => {
+    calls += 1;
+    await gate; // 第一份挂在这里（模拟宿主 agents.create / followup 永不返回）
+    return originalPrompt(id, prompt, options);
+  };
+  try {
+    const prompt = () => requestJson(ctx.port, `/api/v1/tasks/${taskId}/prompt`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+        [HEADER]: 'pocket-hang-prompt',
+      },
+      body: JSON.stringify({ prompt: '永不返回的 prompt' }),
+    });
+
+    const first = prompt(); // 永不 settle，直到 releaseFirst()
+    await delay(120);
+    assert.equal(ctx.server.idempotentPending.size, 1, '第一份在执行期间必须占着同键占位');
+
+    const startedAt = Date.now();
+    const second = await prompt();
+    const elapsed = Date.now() - startedAt;
+
+    assert.equal(second.status, 503, `第二份必须有明确结果，实际 ${second.status}：${second.body.slice(0, 160)}`);
+    assert.equal(second.json.ok, false);
+    assert.equal(second.json.error.code, 'in-progress', '要能区分于「重复执行被抑制」（409 duplicate-suppressed）');
+    assert.equal(second.json.error.retryable, true, '结果未知但可重试，手机端才有重试依据');
+    assert.equal(second.headers['retry-after'], '1', 'HTTP 语义上的 retry-after 也要给');
+    assert.ok(elapsed >= 100 && elapsed < 5000, `第二份必须在上限量级返回（旧代码永久挂起），实际 ${elapsed}ms`);
+    assert.equal(calls, 1, '等待期间绝不许并行执行第二遍（否则副作用做两次）');
+    assert.equal(ctx.server.idempotentWaitTimeouts, waitTimeoutsBefore + 1, '超时要计数，线上才看得出这层在兜底');
+
+    // 收尾：让第一份真的执行完，证明「第二份只是等待超时，第一份仍然有效」。
+    releaseFirst();
+    const settled = await first;
+    assert.equal(settled.status, 200, '第一份自己的结果不受第二份超时影响');
+    assert.equal(ctx.server.idempotentPending.size, 0, '第一份结束后同键占位必须清掉');
+
+    // 第一份已经落库的响应能被同 id 回放 —— 手机丢了那条 503 之后再重试也不会重做副作用。
+    const callsBeforeReplay = calls;
+    const replay = await prompt();
+    assert.equal(replay.status, 200);
+    assert.equal(replay.body, settled.body, '第一份完成之后同 id 必须回放它的响应');
+    assert.equal(calls, callsBeforeReplay, '回放不许再执行一次业务函数');
+  } finally {
+    releaseFirst();
+    ctx.core.index.promptTask = originalPrompt;
+    ctx.server.idempotentWaitMs = originalWait;
+  }
+});
+
+test('D2：sweepIdempotent 回收孤儿的在途占位（第一份永远不返回时的兜底）', () => {
+  const staleKey = BridgeServer.idempotencyKey('POST', '/api/v1/tasks', 'pocket-orphan', 'Bearer x');
+  const freshKey = BridgeServer.idempotencyKey('POST', '/api/v1/tasks', 'pocket-orphan-fresh', 'Bearer x');
+  const never = new Promise(() => {});
+  ctx.server.idempotentPending.set(staleKey, { promise: never, at: Date.now() - 11 * 60_000 });
+  ctx.server.idempotentPending.set(freshKey, { promise: never, at: Date.now() });
+  const evictionsBefore = ctx.server.idempotentPendingEvictions;
+  try {
+    ctx.server.sweepIdempotent();
+    assert.equal(
+      ctx.server.idempotentPending.has(staleKey),
+      false,
+      '超过上界的孤儿占位必须被回收，否则这个 key 之后所有同键请求都只能等到超时拿 503',
+    );
+    assert.equal(ctx.server.idempotentPending.has(freshKey), true, '保鲜期内的占位不许动（那可能是在跑的第一份）');
+    assert.equal(ctx.server.idempotentPendingEvictions, evictionsBefore + 1, '回收要计数');
+  } finally {
+    ctx.server.idempotentPending.delete(staleKey);
+    ctx.server.idempotentPending.delete(freshKey);
+  }
+});
+
 test('R2b 缓存上限：TTL 过了就重新执行；条数 ≤128；单条 >1 MiB 不缓存；总字节有界', async () => {
   // ① TTL：把条目时间戳推到 120 s 之外，sweep 之后同 id 必须重新执行。
   const before = ctx.server.idempotent.size;

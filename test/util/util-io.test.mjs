@@ -247,6 +247,8 @@ test('FileLogger：行格式、级别、Error/循环对象的序列化、镜像�
   logger.info('启动完成', { port: 47901 });
   logger.warn('重连中');
   logger.error(new Error('boom'));
+  // 批量落盘之后，磁盘上的内容由 flush() 决定（8 KB / 200 ms 两个触发点）。
+  logger.flush();
   const text = readFileSync(file, 'utf8');
   const lines = text.split('\n').filter((line) => line.length > 0);
   assert.equal(lines.length >= 3, true);
@@ -258,18 +260,75 @@ test('FileLogger：行格式、级别、Error/循环对象的序列化、镜像�
   const circular = {};
   circular.self = circular;
   logger.info(circular);
+  logger.flush();
   assert.match(readFileSync(file, 'utf8'), /\[object Object\]/u, '循环引用不能把 logger 自己搞崩');
 
   const quiet = new FileLogger(path.join(dir, 'logs', 'quiet.log'), { mirror: false });
   quiet.info('只落盘');
+  quiet.flush();
   assert.equal(readFileSync(path.join(dir, 'logs', 'quiet.log'), 'utf8').includes('只落盘'), true);
+});
+
+/*
+ * 热路径性能闸（P2）：旧实现每行 4 次同步系统调用（statSync + openSync +
+ * writeFileSync + closeSync），实测 109.2 µs/行；详情接口一次固定 2 行 ⇒
+ * 218 µs 纯阻塞。改成"内存缓冲 + 8 KB / 200 ms 落盘"之后，statSync（轮转判断）
+ * 每 30 s 最多一次。这里用可注入的 `io.stat` 数字调用次数。
+ */
+test('FileLogger：20 行只 statSync ≤2 次、缓冲未满不落盘、flush 后内容完整', () => {
+  const file = path.join(dir, 'batch', 'b.log');
+  let stats = 0;
+  const logger = new FileLogger(file, {
+    mirror: false,
+    io: {
+      stat: (target) => {
+        stats += 1;
+        return statSync(target);
+      },
+    },
+  });
+  assert.equal(stats, 1, '构造时读一次体积（轮转基线），之后 30 s 内不再 stat');
+
+  for (let index = 0; index < 20; index += 1) logger.info(`第 ${index} 行`);
+  assert.equal(statSync(file).size, 0, '缓冲未满（8 KB）且未到 200 ms：一行都不许落盘');
+  assert.ok(stats <= 2, `20 行必须 ≤2 次 statSync，实际 ${stats} 次`);
+
+  logger.flush();
+  assert.ok(stats <= 2, `flush 也不能退化成每行一次 stat，实际 ${stats} 次`);
+  const text = readFileSync(file, 'utf8');
+  const lines = text.split('\n').filter((line) => line.length > 0);
+  assert.equal(lines.length, 20, 'flush 之后 20 行必须完整');
+  assert.match(lines[0], /第 0 行$/u);
+  assert.match(lines[19], /第 19 行$/u);
+  assert.equal(logger.buffer, '', 'flush 必须清空缓冲，否则同一行会落两次');
+  assert.equal(logger.bufferBytes, 0);
+});
+
+test('FileLogger：攒够 8 KB 自动落盘、缓冲未满时 200 ms 兜底落盘', async () => {
+  const file = path.join(dir, 'size', 's.log');
+  const logger = new FileLogger(file, { mirror: false });
+  // 每行约 60 字节：150 行 ≈ 9 KB，越过 8 KB 阈值会自己落盘（不必 flush）。
+  for (let index = 0; index < 150; index += 1) logger.info(`凑字节 ${index} ${'x'.repeat(40)}`);
+  assert.ok(statSync(file).size >= 4096, `攒够 8 KB 必须自动落盘，实际 ${statSync(file).size} B`);
+
+  const timerFile = path.join(dir, 'timer', 't.log');
+  const timerLogger = new FileLogger(timerFile, { mirror: false });
+  timerLogger.info('定时器兜底');
+  assert.equal(statSync(timerFile).size, 0, '一行远不到 8 KB：立即读盘必须是空的');
+  await new Promise((resolve) => { setTimeout(resolve, 260); });
+  assert.match(readFileSync(timerFile, 'utf8'), /定时器兜底/u, '200 ms 后必须自己落盘，不能永远等 flush');
+  timerLogger.dispose();
 });
 
 test('FileLogger：超过 maxBytes 轮转成 .1，新文件从当行重新开始', () => {
   const file = path.join(dir, 'rotate', 'r.log');
   const logger = new FileLogger(file, { maxBytes: 1, mirror: false });
   logger.info('第一行');
+  logger.flush();
+  assert.match(readFileSync(file, 'utf8'), /第一行/u, '第一行先落进当前文件');
   logger.info('第二行');
+  // 第二次落盘前体积（内存镜像）已超 maxBytes 1 B ⇒ 必须先轮转。
+  logger.flush();
   assert.equal(statSync(`${file}.1`).isFile(), true, '第二行写入前应先轮转');
   assert.match(readFileSync(`${file}.1`, 'utf8'), /第一行/u);
   const current = readFileSync(file, 'utf8');

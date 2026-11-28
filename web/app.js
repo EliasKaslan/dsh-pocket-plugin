@@ -21,6 +21,8 @@ import { parseShellBuild, shellCacheBuilds, staleShellBuilds } from './lib/shell
 import { DETAIL_TIMEOUT_MS, detailFailureText, waitText } from './lib/rpc-budget.js';
 // 解除配对要清的外壳侧键名。
 import { unpairStorageKeys } from './lib/shell-session.js';
+// 相对时间戳的刷新计划（纯函数：只返回"这一拍真的要写"的节点，单测直接 import）。
+import { isNodeVisible, planRelativeTimeUpdates } from './lib/ts-refresh.js';
 import { toast } from './lib/ui.js';
 import {
   LIMITS, applyTheme, baseUrl, clearCache, isRelayShell, loadCache, loadPrefs, loadSession,
@@ -34,7 +36,7 @@ import { mountTasks } from './views/tasks.js';
 
 // 与 package.json / lib/util.mjs 的 PLUGIN_VERSION 三处必须一致
 // （test/domain/shell-realtime.test.mjs 会核对；漏改会让设置页显示旧版本号）。
-const APP_VERSION = '1.0.7';
+const APP_VERSION = '1.0.8';
 // 设置页要显示「前端版本」。它读的是 store，而 context 上的 appVersion 到不了那里，
 // 所以直接暴露一个全局值——比在 store 里再加一个字段更不容易被后续重构漏掉。
 globalThis.__POCKET_APP_VERSION__ = APP_VERSION;
@@ -55,6 +57,13 @@ let detailTimer = null;
 let pollTimer = null;
 let lastFrameAt = 0;
 const tasksCache = new Map();
+/**
+ * 「上一次真正写进 DOM 的相对时间文案」：node -> text（D3）。
+ *
+ * 每 30 s 的刷新只写值变了的节点；这张表就是判据。它是普通 Map，但每拍都会被
+ * `plan.next` 整表替换（只含当前还在文档里的节点），所以任务增删不会让它只增不减。
+ */
+let renderedTimestamps = new Map();
 
 /* ---------------- api ---------------- */
 
@@ -894,10 +903,16 @@ function startTimers() {
 
   setInterval(() => {
     if (document.visibilityState !== 'visible') return;
+    // D3：以前这里对每个 `[data-ts]` 节点**无条件**写 textContent（5000 项任务列表
+    // 每 30 s 全量重写一次）。现在只写"文案真的变了"的节点，并跳过看不见的节点；
+    // 判断逻辑在 lib/ts-refresh.js（纯函数，单测覆盖），这里只负责取节点与赋值。
+    const nodes = [];
     for (const node of document.querySelectorAll('[data-ts]')) {
-      const ts = Number(node.dataset.ts);
-      if (ts > 0) node.textContent = relTime(ts);
+      nodes.push({ node, ts: Number(node.dataset.ts), visible: isNodeVisible(node) });
     }
+    const plan = planRelativeTimeUpdates(nodes, renderedTimestamps, relTime);
+    for (const { node, text } of plan.writes) node.textContent = text;
+    renderedTimestamps = plan.next;
   }, 30_000);
 
   document.addEventListener('visibilitychange', () => {
