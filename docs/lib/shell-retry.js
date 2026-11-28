@@ -52,6 +52,30 @@ export const HEARTBEAT_MS = 8_000;
  */
 export const WAKE_SILENT_MS = 2 * HEARTBEAT_MS;
 
+/**
+ * 「**有请求在途** + 下行静默」⇒ 立刻重建链路的阈值（外壳看门狗每 2 s 一拍）。
+ *
+ * 为什么必须有这条（这一版事故的直接原因，别删）：
+ *   - 单条请求的**绝对**预算是 `rpcBudgetMs(4, 8_000)` = 15 200 ms（见 `./rpc-budget.js`），
+ *     到点就抛 `relay_timeout`，而 `web/lib/net.js` 把它当"外壳已给结论"的不可重试失败；
+ *   - 而原来的看门狗只认 `PC_STALE_MS`（26 s）——**15.2 s < 26 s**，于是每一次
+ *     "上行通、下行半死"都必然是请求先烧完预算报「中继请求超时」，本该救它的链路
+ *     重建要再等 10.8 s 才发生（之后还有 15 s 冷却）。现场就是这样：桌面 8~30 ms
+ *     就答完了、`nackRepairs=0`，手机却报超时，用户只能手点重试。
+ *
+ * 取"约一个心跳周期"的理由：桌面每 8 s 一条 beat，所以「10 s 没有任何下行帧」在
+ * 半死链路上是明确信号；而**正常但慢**的请求（冷会话构建实测可达 4.4 s）期间 beat
+ * 照旧每 8 s 到达、`lastRxAt` 一直新鲜，这条规则**永远不会命中** —— 这是它不误伤
+ * 慢请求的前提，写在这里免得下一个人把阈值调小。
+ *
+ * 它必须**小于** `rpcWorstCaseMs()`：否则重建永远晚于请求判死，等于没修
+ * （关系由 `test/unit/shell-stall-rebuild.test.mjs` 钉住）。
+ *
+ * 外壳里同值的那份是一个数字字面量（`remote/remote.js` 的 `RPC_STALL_REBUILD_MS`）：
+ * 看门狗的行为用例按名字把常量切进 vm 沙箱里跑，两边同值由用例逐字段比对。
+ */
+export const RPC_STALL_REBUILD_MS = 10_000;
+
 /** 第 `attempt` 次失败后该等多久（attempt 从 1 开始）；没有下一次就返回 null。 */
 export function connectRetryDelay(attempt) {
   const index = Number(attempt);

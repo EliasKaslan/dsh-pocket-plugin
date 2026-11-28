@@ -95,3 +95,34 @@ test('失败文案必须可操作：要么重试，要么返回列表，不能�
   // 用户自己取消的，别再劝他重试。
   assert.equal(detailFailureText({ message: 'x', code: 'aborted' }), '已取消读取这个会话。');
 });
+
+test('F3：relay_timeout 要分出「链路刚重建过、正在/已经自动重试」与「电脑端没响应」', () => {
+  const shellText = '中继请求超时（电脑端已按同一请求重放，回包没送到手机）';
+
+  // ① 链路没重建过：这是"电脑端没响应 / 回包丢了"，文案必须点出电脑端，
+  //    否则用户只会去查自己的网络（现场就是这样被带偏的）。
+  const noRebuild = detailFailureText({ message: shellText, code: 'relay_timeout' });
+  assert.match(noRebuild, /电脑端没有响应/u);
+  assert.match(noRebuild, /回包没送到手机/u, '外壳给的真实原因仍要透出来');
+  assert.match(noRebuild, /重试/u);
+  assert.match(noRebuild, /返回列表/u, '两个出口一个都不能少');
+
+  // ② 链路刚重建过、自动重试还在路上：不能再说"电脑端没响应"（用户什么都做不了），
+  //    要说出"刚重建过 / 正在自动重试"。
+  const rebuilding = detailFailureText({ message: shellText, code: 'relay_timeout', rebuilt: true });
+  assert.match(rebuilding, /链路刚重建过/u);
+  assert.match(rebuilding, /正在自动重试/u);
+  assert.equal(/电脑端没有响应/u.test(rebuilding), false, '重建过就不该把锅甩给电脑端');
+  assert.notEqual(rebuilding, noRebuild, '两种现场必须是两句不同的话');
+
+  // ③ 已经补过一次、仍然失败：说清"补过了"，用户才知道再点一次是有意义的。
+  const retried = detailFailureText({ message: shellText, code: 'relay_timeout', rebuilt: true, retried: true });
+  assert.match(retried, /已自动重试 1 次/u);
+  assert.match(retried, /重试/u);
+  assert.match(retried, /返回列表/u);
+
+  // ④ 其它失败原因不受影响：脏输入也不许出 undefined / NaN。
+  for (const value of [noRebuild, rebuilding, retried]) {
+    assert.equal(String(value).includes('undefined'), false, `文案里出现了 undefined：${value}`);
+  }
+});

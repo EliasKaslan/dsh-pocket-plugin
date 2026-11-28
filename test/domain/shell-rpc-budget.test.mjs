@@ -690,8 +690,14 @@ test('详情视图：读失败时提示条一定会画出来（含重试 + 返�
   assert.match(source, /text: '重试'/u);
   assert.match(source, /text: '返回列表'/u, '失败要给出可操作的第二个出口');
   const app = await readFile(join(ROOT, 'web', 'app.js'), 'utf8');
-  assert.match(app, /store\.detailError = detailFailureText\(\{ message: error\?\.message, code: error\?\.code \}\)/u,
+  // F3：失败文案必须带上"链路重建过没有 / 自动补过没有"两个标记，否则
+  // 「链路刚重建过」与「电脑端没响应」在界面上长得一模一样。
+  assert.match(app, /store\.detailError = detailFailureText\(\{[\s\S]{0,260}?message: error\?\.message/u,
     '失败文案要带"重试/返回列表"的指引，而不是把 error.message 直接丢给用户');
+  assert.match(app, /rebuilt: error\?\.linkRebuilt === true/u,
+    '要把 net.js 标的"这次失败之后链路重建过"传给文案（F3）');
+  assert.match(app, /retried: error\?\.autoRetried === true/u,
+    '要把"已经自动补过一次重试"传给文案（F3）');
   assert.match(app, /timeout: DETAIL_TIMEOUT_MS/u, '详情超时必须来自 rpc-budget.js（与外壳预算同源）');
 });
 

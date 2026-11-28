@@ -143,13 +143,33 @@ export function loadingText(message) {
 /**
  * 详情读取失败的**可操作**文案：告诉用户下一步做什么，而不是只报一个错。
  *
- * @param {{message?: string, code?: string}} [failure]
- *   `code` 来自 `web/lib/net.js`（外壳标了 `pocketCode` 的会原样透上来）。
+ * F3：`relay_timeout` 有两种完全不同的现场，文案必须分开说 —— 否则用户看到
+ * 「中继请求超时」只会去查自己的网络，而两种现场里**都不该**由用户先动手：
+ *
+ *   - `rebuilt === true`：请求还挂着的时候，外壳已按 F1 判定"有请求在途但下行静默"
+ *     并重建过链路；这条失败是**在已经换过的新链路语境下**发生的。要写明"刚重建过 /
+ *     已经自动补过一次重试"，否则用户会以为一切都没发生过。
+ *   - 否则：链路没换过，就是**电脑端没响应**（或回包丢了），这时才该说"电脑端"。
+ *
+ * 出口（重试 / 返回列表）必须在文案里写出来：按钮已经有了，但一句话不说清
+ * "还能做什么"，用户手机上只会看到一条死路。
+ *
+ * @param {{message?: string, code?: string, rebuilt?: boolean, retried?: boolean}} [failure]
+ *   `code` 来自 `web/lib/net.js`（外壳标了 `pocketCode` 的会原样透上来）；
+ *   `rebuilt` = 这次失败之后中继链路确实被重建过（`error.linkRebuilt`，见 F2）；
+ *   `retried` = 已经为它自动补过一次重试（`error.autoRetried`）。
  */
-export function detailFailureText({ message = '', code = '' } = {}) {
+export function detailFailureText({ message = '', code = '', rebuilt = false, retried = false } = {}) {
   const reason = String(message ?? '').trim();
   const picked = reason.length > 0 ? reason : '读取会话失败';
   // 「取消」是用户自己走的，不该再劝他重试一遍。
   if (code === 'aborted') return '已取消读取这个会话。';
+  if (code === 'relay_timeout') {
+    if (rebuilt === true) {
+      const auto = retried === true ? '已自动重试 1 次' : '正在自动重试';
+      return `链路刚重建过，${auto}，回包仍没送到手机。可以点「重试」，或返回列表后再进来。`;
+    }
+    return `电脑端没有响应（${picked}）。可以点「重试」，或返回列表后再进来。`;
+  }
   return `${picked}。可以点「重试」，或返回列表后再进来。`;
 }

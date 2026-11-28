@@ -237,13 +237,21 @@ test('连接页：诊断块 + 复制按钮，且不在 connect.js 里 import rel
 
 test('外壳把诊断快照挂到 __POCKET_DIAG__，且只含非敏感字段', () => {
   const source = read('remote/remote.js');
-  const block = slice(source, 'globalThis.__POCKET_DIAG__ = {', 900);
+  // 窗口要盖住 `snapshot()` 与紧跟其后的函数表：往里加字段会把后面的名字往后推，
+  // 900 已经不够（stallRebuilds 推到了 907），改用 1_000 —— 这只会让"不许出现敏感
+  // 字段"的检查覆盖面**变大**，不会放宽任何一条断言。
+  const block = slice(source, 'globalThis.__POCKET_DIAG__ = {', 1_000);
   for (const field of ['brokers', 'online', 'attempts', 'lastFailure', 'lastOkAt', 'lastAttemptAt', 'now']) {
     assert.match(block, new RegExp(`${field}:`, 'u'), `快照必须提供 ${field}`);
   }
+  // F1：半死链路被看门狗逮住几次，必须在快照里能看到 —— 否则"救了没有"无从判断。
+  assert.match(block, /stallRebuilds:/u, '快照必须提供 stallRebuilds（静默重建次数）');
   for (const functionName of ['snapshot', 'diagRows', 'buildDiagText', 'describeFailure']) {
     assert.match(block, new RegExp(`${functionName}[,:]`, 'u'), `外壳要交出 ${functionName}`);
   }
+  // F2/F3：应用层要问"这条失败之后链路换过没有"，所以外壳必须交出单调的世代号。
+  assert.match(source, /linkEpoch: \(\) => Number\(relay\.linkEpoch\) \|\| 0/u,
+    '__POCKET_DIAG__ 必须交出 linkEpoch 只读访问器（web/lib/net.js 靠它判断要不要补一次）');
   // 房间密钥 / 设备令牌 / 链接里的 r、t 一个都不许进快照
   for (const banned of ['deviceToken', 'this.room', 'key:', "get('k')", "get('r')"]) {
     assert.equal(block.includes(banned), false, `__POCKET_DIAG__ 快照里不该出现 ${banned}`);

@@ -185,6 +185,19 @@ const PC_STALE_MS = 26_000;
  */
 const RESTART_COOLDOWN_MS = 15_000;
 /**
+ * 「有请求在途 + 下行静默」多久就重建（**早于**请求预算烧完）。
+ *
+ * 15.2 s（`rpcBudgetMs(4, 8_000)`）< 26 s（上面那个 `PC_STALE_MS`），所以只靠
+ * 「下行静默 26 s」那一条时，每一次下行半死都必然是请求先判死、拿 `relay_timeout`
+ * 交给界面（`web/lib/net.js` 还把它当成不可重试的定论），而救它的重建还在 10.8 s 之外。
+ * 桌面每 8 s 一条 beat：10 s 一帧下行都没有，说明回包根本进不来，此时重建最便宜。
+ *
+ * 与 `web/lib/shell-retry.js` 的导出常量 `RPC_STALL_REBUILD_MS` 同值（各写一份，
+ * 由 `test/unit/shell-stall-rebuild.test.mjs` 逐字段比对）：外壳这边必须是数字字面量，
+ * 看门狗的行为用例才能把常量切进 vm 沙箱真跑。
+ */
+const RPC_STALL_REBUILD_MS = 10_000;
+/**
  * 连续重建这么多次仍然连不上，就交给外壳做最后一次兜底：刷新页面。
  *
  * 为什么需要它：浏览器里的 mqtt.js 有一种典型死法 —— WebSocket 半死（既不触发
@@ -944,6 +957,16 @@ class Relay {
     /** 连续离线的起点（0 = 当前在线）。硬兜底只看它，不看失败次数。 */
     this.downSince = 0;
     this.lastRestartAt = 0;
+    /**
+     * 链路世代号：每进一次 `restart()` 就 +1（单调，永不清零）。
+     *
+     * 与 `lastRestartAt` 分开：那是"上一次重建的时刻"，会被时钟回拨、也会被
+     * "重建成功"覆盖；应用层（`web/lib/net.js`）要回答的是「这条请求失败之后
+     * 链路**换过没有**」——一个单调计数比时间戳可靠，也不受同毫秒多次重建影响。
+     * 用途：GET 的 `relay_timeout` 允许补一次自动重试（F2），以及详情失败文案
+     * 区分「链路刚重建过」与「电脑端没响应」（F3）。
+     */
+    this.linkEpoch = 0;
     this.readyAt = 0;
     /** 已被新页面接管：不再重连、界面失效。 */
     this.superseded = false;
@@ -1016,6 +1039,14 @@ class Relay {
       rpc: 0, timeouts: 0, resMiss: 0,
       /** 分片：累计没集齐的组数 / 累计发出的 nack 数（诊断三件套，见 partsStats）。 */
       partsIncomplete: 0, partsNacked: 0,
+      /**
+       * 「有请求在途但下行静默」触发的重建次数。
+       *
+       * 它涨而 `timeouts` 也涨 = 半死链路被看门狗逮住救了，但回包仍没回来；
+       * 旧实现里这种情况**一次重建都不会发生**（要等 26 s），用户只看到
+       * `relay_timeout`，诊断上也分不清"没救"与"救了没用"。
+       */
+      stallRebuilds: 0,
     };
   }
 
@@ -1309,6 +1340,8 @@ class Relay {
     this.fastRetryTimer = undefined;
     this.restarting = true;
     this.restartCount += 1;
+    // 世代号先加：应用层（net.js）判断"失败后链路换过没有"只看它，越早可见越好。
+    this.linkEpoch += 1;
     this.lastRestartAt = Date.now();
     console.warn('[pocket] 重建中继连接：' + reason + '（第 ' + this.restartCount + ' 次）');
 
@@ -1399,6 +1432,60 @@ class Relay {
         this.onpcStale(stale, stale
           ? `电脑端已离线 ${Math.round(idle / 1000)} 秒 · 正在重连…（列表可能不是最新）`
           : null);
+      }
+      /*
+       * F1：「有请求在途 + 下行静默」要**立即**重建，不能等 26 s。
+       *
+       * 15.2 s（`rpcBudgetMs(4, 8_000)`）< 26 s（`PC_STALE_MS`），所以只靠下面那条
+       * `stale` 规则时，每一次下行半死都必然是**请求先烧完预算**、拿 `relay_timeout`
+       * 交给界面（`web/lib/net.js` 把它当不可重试的定论），而救它的重建要等 26 s
+       * —— 现场："详情请求桌面 8~30 ms 就答完了，手机 15.2 s 后报中继请求超时"。
+       *
+       * 判据只有三条：在线、有请求在途、`lastRxAt`/`pcSeenAt` 静默超过一个心跳多
+       * （`RPC_STALL_REBUILD_MS`）。**不误伤慢请求的前提**：正常但慢的请求（冷会话
+       * 构建实测 4.4 s）期间 beat 照旧每 8 s 到、`lastRxAt` 一直新鲜 ⇒ 不会命中。
+       *
+       * 下界里带上 `readyAt`（写法与上面的 `idle` 一致）：刚 ready 的前 8 s 本来
+       * 就一条 beat 都可能还没到，那是**首连空窗**不是"下行静默"，不带它就会在
+       * 第一次巡检时把自己刚建的链路推倒（首连自伤）。`lastWakeAt` 故意**不**算：
+       * 回到前台后 16 s 静默那条由 `wakeDecision()` 负责，这里要的是"有请求在途
+       * 就别再等"。
+       *
+       * 重建后 `restart()` 的 `resendPending()` 会用**同一个 request id** 重发在途
+       * 请求（桌面按 id 幂等回放），冷却沿用 `RESTART_COOLDOWN_MS` 防重建风暴。
+       * 下界读 `this.pending?.size`：看门狗每 2 s 一拍，任一步抛错都会连带打断后面
+       * 的保活判断（见本函数开头的注释），所以对测试替身也要能跑。
+       */
+      const lastDownAt = Math.max(this.stats.lastRxAt, this.pcSeenAt, this.readyAt);
+      const silentFor = Date.now() - lastDownAt;
+      /**
+       * 只有"这条请求开始之后一帧下行都没收到"才重建。
+       *
+       * 为什么不能只看"静默 10 s"：桌面每 8 s 一条 beat，阈值离一个心跳周期只有
+       * 2 s 余量 —— 正常链路上丢一拍 beat（我们就处在会丢帧的链路上）就会误判，
+       * 而误判的代价是把 ws 隧道拆掉、把正在拼的分片作废。反过来，
+       * `startedAt > lastDownAt` 表示"请求发出之后**一条下行都没有**"：
+       * 健康链路不可能 10 s 连一拍 beat 都不来，所以这个判据在半死连接上成立、
+       * 在只是"beat 丢了一拍"的链路上不成立。
+       *
+       * 也不能改成"发 hello 探活"：桌面端 `sayHello()` 是 10 s 限流的
+       * （见 `lib/cloud.mjs` 的 `case 'hello'`），被限流时**不会回 beat**，
+       * 探针本身就会制造误判。
+       */
+      let oldestPendingAt = 0;
+      for (const [, entry] of this.pending ?? []) {
+        const startedAt = Number(entry.startedAt) || Number(entry.at) || 0;
+        if (startedAt > 0 && (oldestPendingAt === 0 || startedAt < oldestPendingAt)) oldestPendingAt = startedAt;
+      }
+      if ((this.pending?.size ?? 0) > 0
+        && silentFor > RPC_STALL_REBUILD_MS
+        // 拿不到请求开始时刻（老替身 / 异常条目）时退回"只看静默"：宁可多建一次，
+        // 也不要因为一条缺字段的条目把自救关上。
+        && (oldestPendingAt === 0 || oldestPendingAt > lastDownAt)
+        && Date.now() - this.lastRestartAt > RESTART_COOLDOWN_MS) {
+        this.stats.stallRebuilds += 1;
+        void this.restart('请求在途但下行静默');
+        return;
       }
       // 只显示横幅是不够的：这条链路的坏法就是"看起来连着、其实发不出去"。
       // 静默够久就必须把底层客户端整个重建，否则永远等不到自动重连。
@@ -2010,7 +2097,10 @@ class Relay {
       let generation = 0;
       let settled = false;
       const controller = new AbortController();
-      const entry = { id, at: Date.now(), sessionToken: this.session?.token, deviceToken: this.deviceToken, timer: undefined, resolve: undefined, reject: undefined, retry: undefined, heal: undefined };
+      // `startedAt` 一经创建不再变（`at` 每次 attempt 都会刷新）：看门狗用它判断
+      // "这条请求发出之后是否一条下行都没收到"（见 startStaleWatch 里的说明）。
+      const startedAt = Date.now();
+      const entry = { id, at: startedAt, startedAt, sessionToken: this.session?.token, deviceToken: this.deviceToken, timer: undefined, resolve: undefined, reject: undefined, retry: undefined, heal: undefined };
       const finish = (fn, value) => {
         if (settled) return;
         settled = true;
@@ -2717,6 +2807,7 @@ async function main() {
       partsOpen: relay.parts.size,
       partsIncomplete: relay.stats.partsIncomplete,
       partsNacked: relay.stats.partsNacked,
+      stallRebuilds: relay.stats.stallRebuilds,
     }),
     describeFailure,
     diagRows,
@@ -2726,6 +2817,16 @@ async function main() {
     describeAdvice,
     /** 在途请求的极简视图：应用层拿它显示"正在重试第几次"（不含任何 id）。 */
     inflight: () => relay.inflight(),
+    /**
+     * 链路世代号（每次 `restart()` +1，单调）。
+     *
+     * 内层 UI（`web/lib/net.js`）用它回答「这条失败之后链路换过没有」：
+     *   - F2：换过才允许对 GET 的 `relay_timeout` 补一次自动重试（请求已经在一
+     *     条刚重建的链路上白等过一次预算）；
+     *   - F3：详情失败文案要区分「链路刚重建过」与「电脑端没响应」。
+     * 没有外壳（局域网布局）时它根本不存在，调用方退化成 0 = 行为与以前一致。
+     */
+    linkEpoch: () => Number(relay.linkEpoch) || 0,
   };
 
   relay.onpc = (pc) => setSplash(`已连接 ${pc.name}`, '正在同步任务…');

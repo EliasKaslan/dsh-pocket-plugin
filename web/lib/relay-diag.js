@@ -370,7 +370,7 @@ function countOf(value) {
  * @param {{brokers?: unknown, online?: boolean, pcStale?: boolean, attempts?: number,
  *   lastFailure?: object|null, lastOkAt?: number, lastAttemptAt?: number,
  *   stats?: {rx?: number, tx?: number, err?: number, lastRxAt?: number},
- *   pending?: number, restartCount?: number, sockets?: number,
+ *   pending?: number, restartCount?: number, sockets?: number, stallRebuilds?: number,
  *   now?: number}} [diag]
  * @returns {Array<{key: string, label: string, value: string}>}
  */
@@ -432,6 +432,16 @@ export function diagRows(diag) {
     { key: 'partsopen', label: '半包在拼', value: `${countOf(source.partsOpen)} 组` },
     { key: 'partslost', label: '分片没集齐', value: `${countOf(source.partsIncomplete)} 次` },
     { key: 'partsnack', label: '已发补片请求', value: `${countOf(source.partsNacked)} 次` },
+    /*
+     * 「有请求在途 + 下行静默」触发的重建次数（F1，`RPC_STALL_REBUILD_MS`）。
+     *
+     * 这一行专门用来分辨"没救"和"救了没用"：
+     *   - 它 0 而 `RPC 超时未回包` 也在涨 → 看门狗压根没动手（阈值/接线坏了）；
+     *   - 它涨而 `RPC 超时未回包` 还在涨 → 重建发生了，但回包仍然进不来
+     *     （链路反复半死 / 电脑端一侧的问题），别再只盯着应用侧超时。
+     * 旧实现在这种坏法里**一次重建都不会记**：要等 26 s，而请求 15.2 s 就已经判死了。
+     */
+    { key: 'stallrebuild', label: '静默重建', value: `${countOf(source.stallRebuilds)} 次` },
     { key: 'sockets', label: '实时通道', value: `${countOf(source.sockets)} 条` },
     { key: 'restart', label: '连接重建', value: `${countOf(source.restartCount)} 次` },
     {
@@ -512,7 +522,7 @@ export function crumbText(crumb, now = Date.now()) {
  *   lastFailure?: object|null, lastOkAt?: number, lastAttemptAt?: number,
  *   stats?: {rx?: number, tx?: number, err?: number, lastRxAt?: number},
  *   pending?: number, restartCount?: number, sockets?: number, timeouts?: number,
- *   resMiss?: number, crumb?: object[], rpcBudget?: number,
+ *   resMiss?: number, stallRebuilds?: number, crumb?: object[], rpcBudget?: number,
  *   now?: number, pwa?: boolean, userAgent?: unknown}} [diag]
  * @returns {string}
  */

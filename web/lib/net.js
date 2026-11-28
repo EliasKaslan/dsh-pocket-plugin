@@ -72,20 +72,68 @@ function defaultSleep(ms) {
  *
  * 其余码（`relay_timeout` / `decompress` / `relay`）一律不重试：外壳已经按
  * **同一个 request id** 跑完了一整个重放预算，再来一轮只是把用户等待翻倍。
+ *
+ * **唯一的例外是 `relay_timeout` + 链路确实被重建过**（见 `canRetry`）：那条请求
+ * 的预算是**烧在一条已经半死的链路上**的，重建发生之后重发一次是合理的 ——
+ * 这条例外只给 GET/HEAD，且只给一次。
  */
 const RETRYABLE_CODES = new Set(['network', 'read', 'parts_lost']);
 
-/** 这条请求在失败之后还能不能再试一次。 */
-function canRetry({ method, options, error, attempt, attempts, signal }) {
+/**
+ * 读外壳的「链路世代号」（`remote/remote.js` 的 `relay.linkEpoch`，每次重建 +1）。
+ *
+ * 为什么需要它：没有这个信号，`relay_timeout` 只剩一个笼统的"别重试"——
+ * 而用户现场恰恰是"请求判死的那一刻，看门狗已经把它脚下那条半死链路换掉了"。
+ * 局域网布局里没有外壳（`__POCKET_DIAG__` 不存在）⇒ 恒 0，行为与以前完全一致。
+ */
+function defaultLinkEpoch() {
+  try {
+    const read = globalThis.__POCKET_DIAG__?.linkEpoch;
+    if (typeof read !== 'function') return 0;
+    const value = Number(read());
+    return Number.isFinite(value) ? value : 0;
+  } catch {
+    return 0; // 诊断接口永远不该拖垮请求本身
+  }
+}
+
+/**
+ * 这条请求在失败之后还能不能再试一次。
+ *
+ * @param {{method?: string, options?: object, error?: object, attempt: number,
+ *   attempts: number, signal?: AbortSignal, allowRelayTimeout?: boolean}} input
+ *   `allowRelayTimeout`：本次失败之后链路确实被重建过（且这条 `relay_timeout`
+ *   还没补过重试）—— 只有它为真时，GET/HEAD 的 `relay_timeout` 才允许再试一次。
+ */
+function canRetry({ method, options, error, attempt, attempts, signal, allowRelayTimeout = false }) {
   if (attempt >= attempts) return false;
   if (signal?.aborted === true) return false;
   if (options?.signal?.aborted === true) return false;
+  const verb = String(method ?? 'GET').toUpperCase();
+  const readOnly = verb === 'GET' || verb === 'HEAD';
+  /*
+   * F2：`relay_timeout` 的「外壳已跑完同 id 重放预算」结论**有一个例外**。
+   *
+   * 现场：手机下行半死 → 外壳在 10 s 判"请求在途但下行静默"并重建链路 →
+   * 那条请求的**绝对**截止时刻仍是 15.2 s，于是一条已经换了新链路、桌面 8~30 ms
+   * 就能答的请求，还是把 `relay_timeout` 交到用户手里（还必须手点重试）。
+   *
+   * 为什么只给 GET/HEAD、且只给一次：
+   *   - 写方法换个新 request id 再发，是**语义不同**的一条请求（不是同 id 幂等重放），
+   *     可能把同一条 prompt/确认做第二遍 —— 维持不重试；
+   *   - 读方法天然可重复执行，桌面也按 request id 幂等回放，多读一遍没有任何副作用；
+   *   - 上限 1 次由调用方（`relayTimeoutRetried`）记账：重建过一次就只补一次，
+   *     第二次还是 `relay_timeout` 说明链路仍没救回来，再等下去用户只会更难受。
+   */
+  if (error?.code === 'relay_timeout') {
+    if (!readOnly) return false;
+    return allowRelayTimeout === true;
+  }
   // 外壳已经给过**定论**的失败（同一个 id 的幂等重放跑完了）不许再来一轮。
   // （`parts_lost` 不算定论：那不是"回声慢"，是"这一份字节凑不齐了"。）
   if (error?.relayConfirmed === true) return false;
   if (!RETRYABLE_CODES.has(error?.code)) return false;
-  const verb = String(method ?? 'GET').toUpperCase();
-  if (verb === 'GET' || verb === 'HEAD' || verb === 'OPTIONS') return true;
+  if (readOnly || verb === 'OPTIONS') return true;
   if (options?.idempotent === true) return true;
   return error?.beforeSend === true;
 }
@@ -124,6 +172,7 @@ export function createApi({ getBase, getToken, onUnauthorized }, retry = {}) {
   const attempts = Math.max(1, Number(retry.attempts ?? RETRY_ATTEMPTS) || RETRY_ATTEMPTS);
   const baseMs = Math.max(0, Number(retry.baseMs ?? RETRY_BASE_MS) || 0);
   const sleep = typeof retry.sleep === 'function' ? retry.sleep : defaultSleep;
+  const linkEpoch = typeof retry.linkEpoch === 'function' ? retry.linkEpoch : defaultLinkEpoch;
 
   return async function api(path, options = {}) {
     const base = normalizeBase(options.base ?? getBase());
@@ -140,6 +189,15 @@ export function createApi({ getBase, getToken, onUnauthorized }, retry = {}) {
     }
 
     let lastError;
+    /**
+     * 发这条请求时的链路世代号（每次中继重建 +1）。
+     *
+     * 失败时再读一次：变了 = 这条请求是在**一条后来被判定半死、已经重建过**的链路上
+     * 烧完预算的 ⇒ GET/HEAD 的 `relay_timeout` 允许补一次自动重试（见 `canRetry`）。
+     */
+    const epochAtSend = linkEpoch();
+    /** `relay_timeout` 只补一次：第二次还超时说明链路仍没救回来，继续等只会更糟。 */
+    let relayTimeoutRetried = false;
     // 已经取消的请求连发都不发：既省一次握手，也避免"取消之后又冒出一次重试"。
     if (options.signal?.aborted === true) throw new ApiError('已取消', { code: 'aborted' });
     for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -152,7 +210,14 @@ export function createApi({ getBase, getToken, onUnauthorized }, retry = {}) {
         return await attemptOnce({ base, path, method, headers, body, timeout, options, requestToken });
       } catch (error) {
         lastError = error;
-        if (!canRetry({ method, options, error, attempt, attempts, signal: options.signal })) throw error;
+        const rebuiltSinceSend = linkEpoch() !== epochAtSend;
+        // 把"这次失败之后链路换过没有 / 有没有自动补过一次"带给界面：
+        // F3 的失败文案要区分「链路刚重建过」与「电脑端没响应」，不能只说"失败了"。
+        error.linkRebuilt = rebuiltSinceSend;
+        error.autoRetried = relayTimeoutRetried;
+        const allowRelayTimeout = rebuiltSinceSend && !relayTimeoutRetried;
+        if (!canRetry({ method, options, error, attempt, attempts, signal: options.signal, allowRelayTimeout })) throw error;
+        if (error?.code === 'relay_timeout') relayTimeoutRetried = true;
         console.debug(`[pocket-diag] api retry ${method} ${path} attempt=${attempt + 2} code=${error?.code}`);
       }
     }

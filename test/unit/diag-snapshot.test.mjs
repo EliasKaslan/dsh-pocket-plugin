@@ -32,6 +32,8 @@ const SILENT_DOWNLINK = {
   pending: 3,
   restartCount: 4,
   sockets: 1,
+  // F1：「有请求在途 + 下行静默」触发的重建次数（旧实现里这种坏法一次都不会记）。
+  stallRebuilds: 6,
   now: NOW,
 };
 
@@ -47,6 +49,7 @@ test('A5：能看出"一帧下行都没收到"（online=true 也救不了这种�
   assert.match(rows.pending, /^3 条/u);
   assert.match(rows.sockets, /^1 条/u);
   assert.match(rows.restart, /^4 次/u);
+  assert.match(rows.stallrebuild, /^6 次/u, 'F1 的「静默重建」次数必须在诊断里（旧实现这种坏法一次都不会记）');
   assert.match(rows.rx, /还没收到过/u);
 });
 
@@ -84,7 +87,7 @@ test('A5：「复制诊断信息」带上新字段，且仍然不含密钥 / 令
     pwa: true,
     userAgent: 'Mozilla/5.0 (iPhone)',
   });
-  for (const expected of ['收到下行：0 帧', '发出上行：37 帧', '解析 / 传输错误：2 次', '在途请求：3 条', '实时通道：1 条', '连接重建：4 次', '电脑端心跳：']) {
+  for (const expected of ['收到下行：0 帧', '发出上行：37 帧', '解析 / 传输错误：2 次', '在途请求：3 条', '实时通道：1 条', '连接重建：4 次', '静默重建：6 次', '电脑端心跳：']) {
     assert.ok(text.includes(expected), `复制文本缺少「${expected}」`);
   }
   for (const secret of ['r_room_0123456789', 'k_aes256_secret_value', 'dshb_device_token_secret', 't_relay_identity_secret']) {
@@ -102,6 +105,7 @@ test('A5：新字段缺失 / 非法时给 0 与默认文案（不出现 NaN / un
   assert.match(rows.rx, /^0 帧/u);
   assert.match(rows.pending, /^0 条/u);
   assert.match(rows.restart, /^0 次/u);
+  assert.match(rows.stallrebuild, /^0 次/u, '缺字段时必须是 0，不许 NaN / undefined');
   const text = buildDiagText({ now: NOW });
   assert.equal(text.includes('undefined'), false);
   assert.equal(text.includes('NaN'), false);
