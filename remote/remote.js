@@ -1559,8 +1559,34 @@ class Relay {
       this.parts.markNacked(id, now);
       this.stats.partsNacked += 1;
       console.debug(`[pocket-diag] nack ${id}`);
+      // ① 新桌面（≥1.0.4）：指名补片，一片一条，通常 2 秒内补齐。
       void this.send({ t: 'nack', id, sid: this.sid, seq: this.nextSeq(), ts: this.serverNow() }).catch(() => {});
+      // ② 老桌面（1.0.3 及更早）：`nack` 会被 `default: break` 忽略。这时**同 id
+      //    重发**是唯一的快速自救 —— 那帧响应已经在桌面的 120s 幂等缓存里，重发会让
+      //    它把整条响应重新发一遍（含全部片）。放在这里而不是等 8 秒判失，是因为
+      //    "卡住 2 秒"已经足够证明有片丢了，没必要再干等 6 秒。
+      //    代价：每条请求每 5 秒最多多一帧（nack 自带同组间隔），而它救回的是
+      //    用户正在盯着的那一屏。重复帧对桌面是幂等回放，不会重复执行。
+      this.healOldestPending();
     }
+  }
+
+  /**
+   * 用同一个 request id 重发**最老的在途请求**（桌面命中幂等缓存 → 回放整份响应）。
+   *
+   * 为什么只能"近似挑最老的"：`part` 帧里只有 12 位 chunkId，没有 request id，
+   * 收方无法把半包精确映射回请求。典型场景只有 1~2 条在途请求，这个近似够用；
+   * 挑错时的代价也只是一帧重复请求（幂等，不会重复执行）。
+   *
+   * @returns {boolean} 是否真的重发了
+   */
+  healOldestPending() {
+    let oldest = null;
+    for (const [, entry] of this.pending) {
+      if (oldest === null || entry.at < oldest.at) oldest = entry;
+    }
+    if (oldest === null) return false;
+    return typeof oldest.heal === 'function' && oldest.heal() === true;
   }
 
   /**
@@ -1581,12 +1607,12 @@ class Relay {
     this.stats.partsIncomplete += lost;
     this.stats.err += lost;
     console.debug(`[pocket-diag] parts lost=${lost} (${reason}) open=${this.parts.size}`);
+    if (this.healOldestPending()) return;
     let oldest = null;
     for (const [, entry] of this.pending) {
       if (oldest === null || entry.at < oldest.at) oldest = entry;
     }
     if (oldest === null) return;
-    if (typeof oldest.heal === 'function' && oldest.heal() === true) return;
     oldest.reject?.(partsLostError(lost));
   }
 

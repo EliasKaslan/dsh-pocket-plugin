@@ -455,3 +455,25 @@ test('详情视图：读失败时提示条一定会画出来（含重试 + 返�
     '失败文案要带"重试/返回列表"的指引，而不是把 error.message 直接丢给用户');
   assert.match(app, /timeout: DETAIL_TIMEOUT_MS/u, '详情超时必须来自 rpc-budget.js（与外壳预算同源）');
 });
+
+test('半包卡住 2 秒：除 nack 之外还要同 id 重发（老桌面不认 nack 时的唯一自救）', async () => {
+  const { relay, published } = harness();
+  relay.session = { token: 'session-token-for-test' };
+  const state = track(relay.request({ method: 'GET', path: '/api/v1/tasks/big', headers: {}, gzip: false, attempts: 2, timeout: 30_000 }));
+  await tick();
+  const requestId = published[0].id;
+  await deliver(relay, { t: 'part', id: 'aabbccddeeff', seq: 0, total: 2, d: b64('{"half":') });
+  assert.equal(relay.parts.size, 1);
+
+  const before = published.filter((frame) => frame.t === 'req').length;
+  relay.sweepParts(Date.now() + 2_500);
+  await tick();
+
+  // ① 新桌面：nack 指名补片。
+  assert.equal(published.filter((frame) => frame.t === 'nack').length, 1, '2 秒仍要发 nack');
+  // ② 老桌面（1.0.3 及更早）：nack 被忽略，所以必须同时用同 id 重发，靠 120s 幂等缓存回放整份响应。
+  const reqs = published.filter((frame) => frame.t === 'req');
+  assert.equal(reqs.length, before + 1, '老桌面不认识 nack：同一刻必须同 id 重发，否则只能干等 8 秒');
+  assert.equal(reqs.at(-1).id, requestId, '必须同一个 request id（幂等回放，不重复执行）');
+  assert.equal(state.kind, 'pending', '自救期间请求还活着');
+});
