@@ -162,6 +162,27 @@ function relayFailureMessage(error) {
 }
 
 /**
+ * 读响应正文：整条链上唯一一处"把字节变成字符串"。
+ *
+ * 外壳（`remote/remote.js` 的 `pocketFetch`）会把**解压后的原始字节**直接挂在
+ * `response.pocketBytes` 上。走 `Response.text()` 的话，浏览器要先把 body 流读成
+ * 一整块、再 UTF-8 解码 —— 同一份 150~200 KB 的解压结果等于多搬一遍。手机端这条
+ * 路径正是"点开详情顿一下"的来源之一（探针 Node 24、15 次中位，58 KB 档：
+ * 0.16 ms → 0.12 ms，省掉的是一次 192 763 B 的 body 整块读取；WebKit 上整缓冲
+ * 拷贝更贵）。
+ *
+ * 拿不到这个字段时一律照旧：旧外壳、原生 fetch、以及 204/304 这类没有 body 的
+ * 响应。所以新旧外壳混着跑都不会坏。
+ */
+const pocketTextDecoder = new TextDecoder();
+
+async function readResponseText(response) {
+  const raw = response?.pocketBytes;
+  if (raw instanceof Uint8Array) return pocketTextDecoder.decode(raw);
+  return response.text();
+}
+
+/**
  * @param {string} path
  * @param {{method?: string, body?: unknown, base?: string, auth?: boolean, timeout?: number,
  *   signal?: AbortSignal, idempotent?: boolean}} options
@@ -268,7 +289,7 @@ export function createApi({ getBase, getToken, onUnauthorized }, retry = {}) {
 
     let text;
     try {
-      text = await response.text();
+      text = await readResponseText(response);
     } catch (error) {
       if (controller.signal.aborted === true && options.signal?.aborted !== true) {
         throw new ApiError('请求超时，电脑端可能正忙', { code: 'timeout' });

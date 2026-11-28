@@ -1,4 +1,4 @@
-/* Build stamp: tools/build-shell.mjs replaces 77a75790d1d3c4ea with the content hash of app.js + remote.js + remote.css + index.html — never hand-edit CACHE below. */
+/* Build stamp: tools/build-shell.mjs replaces 3a5e47ee14c77da3 with the content hash of app.js + remote.js + remote.css + index.html — never hand-edit CACHE below. */
 /*
  * DSH Pocket · remote shell service worker
  * ------------------------------------------------------------
@@ -15,7 +15,7 @@
  */
 'use strict';
 
-const BUILD = '77a75790d1d3c4ea';
+const BUILD = '3a5e47ee14c77da3';
 const CACHE = `pocket-shell-${BUILD}`;
 
 /**

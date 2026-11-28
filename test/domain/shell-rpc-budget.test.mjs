@@ -260,27 +260,47 @@ test('重连：attempt 用尽 + 半包被清时，resendPending 仍按同一个 
 
 /* ------------------ 5) 大响应解压必须有截止时刻 ------------------ */
 
-/** 在 vm 里跑生产源码切出来的 `decompressGzip()`，可换掉 Blob/Response/DecompressionStream。 */
+/** 在 vm 里跑生产源码切出来的 `decompressGzip()`，可换掉 `DecompressionStream`。 */
 function loadDecompress(globals) {
   const slices = runSlices({
     declarations: [
       { name: 'DECOMPRESS_TIMEOUT_MS', source: sliceConst(SOURCE, 'DECOMPRESS_TIMEOUT_MS') },
       { name: 'decompressGzip', source: sliceFunction(SOURCE, 'decompressGzip') },
     ],
-    globals,
+    globals: { DecompressionStream, ...globals },
   });
   return slices;
 }
 
-test('解压流卡住时必须超时收场（否则界面永久停在「加载中…」）', async () => {
-  // 假的 Blob/DecompressionStream/Response：拼出来的流永远不结束 ——
-  // 这正是 `new Response(stream).arrayBuffer()` 不 resolve 的那种坏法。
-  const fake = {
-    Blob: class { constructor(parts) { this.parts = parts; } stream() { return { pipeThrough: (ds) => ({ stalled: true, ds }) }; } },
-    DecompressionStream: class { constructor(format) { this.format = format; } },
-    Response: class { constructor(stream) { this.stream = stream; } arrayBuffer() { return new Promise(() => {}); } },
+/**
+ * 一个"读端永远不结束 / 直接报错"的 `DecompressionStream` 替身。
+ *
+ * 解压实现已经改成**直接写/读 `DecompressionStream`**（不再经 Blob → pipeThrough →
+ * Response 中转，那是同一份数据的两次整缓冲搬运），所以这里伪造的坏法也跟着换成
+ * "读写两端"：生产实现必须仍然（a）有截止时刻、（b）超时/失败后 `cancel()` 读端。
+ */
+function badStream({ failure = null } = {}) {
+  const cancelled = { count: 0 };
+  const reader = {
+    read: () => (failure === null ? new Promise(() => {}) : Promise.reject(failure)),
+    cancel: async () => { cancelled.count += 1; },
   };
-  const { decompressGzip } = loadDecompress(fake);
+  const writer = { write: () => Promise.resolve(), close: () => Promise.resolve() };
+  return {
+    cancelled,
+    DecompressionStream: class {
+      constructor(format) {
+        this.format = format;
+        return { readable: { getReader: () => reader }, writable: { getWriter: () => writer } };
+      }
+    },
+  };
+}
+
+test('解压流卡住时必须超时收场（否则界面永久停在「加载中…」）', async () => {
+  // 读端永远不 resolve —— 这正是 WebKit 的 `DecompressionStream` 半死时的那种坏法。
+  const fake = badStream();
+  const { decompressGzip } = loadDecompress({ DecompressionStream: fake.DecompressionStream });
   const startedAt = Date.now();
   let caught = null;
   try {
@@ -298,48 +318,33 @@ test('解压流卡住时必须超时收场（否则界面永久停在「加载�
 test('C5：解压超时/失败必须取消底层流（旧实现只 reject，45~108 KB 缓冲常驻且可叠加）', async () => {
   // `Promise.race` 只是**不再等**那条流：不留引用、不 cancel 的话，reader 与已解出的
   // 缓冲会跟着这个永远不 resolve 的 promise 一起常驻，每失败一次叠一份。
-  const cancelled = { count: 0 };
-  const bodyOf = () => ({
-    cancel: async () => { cancelled.count += 1; },
-  });
   // ① 卡住的流 → 超时 → 必须 cancel。
-  const stalled = {
-    Blob: class { constructor(parts) { this.parts = parts; } stream() { return { pipeThrough: () => ({ stalled: true }) }; } },
-    DecompressionStream: class { constructor(format) { this.format = format; } },
-    Response: class {
-      constructor(stream) { this.stream = stream; this.body = bodyOf(); }
-      arrayBuffer() { return new Promise(() => {}); }
-    },
-  };
+  const stalled = badStream();
   let caught = null;
   try {
-    await loadDecompress(stalled).decompressGzip(new Uint8Array([1, 2, 3]), 120);
+    await loadDecompress({ DecompressionStream: stalled.DecompressionStream })
+      .decompressGzip(new Uint8Array([1, 2, 3]), 120);
   } catch (error) {
     caught = error;
   }
   assert.equal(caught?.pocketCode, 'decompress');
-  assert.equal(cancelled.count, 1, '超时后必须 response.body.cancel()，否则缓冲永远不释放');
+  assert.equal(stalled.cancelled.count, 1, '超时后必须 cancel 读端，否则缓冲永远不释放');
 
-  // ② 坏字节 → arrayBuffer() 直接 reject → 同样必须 cancel（catch 里统一释放）。
-  const broken = {
-    ...stalled,
-    Response: class {
-      constructor(stream) { this.stream = stream; this.body = bodyOf(); }
-      arrayBuffer() { return Promise.reject(new Error('invalid gzip data')); }
-    },
-  };
+  // ② 坏字节 → 读端 reject → 同样必须 cancel（catch 里统一释放）。
+  const broken = badStream({ failure: new Error('invalid gzip data') });
   caught = null;
   try {
-    await loadDecompress(broken).decompressGzip(new Uint8Array([9, 9, 9]), 3_000);
+    await loadDecompress({ DecompressionStream: broken.DecompressionStream })
+      .decompressGzip(new Uint8Array([9, 9, 9]), 3_000);
   } catch (error) {
     caught = error;
   }
   assert.equal(caught?.pocketCode, 'decompress');
-  assert.equal(cancelled.count, 2, '解压失败的路径也要释放底层流');
+  assert.equal(broken.cancelled.count, 1, '解压失败的路径也要释放底层流');
 });
 
 test('坏字节与正常 gzip：区分得开，且失败都标 pocketCode=decompress（不许被当成"连不上"）', async () => {
-  const { decompressGzip } = loadDecompress({ Blob, Response, DecompressionStream });
+  const { decompressGzip } = loadDecompress({ DecompressionStream });
   const original = encoder.encode(JSON.stringify({ ok: true, pad: 'x'.repeat(2048) }));
   const gz = new Uint8Array(gzipSync(Buffer.from(original)));
   const round = await decompressGzip(gz, 3_000);

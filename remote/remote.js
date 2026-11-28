@@ -2312,11 +2312,20 @@ class Relay {
  * @returns {Promise<Uint8Array>}
  */
 async function decompressGzip(bytes, timeoutMs = DECOMPRESS_TIMEOUT_MS) {
-  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
-  // 必须留一份 response 的引用：`Promise.race` 只是**不再等**那条流，而它背后的
-  // reader 与已解出的缓冲（一条大响应 45~108 KB）会一直常驻，且每次超时都能叠加
-  // 一份。留了引用才能在 catch 里把它真的取消掉（见下）。
-  const response = new Response(stream);
+  // 旧实现是 `new Blob([bytes]).stream().pipeThrough(DS)` → `new Response(...).arrayBuffer()`：
+  // 同一份数据要搬三遍（gzip 字节拷进 Blob → Blob 流 chunk → arrayBuffer 再拼一块），
+  // 而解压本身只需要"写进去、读出来"。手机端这条路径解压后是 150~200 KB，三份搬运
+  // 全落在主线程上（探针 Node 24、15 次中位：2 KB 档 0.31 ms → 0.15 ms，58 KB 档
+  // 0.88 ms → 0.77 ms，且 2 KB 的固定开销几乎全是它）。
+  // 现在直接写 DecompressionStream，从 read 端收集 chunk：单 chunk 时零拷贝返回，
+  // 多 chunk 才拼一次（这一步 `Response.arrayBuffer()` 本来也要做）。
+  const stream = new DecompressionStream('gzip');
+  const reader = stream.readable.getReader();
+  const writer = stream.writable.getWriter();
+  // 写端不 await：坏字节会让 write 与 read **同时**失败，而 read 端才是我们观察的
+  // 通道。不接住 write 的 rejection 只会在控制台刷 "unhandled rejection"。
+  void writer.write(bytes).catch(() => {});
+  void writer.close().catch(() => {});
   let timer;
   const guard = new Promise((_resolve, reject) => {
     timer = setTimeout(() => {
@@ -2325,14 +2334,34 @@ async function decompressGzip(bytes, timeoutMs = DECOMPRESS_TIMEOUT_MS) {
       reject(error);
     }, Math.max(1, Number(timeoutMs) || DECOMPRESS_TIMEOUT_MS));
   });
+  const drain = (async () => {
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value !== undefined && value.length > 0) {
+        chunks.push(value);
+        total += value.length;
+      }
+    }
+    if (chunks.length === 1) return chunks[0];
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return out;
+  })();
   try {
-    const buffer = await Promise.race([response.arrayBuffer(), guard]);
-    return new Uint8Array(buffer);
+    return await Promise.race([drain, guard]);
   } catch (error) {
     // 超时/坏字节都要把底层流取消掉：不取消的话这条 `DecompressionStream` 永远
-    // 半开着（浏览器里表现为"解压一次卡一次"，内存只涨不落）。
+    // 半开着（浏览器里表现为"解压一次卡一次"，内存只涨不落）。`Promise.race` 只是
+    // 不再等它，读端还攥着已解出的缓冲。
     // `cancel()` 自己也可能抛（流已关闭 / 平台不支持），绝不能再盖掉原始错误。
-    try { await response.body?.cancel?.(); } catch { /* 已关闭或平台不支持 */ }
+    try { await reader.cancel?.(); } catch { /* 已关闭或平台不支持 */ }
     // 解压失败（坏字节 / 流卡住）都归成同一类：拿到的 body 不可用。
     if (error?.pocketCode === 'decompress') throw error;
     const failure = new Error(`大响应解压失败：${String(error?.message ?? error)}`);
@@ -2361,6 +2390,29 @@ function tagRelayFailure(error) {
   if (typeof error.pocketCode === 'string' && error.pocketCode !== '') return error;
   error.pocketCode = Number(error.timeoutMs) > 0 ? 'relay_timeout' : 'relay';
   return error;
+}
+
+/**
+ * 把一段字节包成 Response 能直接吃的**单 chunk 流**。
+ *
+ * 为什么不用 `new Response(bytes)`：那是"把字节交给 Response"，实现上要在构造时
+ * 把整段 body 拷进自己的缓冲 —— 计数桩实测：对 58 KB 档（解压后 192 763 B）的响应，
+ * 这一下就记到一次 192 763 B 的整份拷贝；之后应用 `text()` 还会把 body 流读成一块
+ * （又一次 192 763 B）。改成流之后构造时不碰字节，谁真去读谁才付那一份，而应用侧
+ * （`web/lib/net.js`）走 `pocketBytes` 更是连流都不读。
+ *
+ * 语义与 `new Response(bytes)` 完全一致（单 chunk、读一次即 EOF），只是把拷贝推迟。
+ *
+ * @param {Uint8Array} bytes
+ * @returns {ReadableStream}
+ */
+function bytesBody(bytes) {
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
 }
 
 function installFetch(relay) {
@@ -2408,7 +2460,15 @@ function installFetch(relay) {
     }
     const status = Number(reply.status) || 200;
     const noBody = method === 'HEAD' || status === 204 || status === 205 || status === 304;
-    return new Response(noBody ? null : bytes, { status, statusText: '', headers: outHeaders });
+    // body 走单 chunk 流（构造时零拷贝，见上方 `bytesBody()`）。
+    const response = new Response(noBody ? null : bytesBody(bytes), { status, statusText: '', headers: outHeaders });
+    // 给应用层留一条**不经过 Response/流**的取字节通道：`web/lib/net.js` 直接拿它
+    // 解码，省掉 Response 读流再拼一块的整份拷贝。非枚举属性，不改变 Response 的任何
+    // 标准行为；旧版应用不读它，行为不变。
+    if (!noBody) {
+      Object.defineProperty(response, 'pocketBytes', { value: bytes, configurable: true, enumerable: false });
+    }
+    return response;
   };
 }
 
