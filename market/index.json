@@ -18,11 +18,11 @@
       "versions": [
         {
           "version": "1.0.5",
-          "publishTimestamp": 1795847702,
+          "publishTimestamp": 1795848281,
           "source": {
             "type": "git",
             "url": "https://github.com/EliasKaslan/dsh-pocket-plugin.git",
-            "commit": "476c753afef1d9bd91444e0c41f72ed6b2aaeb93"
+            "commit": "972f1bc53fe79be601613bdeddae91e8c50c6f17"
           },
           "engines": {
             "dsh": ">=0.2.2-rc.2 <0.3.0-0"
