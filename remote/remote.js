@@ -68,6 +68,18 @@ const DEFAULT_BROKERS = ['wss://broker-cn.emqx.io:8084/mqtt'];
 
 /** Wire protocol version. 2 added `seq`/`ts`/`sid` and the `reject` frame. */
 const PROTOCOL = 2;
+/**
+ * 信封协议版本（v3 = 二进制信封 `[0x03][iv 12][ct][tag 16]`）。
+ *
+ * **与 `PROTOCOL` 分开**：`PROTOCOL` 是帧协议（`hello.ver`，老桌面只会看它），
+ * 这个号只表示「我认识二进制信封」，靠 `hello.proto` 交换。实际用哪一版由
+ * `send()` 按**桌面声明的** `proto` 决定（见 `this.pcProto`），未协商一律 v2。
+ *
+ * 为什么不干脆把 `PROTOCOL` 加到 3：老桌面按 `ver` 判断兼容性（`pcVersion`），
+ * 改它等于宣布"这是另一套帧协议"，而实际上帧格式一个字节都没变 —— 变的只是
+ * 密文怎么装进 MQTT payload。两个编号各管一层，和 `SEAL_VERSION` 与 `ver` 的关系一样。
+ */
+const ENVELOPE_PROTOCOL = 3;
 
 const HELLO_TIMEOUT_MS = 12_000;
 /** hello is rate-limited to one per 10 s so two peers cannot echo each other. */
@@ -579,22 +591,75 @@ async function makeSealer(keyB64, room) {
   if (keyBytes.length !== 32) throw new Error('密钥长度不正确');
   const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
   const scopeBytes = await crypto.subtle.digest('SHA-256', encoder.encode(JSON.stringify([room, keyB64])));
+  /**
+   * 解一条 **v2 JSON 信封**（`{"v":1,"n":b64(iv),"c":b64(ct‖tag)}`）。
+   *
+   * 内层闭包是刻意的：`test/support/relay-client.interop.test.mjs` 用
+   * `shell-source.mjs` 把 `makeSealer` 这一个函数整体切进 vm 里跑，任何**模块级**
+   * 新符号都会在沙箱里变成 ReferenceError（信封号/魔数只能写成函数内的字面量）。
+   */
+  const openJson = async (text, aad) => {
+    const parsed = JSON.parse(text);
+    if (parsed === null || typeof parsed !== 'object' || parsed.v !== 1) throw new Error('信封版本不正确');
+    const iv = unb64(parsed.n);
+    const blob = unb64(parsed.c);
+    if (iv.length !== 12 || blob.length <= 16) throw new Error('信封内容不正确');
+    const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: encoder.encode(aad) }, key, blob);
+    return JSON.parse(decoder.decode(plaintext));
+  };
+  /** 解一条 **v3 二进制信封**；`iv` 必须正好 12 字节、`blob` 必须含 16 字节 tag。 */
+  const openBinary = async (view, aad) => {
+    if (view.length <= 1 + 12 + 16) throw new Error('信封内容不正确');
+    const iv = view.subarray(1, 13);
+    const blob = view.subarray(13);
+    const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: encoder.encode(aad) }, key, blob);
+    return JSON.parse(decoder.decode(plaintext));
+  };
   return {
     scope: b64(new Uint8Array(scopeBytes)),
+    /** v2 JSON 信封（老桌面唯一认识的那一版，也是未协商时的默认）。 */
     async seal(object, aad) {
       const iv = crypto.getRandomValues(new Uint8Array(12));
       const plaintext = encoder.encode(JSON.stringify(object));
       const sealed = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: encoder.encode(aad) }, key, plaintext);
       return JSON.stringify({ v: 1, n: b64(iv), c: b64(new Uint8Array(sealed)) });
     },
-    async unseal(text, aad) {
-      const parsed = JSON.parse(text);
-      if (parsed === null || typeof parsed !== 'object' || parsed.v !== 1) throw new Error('信封版本不正确');
-      const iv = unb64(parsed.n);
-      const blob = unb64(parsed.c);
-      if (iv.length !== 12 || blob.length <= 16) throw new Error('信封内容不正确');
-      const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: encoder.encode(aad) }, key, blob);
-      return JSON.parse(decoder.decode(plaintext));
+    /**
+     * v3 二进制信封：`[0x03][iv 12][ct][tag 16]`。
+     *
+     * 安全参数与 `seal()` **逐项相同**（同一把 key、AAD = 主题串、IV 每次 12 字节
+     * 随机、tag 16 字节）；区别只是不再 base64 + 套 JSON。返回 `Uint8Array` 而不是
+     * 字符串：mqtt.js 的 payload 直接收 ArrayBufferView，浏览器会按二进制发出去。
+     */
+    async sealBinary(object, aad) {
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const plaintext = encoder.encode(JSON.stringify(object));
+      const sealed = new Uint8Array(await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv, additionalData: encoder.encode(aad) },
+        key,
+        plaintext,
+      ));
+      const out = new Uint8Array(1 + 12 + sealed.length);
+      out[0] = 0x03;
+      out.set(iv, 1);
+      out.set(sealed, 13);
+      return out;
+    },
+    /**
+     * 按线上形态解封（**收方向唯一入口**）：字符串 = v2 JSON 文本；
+     * `Uint8Array`/`Buffer` = 二进制信封，首字节决定 v2（`{`）还是 v3（`0x03`）。
+     *
+     * 首字节不认识 ⇒ 抛错（调用方 `onMessage()` 只计数、不崩溃）。这里不能"猜"：
+     * 猜错会把密文当明文喂给 JSON.parse，错误信息就再也指不到真正的原因。
+     */
+    async unseal(envelope, aad) {
+      if (typeof envelope === 'string') return openJson(envelope, aad);
+      const view = envelope instanceof Uint8Array ? envelope : new Uint8Array(envelope);
+      const magic = view.length > 0 ? view[0] : -1;
+      if (magic === 0x03) return openBinary(view, aad);
+      // 老桌面把 v2 JSON 文本当二进制递过来（mqtt.js 两种都可能给 Uint8Array）。
+      if (magic === 0x7b) return openJson(decoder.decode(view), aad);
+      throw new Error('信封版本不正确');
     },
     room,
   };
@@ -958,6 +1023,18 @@ class Relay {
     this.pcSeenAt = 0;
     this.pcStale = false;
     this.pcVersion = 0;
+    /**
+     * 桌面在 `hello`/`beat` 里声明的**信封**协议版本（0 = 还没收到 / 老桌面不认识
+     * `proto`）。这就是协商里的 "desktopProto"：
+     *
+     *  - 上行用哪一版**只由它决定**（`send()` 里 `Number(this.pcProto) >= 3`）；
+     *  - 0 是刻意的保守默认值 —— 拿不准就发 v2，老桌面 100% 能解；
+     *  - 每一帧 hello/beat 都重写（缺 `proto` 就写回 0），不做"学会就一直记得"：
+     *    桌面被降级/换回老版本时必须立刻退回 v2，否则我们发出去的二进制帧老桌面
+     *    一帧都解不开，而两边日志都只有"什么都没发生"；
+     *  - `restart()` 里也清零：换了一条链路就从"不知道对面是谁"重新开始。
+     */
+    this.pcProto = 0;
     /**
      * 桌面下发的当前心跳周期（`hello` / `beat` 的增量字段 `beatMs`）。
      *
@@ -1347,7 +1424,11 @@ class Relay {
     // 直接忽略这个字段；新桌面只有看到它才敢进空闲档 —— 否则老外壳手里写死的
     // 26 s 阈值会把 30 s 的正常间隔判成「电脑端已离线」，反复重建。
     void this.send({
-      t: 'hello', name: this.phoneName, ver: PROTOCOL, ts: this.serverNow(), beatAck: true,
+      t: 'hello', name: this.phoneName, ver: PROTOCOL,
+      // 信封能力声明（不是"我现在就发二进制"）：老桌面忽略它，行为不变；
+      // 新桌面看到 `proto >= 3` 才会用 v3 二进制信封回我们。
+      proto: ENVELOPE_PROTOCOL,
+      ts: this.serverNow(), beatAck: true,
     }).catch(() => {});
   }
 
@@ -1383,6 +1464,7 @@ class Relay {
     this.ready = false;
     this.readyAt = 0;
     this.pcHello = null;
+    this.pcProto = 0;
     this.pcStale = false;
     // 半包表**不在这里清**：清表要记账（"一次重连把正在拼的大响应清掉了"必须能在
     // 诊断里看见），而记账点在 `abortTransport()` 里。旧实现先在上面 `parts.clear()`、
@@ -1553,7 +1635,11 @@ class Relay {
     if (payload.byteLength > MAX_FRAME * 2 || client !== this.client) return;
     let message;
     try {
-      message = await this.sealer.unseal(decoder.decode(payload), this.downTopic);
+      // v2 是**文本**信封（首字节 `{`），v3 是二进制、必须原样保持字节（先 decode
+      // 成字符串就把密文毁了）。这里只决定"交给 sealer 什么形态"，版本分流与
+      // 校验在 sealer 里（它同时还管 AAD 与钥匙）。
+      const envelope = payload.length > 0 && payload[0] === 0x7b ? decoder.decode(payload) : payload;
+      message = await this.sealer.unseal(envelope, this.downTopic);
     } catch (error) {
       this.stats.err += 1;
       this.stats.lastError = `unseal: ${error?.message}`;
@@ -1703,6 +1789,17 @@ class Relay {
     // a heartbeat cannot erase what the hello told us.
     const ver = Number(message.ver);
     if (Number.isFinite(ver) && ver > 0) this.pcVersion = ver;
+    /**
+     * 信封协议协商（desktopProto）。
+     *
+     * 与 `beatMs` / `ver` 的"缺了就沿用上次"**故意不同**：这里的缺失必须写回 0。
+     * 场景是这个 bug 的真实来源：手机先连上新桌面（学到 3），桌面被降级/换回老版本，
+     * 老桌面的 hello 不带 `proto` —— 若沿用 3，手机就会一直发二进制上行，老桌面
+     * 一帧都解不开，界面表现成"连着但毫无反应"，两边日志都是干净的。
+     * 写回 0 最坏只是让新桌面多收几帧 v2（它两种都认识），代价为零。
+     */
+    const proto = Number(message.proto);
+    this.pcProto = Number.isFinite(proto) && proto > 0 ? proto : 0;
     const serverTs = Number(message.ts);
     if (Number.isFinite(serverTs) && serverTs > 0) {
       const offset = serverTs - Date.now();
@@ -1918,9 +2015,17 @@ class Relay {
       if (!await this.waitReady(SEND_READY_WAIT_MS)) throw unavailable('中继尚未就绪');
     }
     const client = this.client;
+    /**
+     * 上行信封选择（**协商在这里收口**）：只有"自己也认识 v3 且桌面声明过 ≥3"
+     * 才发二进制。`this.pcProto` 缺失 / 为 0（还没收到 hello/beat、或老桌面
+     * 压根不带 `proto`）⇒ v2。整帧与分片走同一个 `publish()` 闭包，不会混。
+     */
+    const binary = Number(this.pcProto) >= 3;
     const publish = async (frame) => {
       signal?.throwIfAborted();
-      const sealed = await this.sealer.seal(frame, this.upTopic);
+      const sealed = binary
+        ? await this.sealer.sealBinary(frame, this.upTopic)
+        : await this.sealer.seal(frame, this.upTopic);
       signal?.throwIfAborted();
       if (!client || this.client !== client || !this.ready || this.superseded) throw unavailable('中继连接已更换');
       client.publish(this.upTopic, sealed, { qos: 1 });

@@ -6,6 +6,10 @@
  *  - 同一份明文 → 密文 → 明文逐字节一致（真实代码封、真实代码解，双向）；
  *  - 任何一处被改（密文任意字节 / IV / 信封版本 / AAD / 方向 / 房间话题 / 钥匙）
  *    都必须**抛错**，绝不允许返回垃圾明文或留下半截状态。
+ *
+ * 本文件的用例全部**不协商**（没有喂带 `proto` 的 hello）⇒ 走的是默认 v2 JSON
+ * 信封，所以这里断言的信封形状就是「默认路径仍然长这样」。v3 二进制信封的形状、
+ * 分流与协商矩阵在 `test/relay/envelope-v3.test.mjs`（不在这里重复）。
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -65,6 +69,12 @@ test('线上只有密文：payload 里不出现明文哨兵，IV 随机且为 12
   const { link, sent } = makeLink();
   assert.equal(link.publish(PLAINTEXT), true);
   assert.equal(link.publish(PLAINTEXT), true);
+
+  // 这一组**故意**不喂 hello：`phoneProto` 还是 0 ⇒ 协商未成立 ⇒ 默认 v2 JSON
+  // 信封。也就是说下面断言的是"默认路径的线上形状"仍然如此（v3 形状见
+  // test/relay/envelope-v3.test.mjs）。这是"信封 JSON 形状"断言被保留的方式。
+  assert.equal(link.phoneProto, 0);
+  assert.equal(link.wantsBinaryDownlink(), false);
 
   assert.ok(!sent[0].payload.includes(CANARY), 'MQTT payload 里出现明文 = E2EE 失效');
   assert.ok(!sent[0].payload.includes('中文也要原样回来'));
@@ -136,7 +146,16 @@ test('信封结构/版本被改 → 直接拒（v=2、只剩 tag、密文为空�
     '只有 tag 没有密文的信封必须拒',
   );
   assert.throws(() => victim.onFrame(rebuild({ ...envelope, c: '' })), BAD_ENVELOPE);
-  assert.throws(() => victim.onFrame(Buffer.from('not json at all', 'utf8')), ANY_REJECT);
+  // 未知首字节（既不是 `{`=v2、也不是 0x03=v3）走 v3a 的入站分流：**丢弃 + 计数**，
+  // 不再抛异常（公共主题上不带钥匙也能丢垃圾，一帧一抛就是一次 warn/磁盘 I/O）。
+  // 超过任何合法信封体积的垃圾帧仍显式拒绝，见下面的用例。
+  const junkBefore = victim.stats.junk;
+  assert.equal(victim.onFrame(Buffer.from('not json at all', 'utf8')), undefined, '未知首字节不许抛');
+  assert.equal(victim.stats.junk, junkBefore + 1, '被丢弃的垃圾帧必须计数（stats.junk）');
+  assert.equal(victim.stats.rx, before, '被拒/被丢的帧不能计入接收统计');
+  // 空 payload 也走同一条「丢垃圾」路径，不能崩。
+  assert.equal(victim.onFrame(Buffer.alloc(0)), undefined);
+  assert.equal(victim.stats.junk, junkBefore + 2);
   // 空对象 / null 之类也不能被当成合法帧。
   assert.throws(() => victim.onFrame(Buffer.from('{}', 'utf8')), BAD_ENVELOPE);
   assert.equal(victim.stats.rx, before, '被拒的帧不能计入接收统计');
