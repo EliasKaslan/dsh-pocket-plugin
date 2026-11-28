@@ -55,7 +55,7 @@ import {
  * `test/unit/shell-retry` / `test/unit/shell-parts` 测的是行为（失败几次、隔多久、
  * 谁被淘汰），而不是"某个字符串还在不在"。
  */
-import { CONTROL_RESEND_DELAYS, connectWithRetry, wakeDecision } from './lib/shell-retry.js';
+import { CONTROL_RESEND_DELAYS, connectWithRetry, deriveThresholds, wakeDecision } from './lib/shell-retry.js';
 import { PartTable } from './lib/shell-parts.js';import { adoptScope, scopeVerdict } from './lib/shell-session.js';
 
 /* ------------------------------- constants ------------------------------ */
@@ -178,7 +178,14 @@ function breadcrumbPath(path) {
   const only = cut >= 0 ? text.slice(0, cut) : text;
   return only.slice(0, 48);
 }
-/** Desktop beats every 8 s; keep 3x headroom for mobile network jitter. */
+/**
+ * 离线横幅 + 重建的静默阈值（**老桌面**下的值：8 s 一跳的老假设）。
+ *
+ * 1.1.0 起桌面按活跃度自适应心跳（空闲 30 s / 有实时通道或在途请求 8 s），并在
+ * hello / beat 里下发当前周期 `beatMs`。本实例真正用的是 `this.pcStaleMs`
+ * （由 `noteBeatMs()` 按 `deriveThresholds()` 推导）；这个常量只在**收不到**
+ * `beatMs`（老桌面 / 脏值）时兜底，行为与 1.0.10 逐字等价。
+ */
 const PC_STALE_MS = 26_000;
 /**
  * 下行静默多久就允许重建一次中继连接（冷却，避免抖动时狂重建）。
@@ -195,6 +202,13 @@ const RESTART_COOLDOWN_MS = 15_000;
  * 与 `web/lib/shell-retry.js` 的导出常量 `RPC_STALL_REBUILD_MS` 同值（各写一份，
  * 由 `test/unit/shell-stall-rebuild.test.mjs` 逐字段比对）：外壳这边必须是数字字面量，
  * 看门狗的行为用例才能把常量切进 vm 沙箱真跑。
+ *
+ * **但这只是「已知心跳 8 s」时的值**：桌面把心跳拉长到 30 s 之后，10 s 的静默是
+ * 完全正常的（下一次 beat 还没到），照 10 s 判就会误重建 —— 每次重建都要拆掉
+ * ws 隧道、作废正在拼的分片。所以运行时用 `this.rpcStallRebuildMs`（由下发的
+ * `beatMs` 按 `deriveThresholds()` 推导，永不小于这个常量）；这个字面量只在
+ * 收不到 `beatMs` 的老桌面下生效（红线由 `test/unit/shell-adaptive-beat.test.mjs`
+ * 钉住：任何档位下推导值都必须**长于一个心跳**）。
  */
 const RPC_STALL_REBUILD_MS = 10_000;
 /**
@@ -944,6 +958,20 @@ class Relay {
     this.pcSeenAt = 0;
     this.pcStale = false;
     this.pcVersion = 0;
+    /**
+     * 桌面下发的当前心跳周期（`hello` / `beat` 的增量字段 `beatMs`）。
+     *
+     * 0 = 还没学到（老桌面）：这时三个阈值全部用上面那几个常量（8 s 老假设），
+     * 行为与 1.0.10 完全一致。学到之后由 `noteBeatMs()` 按
+     * `web/lib/shell-retry.js` 的 `deriveThresholds()` 重算下面三个字段。
+     * 只增不减：某一帧没有 `beatMs` 时**不清零、不缩小**（拿不准就沿用已知值，
+     * 宁可晚一点重建，也不能把"反正可能是 8 s"当成理由去调小阈值）。
+     */
+    this.pcBeatMs = 0;
+    /** 离线横幅 + 重建的静默阈值（有效值；见 `PC_STALE_MS` 的说明）。 */
+    this.pcStaleMs = PC_STALE_MS;
+    /** 「有请求在途 + 下行静默」的立即重建阈值（有效值，红线：必须 > 一个心跳）。 */
+    this.rpcStallRebuildMs = RPC_STALL_REBUILD_MS;
     this.staleTimer = undefined;
     /** Monotonic per-page-load request sequence + the session id it belongs to. */
     this.sid = randomId(4);
@@ -1315,7 +1343,12 @@ class Relay {
     const now = Date.now();
     if (!force && now - this.lastHelloAt < HELLO_MIN_GAP_MS) return;
     this.lastHelloAt = now;
-    void this.send({ t: 'hello', name: this.phoneName, ver: PROTOCOL, ts: this.serverNow() }).catch(() => {});
+    // `beatAck: true`：告诉桌面「我认识 beatMs，可以按活跃度拉长心跳」。老桌面
+    // 直接忽略这个字段；新桌面只有看到它才敢进空闲档 —— 否则老外壳手里写死的
+    // 26 s 阈值会把 30 s 的正常间隔判成「电脑端已离线」，反复重建。
+    void this.send({
+      t: 'hello', name: this.phoneName, ver: PROTOCOL, ts: this.serverNow(), beatAck: true,
+    }).catch(() => {});
   }
 
   /**
@@ -1426,7 +1459,14 @@ class Relay {
       // 以前 pcSeenAt===0 就直接 return —— 而"连上了却一帧都没收到"恰恰是
       // 最需要重建的状态。改用以 readyAt 为下界。
       const idle = Date.now() - Math.max(this.pcSeenAt, this.stats.lastRxAt, this.readyAt, this.lastWakeAt);
-      const stale = idle > PC_STALE_MS;
+      /**
+       * 阈值取**当前生效值**：桌面下发过 `beatMs` 就是推导出来的（空闲档 30 s
+       * ⇒ 97.5 s），收不到就是老常量 26 s。`Number(...) > 0` 而不是 `??`：
+       * 老测试替身 / 老快照里这个字段可能是 0 或缺失，两种都必须退回老行为，
+       * 不能变成"阈值 0 ⇒ 每 2 秒重建一次"。
+       */
+      const staleMs = Number(this.pcStaleMs) > 0 ? this.pcStaleMs : PC_STALE_MS;
+      const stale = idle > staleMs;
       if (stale !== this.pcStale) {
         this.pcStale = stale;
         this.onpcStale(stale, stale
@@ -1442,8 +1482,9 @@ class Relay {
        * —— 现场："详情请求桌面 8~30 ms 就答完了，手机 15.2 s 后报中继请求超时"。
        *
        * 判据只有三条：在线、有请求在途、`lastRxAt`/`pcSeenAt` 静默超过一个心跳多
-       * （`RPC_STALL_REBUILD_MS`）。**不误伤慢请求的前提**：正常但慢的请求（冷会话
-       * 构建实测 4.4 s）期间 beat 照旧每 8 s 到、`lastRxAt` 一直新鲜 ⇒ 不会命中。
+       * （`this.rpcStallRebuildMs`：8 s 心跳下=10 s，空闲档 30 s 心跳下=37.5 s）。
+       * **不误伤慢请求的前提**：正常但慢的请求（冷会话构建实测 4.4 s）期间 beat
+       * 照旧按当前档位到、`lastRxAt` 一直新鲜 ⇒ 不会命中。
        *
        * 下界里带上 `readyAt`（写法与上面的 `idle` 一致）：刚 ready 的前 8 s 本来
        * 就一条 beat 都可能还没到，那是**首连空窗**不是"下行静默"，不带它就会在
@@ -1465,8 +1506,10 @@ class Relay {
        * 2 s 余量 —— 正常链路上丢一拍 beat（我们就处在会丢帧的链路上）就会误判，
        * 而误判的代价是把 ws 隧道拆掉、把正在拼的分片作废。反过来，
        * `startedAt > lastDownAt` 表示"请求发出之后**一条下行都没有**"：
-       * 健康链路不可能 10 s 连一拍 beat 都不来，所以这个判据在半死连接上成立、
-       * 在只是"beat 丢了一拍"的链路上不成立。
+       * 健康链路不可能在"阈值"这么长的时间里连一拍 beat 都不来，所以这个判据在
+       * 半死连接上成立、在只是"beat 丢了一拍"的链路上不成立。
+       * （桌面空闲档把心跳拉长到 30 s 后，阈值跟着变成 37.5 s —— 否则这条判据
+       * 本身就会在空闲链路上误命中，见 `this.rpcStallRebuildMs` 的赋值处。）
        *
        * 也不能改成"发 hello 探活"：桌面端 `sayHello()` 是 10 s 限流的
        * （见 `lib/cloud.mjs` 的 `case 'hello'`），被限流时**不会回 beat**，
@@ -1477,15 +1520,26 @@ class Relay {
         const startedAt = Number(entry.startedAt) || Number(entry.at) || 0;
         if (startedAt > 0 && (oldestPendingAt === 0 || startedAt < oldestPendingAt)) oldestPendingAt = startedAt;
       }
-      if ((this.pending?.size ?? 0) > 0
-        && silentFor > RPC_STALL_REBUILD_MS
-        // 拿不到请求开始时刻（老替身 / 异常条目）时退回"只看静默"：宁可多建一次，
-        // 也不要因为一条缺字段的条目把自救关上。
-        && (oldestPendingAt === 0 || oldestPendingAt > lastDownAt)
-        && Date.now() - this.lastRestartAt > RESTART_COOLDOWN_MS) {
-        this.stats.stallRebuilds += 1;
-        void this.restart('请求在途但下行静默');
-        return;
+      if ((this.pending?.size ?? 0) > 0) {
+        // 红线：这个阈值**必须长于一个心跳**（`this.pcBeatMs`）。桌面空闲档
+        // 30 s 时它是 37.5 s（`deriveThresholds()`），照 10 s 判就是把正常的长
+        // 间隔当静默 —— 会拆掉 ws 隧道、作废正在拼的分片。
+        //
+        // 为什么"变慢了"也不吃亏：有请求在途 ⇒ 桌面 `pending.size > 0` ⇒ 立刻
+        // 切回 8 s 档并**马上补一条 beat**（`lib/cloud.mjs` 的 `applyBeatTier()`），
+        // 手机收到它就把阈值压回今天的 10 s。所以下面这条判据在"桌面收到了请求"
+        // 之后几乎立刻恢复原来的灵敏度；只有上行也一起坏掉（请求根本没到桌面）
+        // 时才会晚一点重建 —— 那种情况下慢一点是保守，不是错误。
+        const stallMs = Number(this.rpcStallRebuildMs) > 0 ? this.rpcStallRebuildMs : RPC_STALL_REBUILD_MS;
+        if (silentFor > stallMs
+          // 拿不到请求开始时刻（老替身 / 异常条目）时退回"只看静默"：宁可多建一次，
+          // 也不要因为一条缺字段的条目把自救关上。
+          && (oldestPendingAt === 0 || oldestPendingAt > lastDownAt)
+          && Date.now() - this.lastRestartAt > RESTART_COOLDOWN_MS) {
+          this.stats.stallRebuilds += 1;
+          void this.restart('请求在途但下行静默');
+          return;
+        }
       }
       // 只显示横幅是不够的：这条链路的坏法就是"看起来连着、其实发不出去"。
       // 静默够久就必须把底层客户端整个重建，否则永远等不到自动重连。
@@ -1611,10 +1665,40 @@ class Relay {
     }
   }
 
+  /**
+   * 学一条桌面下发的心跳周期（`hello` / `beat` 的增量字段 `beatMs`），并据此
+   * 重算本机的三个静默阈值。
+   *
+   * 为什么必须学：桌面的心跳按活跃度自适应（空闲 30 s）。手机的三个阈值都是
+   * 「心跳周期的倍数」推导出来的 —— 不学就还在按 8 s 假设走，于是下一次
+   * 正常的长间隔会被判成「下行静默」⇒ 拆 ws 隧道、作废正在拼的分片（误重建）。
+   *
+   * 保守语义（三处都别改）：
+   *  1. 字段缺失 / 非数字 / ≤0 ⇒ **什么都不做**：沿用当前有效值（初始就是 8 s
+   *     老假设）。不清零、不回退 —— 老桌面不会下发这个字段，行为与 1.0.10 一致；
+   *  2. 比 8 s 还小的值按 8 s 算（`deriveThresholds()` 内部收口）：阈值只能放大，
+   *     不能比今天更激进；
+   *  3. 推导值一律 ≥ 老常量：桌面切回快速档（`beatMs = 8_000`）时阈值回到今天
+   *     的三个数，不会更低。
+   *
+   * @param {unknown} raw 帧里的 `beatMs`
+   * @returns {boolean} 是否真的更新了（诊断用）
+   */
+  noteBeatMs(raw) {
+    const next = deriveThresholds(raw);
+    if (next.known !== true) return false;
+    this.pcBeatMs = next.beatMs;
+    this.pcStaleMs = next.pcStaleMs;
+    this.rpcStallRebuildMs = next.rpcStallRebuildMs;
+    return true;
+  }
+
   noteDesktopAlive(message) {
     this.supportsAuthReplyId = message.authReplyId === true;
     this.pcHello = { name: String(message.name ?? '电脑'), at: Date.now() };
     this.pcSeenAt = Date.now();
+    // 心跳周期与 `ver` 一样是「增量、可缺」的字段：缺了就保持上一次学到的那一档。
+    this.noteBeatMs(message.beatMs);
     // `beat` carries `ver` too; keep the last known value when it is absent so
     // a heartbeat cannot erase what the hello told us.
     const ver = Number(message.ver);
@@ -3298,6 +3382,8 @@ async function main() {
       pcSeenAt: relay.pcSeenAt,
       readyAt: relay.readyAt,
       restarting: relay.restarting,
+      // 桌面空闲档 30 s 时门槛放大到 60 s：不能让"下一次心跳还没到"变成一次重建。
+      beatMs: relay.pcBeatMs,
     });
     relay.lastWakeAt = now;
     // 顺带主动探一次：活着的话电脑会立刻回 hello+beat，把静默清零。

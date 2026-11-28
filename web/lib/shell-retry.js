@@ -39,7 +39,14 @@ export const CONNECT_RETRY_DELAYS = [1_000, 2_000, 4_000, 8_000];
  */
 export const CONTROL_RESEND_DELAYS = [1_500, 3_500];
 
-/** 电脑端心跳周期（桌面 `beat` 每 8 s 一条）。 */
+/**
+ * 桌面心跳的**老假设**：8 s 一跳。
+ *
+ * 1.1.0 起桌面会按活跃度自适应（空闲 30 s / 有实时通道或在途请求 8 s），并把
+ * 当前生效周期通过 hello / beat 的增量字段 `beatMs` 下发。收到 `beatMs` 时用
+ * `deriveThresholds()` 重算下面三个阈值；**收不到**（老桌面）就继续按这个
+ * 8 s 假设走 —— 行为与 1.0.10 逐字等价，这是向下兼容的那一半。
+ */
 export const HEARTBEAT_MS = 8_000;
 
 /**
@@ -49,6 +56,9 @@ export const HEARTBEAT_MS = 8_000;
  * 用 2× 而不是等 `PC_STALE_MS`（26 s）：iOS 上页面冻结期间收不到帧是常态，
  * 醒来后用户最多愿意等一两秒，等 26 s + 15 s 冷却的体感就是"回到前台后
  * 最长 40 秒页面不动"。
+ *
+ * 这是**下限**：桌面空闲档把心跳拉长到 30 s 时按 2× 放大到 60 s（见
+ * `deriveThresholds()`）—— 否则"下一次心跳还没到"就会被当成死链。
  */
 export const WAKE_SILENT_MS = 2 * HEARTBEAT_MS;
 
@@ -75,6 +85,57 @@ export const WAKE_SILENT_MS = 2 * HEARTBEAT_MS;
  * 看门狗的行为用例按名字把常量切进 vm 沙箱里跑，两边同值由用例逐字段比对。
  */
 export const RPC_STALL_REBUILD_MS = 10_000;
+
+/**
+ * 「电脑端已离线」横幅 + 重建的静默阈值（老假设下的值）。
+ *
+ * `remote/remote.js` 里同值的那份是数字字面量（行为用例把常量切进 vm 沙箱跑），
+ * 两边同值由 `test/unit/shell-stall-rebuild.test.mjs` 逐字段比对。
+ */
+export const PC_STALE_MS = 26_000;
+
+/**
+ * 从桌面下发的 `beatMs` 推导本机的静默阈值（本轮新增）。
+ *
+ * 公式只有三条，写成代码而不是散在三个地方，是因为**红线**在这里：
+ *
+ *     RPC_STALL_REBUILD_MS 必须**长于一个心跳**，否则正常链路的下一次 beat
+ *     就会被当成「下行静默」⇒ 拆掉 ws 隧道、作废正在拼的分片（误重建）。
+ *
+ * 桌面把心跳拉长到 30 s 之后，若手机还用「8 s 假设」的 10 s，这条红线立刻被
+ * 踩穿。所以三个阈值都必须**跟着 beatMs 放大**，并且永远不低于今天的值：
+ *
+ *   wakeSilentMs       = max(16_000, 2 × beatMs)      // 回到前台判静默
+ *   pcStaleMs          = max(26_000, 3.25 × beatMs)   // 离线横幅 + 重建
+ *   rpcStallRebuildMs  = max(10_000, 1.25 × beatMs)   // 有请求在途 + 下行静默
+ *
+ * 系数取 2 / 3.25 / 1.25 不是新拍的数字：它们正是老常量对 8 s 的倍数
+ * （16_000 = 2×、26_000 = 3.25×、10_000 = 1.25×），所以 `beatMs = 8_000` 时
+ * 推导结果与 1.0.10 **逐值相等**，老桌面/新桌面在同一档位下行为一致。
+ *
+ * 保守优先的三条规矩（别改成"聪明的"）：
+ *  1. `beatMs` 缺失 / 非数字 / ≤0 ⇒ 当"不知道"，退回 8 s 假设（今天的行为）；
+ *  2. `beatMs` 比 8 s 还小（更激进的桌面）⇒ 按 8 s 算，**不许**把阈值调小；
+ *  3. 只增不减：推导值一律 `max(老常量, 公式值)`。
+ *
+ * @param {number|string|undefined} beatMs 桌面下发的当前心跳周期（毫秒）
+ * @returns {{beatMs: number, known: boolean, wakeSilentMs: number,
+ *   pcStaleMs: number, rpcStallRebuildMs: number}}
+ *   `known` 表示这次是否真的用上了桌面下发的值（false = 老桌面 / 脏值，退回老假设）。
+ */
+export function deriveThresholds(beatMs) {
+  const raw = Number(beatMs);
+  const known = Number.isFinite(raw) && raw > 0;
+  // 第 2 条：比老假设还小时按老假设算 —— 阈值只能放大，不能比今天更激进。
+  const beat = known ? Math.max(HEARTBEAT_MS, Math.round(raw)) : HEARTBEAT_MS;
+  return {
+    beatMs: beat,
+    known,
+    wakeSilentMs: Math.max(WAKE_SILENT_MS, 2 * beat),
+    pcStaleMs: Math.max(PC_STALE_MS, Math.ceil(3.25 * beat)),
+    rpcStallRebuildMs: Math.max(RPC_STALL_REBUILD_MS, Math.ceil(1.25 * beat)),
+  };
+}
 
 /** 第 `attempt` 次失败后该等多久（attempt 从 1 开始）；没有下一次就返回 null。 */
 export function connectRetryDelay(attempt) {
@@ -128,18 +189,24 @@ export async function connectWithRetry({ connect, delays = CONNECT_RETRY_DELAYS,
  * "刚刚"当最后一次下行，永远判不出静默）。
  *
  * @param {{ready?: boolean, now: number, lastRxAt?: number, pcSeenAt?: number,
- *   readyAt?: number, restarting?: boolean}} input
+ *   readyAt?: number, restarting?: boolean, beatMs?: number}} input
+ *   `beatMs` 是**桌面下发的心跳周期**（`remote/remote.js` 的 `pcBeatMs`）；
+ *   不给（老桌面 / 老调用点）就是 1.0.10 的 16 s 老假设，行为不变。
  * @returns {'restart-silent'|'restart-down'|'none'}
  *   - `restart-silent`：连接自称在线，但已经两个心跳周期没有下行 → 立刻重建，
  *     **不受** `justRestarted` 的 20 秒窗口限制（那正是"回到前台后不动"的来源）。
+ *     桌面空闲档 30 s 时门槛会放大到 60 s —— 保守方向：宁可晚一点重建，也
+ *     不能把"下一次心跳还没到"当成静默。
  *   - `restart-down`：本来就没连上 → 交给调用方按原有窗口决定。
  *   - `none`：不用动（正在重建 / 链路新鲜）。
  */
-export function wakeDecision({ ready = false, now, lastRxAt = 0, pcSeenAt = 0, readyAt = 0, restarting = false } = {}) {
+export function wakeDecision({
+  ready = false, now, lastRxAt = 0, pcSeenAt = 0, readyAt = 0, restarting = false, beatMs,
+} = {}) {
   if (restarting === true) return 'none';
   if (ready !== true) return 'restart-down';
   const stamp = Math.max(Number(lastRxAt) || 0, Number(pcSeenAt) || 0, Number(readyAt) || 0);
   const since = Number(now) - stamp;
   if (!Number.isFinite(since)) return 'none';
-  return since >= WAKE_SILENT_MS ? 'restart-silent' : 'none';
+  return since >= deriveThresholds(beatMs).wakeSilentMs ? 'restart-silent' : 'none';
 }

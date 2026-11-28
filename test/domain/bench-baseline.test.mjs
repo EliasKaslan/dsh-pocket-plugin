@@ -1,5 +1,5 @@
 /**
- * 门禁：手机端「流畅度」基线（v1.0.7 实测口径）。
+ * 门禁：手机端「流畅度」基线（当前实现实测口径）。
  *
  * 测什么
  * ------
@@ -10,7 +10,7 @@
  * 判据怎么读（**两个数字，别混**）
  * ------------------------------
  *   - `target`：任务书给的产品目标（表里的数字，后续优化要打到的靶子）；
- *   - `limit`：本次**门禁**锁定的值 = v1.0.7 基线实测 + 余量。
+ *   - `limit`：本次**门禁**锁定的值 = 基线实测 + 余量。
  *
  * 两者不一致的地方都写了原因（见 `SCENARIOS[*].note`）。门禁的作用是"防回归"，
  * 不是"证明已经达标"：基线就已经超过 target 的场景，只能先把门禁锁在实测值上，
@@ -178,7 +178,7 @@ function gate(scenario, summary, metric, actual, limit, { target, unit = 'ms' } 
   ].join('\n'));
 }
 
-test('bench-baseline：6 个故障注入场景在 v1.0.7 上跑出可判定数字', { timeout: 90_000 }, async () => {
+test('bench-baseline：6 个故障注入场景在当前实现上跑出可判定数字', { timeout: 90_000 }, async () => {
   const totalStart = Date.now();
   const rows = new Map();
 
@@ -195,7 +195,7 @@ test('bench-baseline：6 个故障注入场景在 v1.0.7 上跑出可判定数�
   const totalMs = Date.now() - totalStart;
 
   // ---------------------------------------------------------------- 汇总表
-  console.log(`\n基线（v1.0.7，单向 ${ONE_WAY_MS} ms ⇒ RTT ≈ ${RTT_MS} ms，N=30/200，最近秩百分位）：`);
+  console.log(`\n基线（当前实现，单向 ${ONE_WAY_MS} ms ⇒ RTT ≈ ${RTT_MS} ms，N=30/200，最近秩百分位）：`);
   console.log(formatTable(ordered));
   console.log(`\n分发布局：p50/p95/p99/max 单位 ms，只统计成功请求；失败请求的耗时是"等满预算 ${RPC_BUDGET_MS} ms"。`);
   for (const row of ordered) {
